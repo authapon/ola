@@ -436,16 +436,18 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  OLA_OLLAMA_API_KEY        Bearer token (เปิดใช้ด้วย -k)")
 		fmt.Println("  OLA_OLLAMA_MODEL          โมเดลที่จะใช้ (override ด้วย -m) [จำเป็น ถ้าไม่ใช้ -m]")
 		fmt.Println("  OLA_OLLAMA_CONTEXT_SIZE   num_ctx เริ่มต้น (override ด้วย -c, default: 16384)")
-		fmt.Println("  OLA_OUTPUT_FILE           ไฟล์ output เริ่มต้น (override ด้วย -o, default: output.txt)")
-		fmt.Println()
-		fmt.Println("Options: (ต้องระบุก่อน <prompt> เสมอ ทั้งหมดรองรับทั้งรูปแบบสั้น -x และยาว --xxx)")
+	fmt.Println("  OLA_OUTPUT_FILE           ไฟล์ output เริ่มต้น (override ด้วย -o, default: output.txt)")
+	fmt.Println("  OLA_TOPIC                 topic สำหรับส่ง notification ไป ntfy.sh (override ด้วย -x)")
+	fmt.Println()
+	fmt.Println("Options: (ต้องระบุก่อน <prompt> เสมอ ทั้งหมดรองรับทั้งรูปแบบสั้น -x และยาว --xxx)")
 		fmt.Println("  -m, --model <name>   โมเดลที่ใช้ [จำเป็น ถ้าไม่ตั้ง $OLA_OLLAMA_MODEL]")
 		fmt.Println("  -c, --ctx <num>      ตั้ง num_ctx ต่อ request ต้องเป็นจำนวนเต็มไม่ติดลบ (default: $OLA_OLLAMA_CONTEXT_SIZE หรือ 16384)")
 		fmt.Println("  -k, --key            ส่ง Authorization: Bearer $OLA_OLLAMA_API_KEY (error ถ้าตั้ง -k แต่ไม่มีค่าตัวแปรนี้)")
 		fmt.Println("  -s, --system <file>  ใช้ system prompt จากไฟล์ระบุ แทนค่า built-in (error ถ้าไฟล์ไม่มี อ่านไม่ได้ หรือว่างเปล่า)")
 		fmt.Println("  -T, --no-think       ปิด thinking mode โดยส่ง \"think\": false ไปใน request (default: ไม่ส่ง field นี้ ให้ Ollama ตัดสินใจเอง)")
-		fmt.Println("  -o, --output <file>  บันทึกผลลัพธ์ + log ลงไฟล์ (default: $OLA_OUTPUT_FILE หรือ output.txt) เขียนทับไฟล์เดิมเสมอ เว้นแต่ใช้ -a")
-		fmt.Println("  -a, --append         ต่อท้ายไฟล์ output แทนการเขียนทับ (ใช้ได้ทั้งกับ -o หรือไฟล์ default ก็ได้ ไม่จำเป็นต้องคู่กับ -o)")
+	fmt.Println("  -x, --topic <topic>  ส่ง notification ไป ntfy.sh ด้วย topic นี้เมื่อทำงานเสร็จ (override $OLA_TOPIC)")
+	fmt.Println("  -o, --output <file>  บันทึกผลลัพธ์ + log ลงไฟล์ (default: $OLA_OUTPUT_FILE หรือ output.txt) เขียนทับไฟล์เดิมเสมอ เว้นแต่ใช้ -a")
+	fmt.Println("  -a, --append         ต่อท้ายไฟล์ output แทนการเขียนทับ (ใช้ได้ทั้งกับ -o หรือไฟล์ default ก็ได้ ไม่จำเป็นต้องคู่กับ -o)")
 		fmt.Println("  -r, --raw            ไม่ใส่ separator \"===== แนบไฟล์ =====\" และ \"--- filename ---\" ระหว่างไฟล์ข้อความที่แนบ")
 		fmt.Println("  -n, --dry-run        แสดง JSON payload และ system prompt ที่จะส่ง โดยไม่เรียก API จริง")
 		fmt.Println("  -h, --help           แสดงข้อความนี้")
@@ -455,15 +457,20 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  - ไฟล์นามสกุลอื่นทั้งหมดจะถูกอ่านเป็นข้อความและต่อท้ายเข้าไปใน content ของ prompt โดยตรง")
 		fmt.Println("  - ไฟล์ที่ไม่พบจะแสดง warning และถูกข้ามไป ไม่ทำให้โปรแกรมหยุดทำงาน")
 		fmt.Println()
-		fmt.Println("หมายเหตุ:")
-		fmt.Println("  - ไม่ต้องพึ่งพา curl/jq/perl/base64 ภายนอกอีกต่อไป ทำงานแบบ native ทั้งหมดใน Go binary เดียว")
-		fmt.Println("  - Exit code จะเป็น 1 ถ้า Ollama ตอบกลับด้วย HTTP status >= 400 (เนื้อหาที่ตอบกลับมาจะยังถูกแสดง/บันทึกตามปกติ)")
+	fmt.Println("หมายเหตุ:")
+	fmt.Println("  - ไม่ต้องพึ่งพา curl/jq/perl/base64 ภายนอกอีกต่อไป ทำงานแบบ native ทั้งหมดใน Go binary เดียว")
+	fmt.Println("  - Exit code จะเป็น 1 ถ้า Ollama ตอบกลับด้วย HTTP status >= 400 (เนื้อหาที่ตอบกลับมาจะยังถูกแสดง/บันทึกตามปกติ)")
+	fmt.Println("  - ใช้ -x <topic> หรือตั้งตัวแปร OLA_TOPIC เพื่อรับ notification ผ่าน ntfy.sh เมื่อทำงานเสร็จ")
+	fmt.Println("    (notification จะถูกส่งทั้งในกรณีสำเร็จและเกิด error ไปที่ https://ntfy.sh/<topic>)")
 		fmt.Println()
 		fmt.Println("Examples:")
 		fmt.Println("  export OLA_OLLAMA_MODEL=qwen3.6:27b")
 		fmt.Println("  ola ask 'review this code' main.py")
 		fmt.Println("  ola ask -k -c 65536 'วิเคราะห์' src/*.py")
 		fmt.Println("  ola ask -s system.md 'แปล' input.txt")
+	fmt.Println("  ola ask -x mytopic 'review this PR'")
+	fmt.Println("  export OLA_TOPIC=mytopic")
+	fmt.Println("  ola ask 'deploy to production'  # ใช้ค่า OLA_TOPIC จาก environment")
 	}
 }
 
@@ -471,7 +478,7 @@ func cmdAsk(args []string) int {
 	fs := flag.NewFlagSet("ask", flag.ContinueOnError)
 	fs.SetOutput(io.Discard) // we print our own errors
 
-	var model, ctxStr, systemFile, outputFile string
+	var model, ctxStr, systemFile, outputFile, topic string
 	var flagKey, flagNoThink, flagRaw, flagDryRun, flagAppend, flagHelp bool
 
 	fs.StringVar(&model, "m", "", "")
@@ -492,6 +499,8 @@ func cmdAsk(args []string) int {
 	fs.StringVar(&outputFile, "output", "", "")
 	fs.BoolVar(&flagAppend, "a", false, "")
 	fs.BoolVar(&flagAppend, "append", false, "")
+	fs.StringVar(&topic, "x", "", "")
+	fs.StringVar(&topic, "topic", "", "")
 	fs.BoolVar(&flagHelp, "h", false, "")
 	fs.BoolVar(&flagHelp, "help", false, "")
 
@@ -704,10 +713,19 @@ func cmdAsk(args []string) int {
 	fmt.Fprintln(outFile, "---")
 	fmt.Fprintln(outFile)
 
+	// Resolve ntfy.sh topic early so it's available on all exit paths
+	ntfyTopic := topic
+	if ntfyTopic == "" {
+		ntfyTopic = os.Getenv("OLA_TOPIC")
+	}
+
 	// Send request
 	httpReq, err := http.NewRequest(http.MethodPost, host+"/api/chat", strings.NewReader(string(payload)))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: สร้าง HTTP request ไม่ได้: %v\n", err)
+		if ntfyTopic != "" {
+			sendNotification(ntfyTopic, fmt.Sprintf("Work Failed: %s", err.Error()))
+		}
 		return 1
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -719,16 +737,42 @@ func cmdAsk(args []string) int {
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: เรียก API ไม่สำเร็จ: %v\n", err)
+		if ntfyTopic != "" {
+			sendNotification(ntfyTopic, fmt.Sprintf("Work Failed: %s", err.Error()))
+		}
 		return 1
 	}
 	defer resp.Body.Close()
 
 	streamResponse(resp.Body, outFile)
 
+	// Send ntfy.sh notification based on response status
+	if ntfyTopic != "" {
+		if resp.StatusCode >= 400 {
+			sendNotification(ntfyTopic, fmt.Sprintf("Work Failed: %s", resp.Status))
+		} else {
+			sendNotification(ntfyTopic, "Work Finnished")
+		}
+	}
+
 	if resp.StatusCode >= 400 {
 		return 1
 	}
 	return 0
+}
+
+// ─────────────────────────────────────────────────────────────────
+// ntfy.sh notification
+// ─────────────────────────────────────────────────────────────────
+
+func sendNotification(topic, message string) {
+	url := "https://ntfy.sh/" + topic
+	resp, err := http.Post(url, "text/plain", strings.NewReader(message))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: ส่ง notification ไม่สำเร็จ: %v\n", err)
+		return
+	}
+	resp.Body.Close()
 }
 
 func maskKey(key string) string {
