@@ -1,25 +1,38 @@
 // ola - a CLI that talks to Ollama's /api/chat endpoint and can act on the
 // local filesystem itself via built-in tool calls.
 //
-// Subcommand:
+// Subcommands:
 //
 //	ola ask [options] <prompt> [files...]
+//	ola coding [options]
 //
 // Tool-calling is always on (no flag to disable it) and is not an optional
-// mode: every request sent to Ollama includes the built-in tool schema, and
+// mode: every request sent to Ollama includes a built-in tool schema, and
 // the program runs a loop that keeps calling the model, executing whatever
 // tools it asks for, and feeding the results back until the model produces
-// a plain answer (or a hard iteration cap is hit).
+// a plain answer (or a hard cap is hit).
 //
-// Built-in tools, all sandboxed to the current working directory (there is
-// no --workdir flag; "current directory" always means the directory ola was
-// invoked from):
+// "ask" is a single-prompt, human-in-the-loop exchange. Its base tools, all
+// sandboxed to the current working directory (there is no --workdir flag;
+// "current directory" always means the directory ola was invoked from):
 //
 //	read_file      - read a file's full contents
 //	search_files   - find files by glob pattern, optionally grep their lines
 //	write_file     - create or overwrite a file with full content
 //	edit_file      - unique search/replace inside an existing file
 //	ask_user       - block on stdin and ask the human a question
+//
+// "coding" (see coding.go) is a longer-running, requirements-file-driven
+// loop meant to run unattended: instead of a prompt, it reads a
+// requirements.md-style file and works through an implement/verify/fix
+// cycle on its own, using the same five base tools above plus four more
+// (add_tasks, mark_task_done, run_command, report_complete). It has its own
+// system prompt, its own (much higher) iteration cap plus a wall-clock
+// timeout, and a verification gate: report_complete does not end the
+// session by itself - ola independently re-runs the project's own
+// build/test command and only accepts completion if that actually passes,
+// looping back with the failure output otherwise. Task-checklist state is
+// persisted to disk so a killed/interrupted run can resume.
 //
 // There used to be a second subcommand ("extract") plus a text-marker
 // convention (<<<ooo FILENAME ooo>>> ... <<<xxx FILENAME xxx>>>) that let a
@@ -28,17 +41,17 @@
 // gone. File changes now happen for real, immediately, via write_file /
 // edit_file tool calls - there is nothing left to extract.
 //
-// The system prompt is fixed and built into the binary. There is no
-// -s/--system flag anymore: the tool-calling contract (available tools,
-// sandboxing rules, when to ask the user) is load-bearing enough that
-// letting it be silently swapped out from the command line was judged not
-// worth the risk of an inconsistent/broken prompt at runtime.
+// The system prompts (one per subcommand) are fixed and built into the
+// binary. There is no -s/--system flag anymore: the tool-calling contract
+// (available tools, sandboxing rules, when to ask the user) is load-bearing
+// enough that letting it be silently swapped out from the command line was
+// judged not worth the risk of an inconsistent/broken prompt at runtime.
 //
 // When the model requests a tool call, ola prints it to the terminal in red
 // so it's visually distinct from thinking (cyan) and the final answer
 // (bold/default) output.
 //
-// Environment variables:
+// Environment variables (shared by both subcommands):
 //
 //	OLA_OLLAMA_API_BASE     Host (default: http://localhost:11434)
 //	OLA_OLLAMA_API_KEY      Bearer token (enabled with -k)
@@ -154,6 +167,8 @@ func main() {
 	switch os.Args[1] {
 	case "ask":
 		os.Exit(cmdAsk(os.Args[2:]))
+	case "coding":
+		os.Exit(cmdCoding(os.Args[2:]))
 	case "-h", "--help", "help":
 		printTopUsage()
 		os.Exit(0)
@@ -168,11 +183,16 @@ func printTopUsage() {
 	fmt.Println("Usage: ola <command> [options]")
 	fmt.Println()
 	fmt.Println("Commands:")
-	fmt.Println("  ask   Call Ollama /api/chat with a prompt (and optional files), with")
-	fmt.Println("        built-in tool calling (read/search/write/edit files, ask the user)")
-	fmt.Println("        always enabled, running against the current directory.")
+	fmt.Println("  ask     Call Ollama /api/chat with a prompt (and optional files), with")
+	fmt.Println("          built-in tool calling (read/search/write/edit files, ask the user)")
+	fmt.Println("          always enabled, running against the current directory.")
 	fmt.Println()
-	fmt.Println("Run 'ola ask -h' for command-specific help.")
+	fmt.Println("  coding  No prompt - reads a requirements file (default requirements.md)")
+	fmt.Println("          and runs an unattended plan/implement/verify/fix loop against the")
+	fmt.Println("          current directory until the project's own build/test command")
+	fmt.Println("          actually passes, or a round/time cap is hit.")
+	fmt.Println()
+	fmt.Println("Run 'ola ask -h' or 'ola coding -h' for command-specific help.")
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -695,16 +715,9 @@ func cmdAsk(args []string) int {
 	// Terminal colors. Tool calls print in red so they're visually distinct
 	// from thinking (cyan) and the final answer (bold/default).
 	isTTY := isTerminalStdout()
-	var cReset, cCyan, cBold, cDim, cRed string
-	if isTTY {
-		cReset = "\x1b[0m"
-		cCyan = "\x1b[96m"
-		cBold = "\x1b[1m"
-		cDim = "\x1b[2m"
-		cRed = "\x1b[91m"
-	}
+	cReset, cCyan, cBold, cDim, cRed := terminalColors(isTTY)
 
-	client := &http.Client{}
+	client := newHTTPClient()
 	sessionStart := time.Now()
 	lastStatusCode := 0
 	iteration := 0
@@ -772,7 +785,7 @@ func cmdAsk(args []string) int {
 			ToolCalls: outcome.ToolCalls,
 		})
 		for _, tc := range outcome.ToolCalls {
-			result := dispatchToolCall(tc, ntfyTopic, cRed, cReset, outFile)
+			result := dispatchToolCall(tc, ntfyTopic, cRed, cReset, outFile, nil)
 			messages = append(messages, ollamaMessage{
 				Role:    "tool",
 				Content: result,
@@ -1195,7 +1208,15 @@ func toolAskUser(args map[string]interface{}, ntfyTopic, red, reset string) (str
 // result) to the terminal in red, logging the full exchange to outFile, and
 // returning the string that should be sent back to the model as the
 // content of a role:"tool" message.
-func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.File) string {
+//
+// extra is an optional hook for tool names beyond the five base ones
+// handled directly below (name, parsed-args) -> (result, error, handled).
+// "ask" passes nil, since it only ever offers the base five tools to the
+// model in the first place. "coding" (see coding.go) passes a closure
+// covering add_tasks/mark_task_done/run_command/report_complete, so those
+// get the same printing/logging/error-handling treatment as the base tools
+// without duplicating that plumbing.
+func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.File, extra func(name string, args map[string]interface{}) (string, error, bool)) string {
 	var args map[string]interface{}
 	_ = json.Unmarshal(tc.Function.Arguments, &args)
 
@@ -1223,6 +1244,12 @@ func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.Fil
 	case "ask_user":
 		result, err = toolAskUser(args, ntfyTopic, red, reset)
 	default:
+		if extra != nil {
+			if r, e, handled := extra(tc.Function.Name, args); handled {
+				result, err = r, e
+				break
+			}
+		}
 		err = fmt.Errorf("ไม่รู้จัก tool: %s", tc.Function.Name)
 	}
 
@@ -1253,6 +1280,40 @@ func sendNotification(topic, message string) {
 		return
 	}
 	resp.Body.Close()
+}
+
+// terminalColors returns the ANSI color codes used to visually separate
+// thinking (cyan), the final answer (bold/default), and tool-call activity
+// (red) - or all-empty strings when stdout isn't a real terminal. Shared by
+// both "ask" and "coding" so their output looks consistent.
+func terminalColors(isTTY bool) (reset, cyan, bold, dim, red string) {
+	if !isTTY {
+		return "", "", "", "", ""
+	}
+	return "\x1b[0m", "\x1b[96m", "\x1b[1m", "\x1b[2m", "\x1b[91m"
+}
+
+func newHTTPClient() *http.Client {
+	return &http.Client{}
+}
+
+// postChatRequest marshals req and POSTs it to host+"/api/chat". Shared by
+// both "ask" and "coding"'s tool-calling loops. The caller owns the
+// returned response and must Close() its Body.
+func postChatRequest(client *http.Client, host, apiKey string, useKey bool, req ollamaRequest) (*http.Response, error) {
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("สร้าง JSON payload ไม่ได้: %v", err)
+	}
+	httpReq, err := http.NewRequest(http.MethodPost, host+"/api/chat", strings.NewReader(string(payload)))
+	if err != nil {
+		return nil, fmt.Errorf("สร้าง HTTP request ไม่ได้: %v", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if useKey {
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	return client.Do(httpReq)
 }
 
 func maskKey(key string) string {
