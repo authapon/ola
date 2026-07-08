@@ -235,23 +235,7 @@ var codingExtraTools = []ollamaTool{
 			},
 		},
 	},
-	{
-		Type: "function",
-		Function: ollamaToolFunction{
-			Name:        "run_command",
-			Description: "Run a build/test/lint command for this project from the current directory. Only binaries relevant to this project's detected toolchain are allowed; arbitrary shell commands are rejected.",
-			Parameters: map[string]interface{}{
-				"type": "object",
-				"properties": map[string]interface{}{
-					"command": map[string]interface{}{
-						"type":        "string",
-						"description": "The command to run, e.g. \"go test ./...\". May chain with &&/;/| as long as every segment's binary is allowed.",
-					},
-				},
-				"required": []string{"command"},
-			},
-		},
-	},
+	runCommandTool, // shared schema, defined once in main.go
 	{
 		Type: "function",
 		Function: ollamaToolFunction{
