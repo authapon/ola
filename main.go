@@ -59,6 +59,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -99,6 +100,16 @@ changes a real file on disk immediately.
   destructive/hard-to-reverse change (e.g. overwriting a large existing
   file). Do not use it for things you can reasonably decide yourself - state
   the assumption instead and move on.
+
+# WHEN NO FILES ARE ATTACHED
+If the user's message includes an auto-generated directory tree section, it
+is a listing of file/directory names only - not their contents, and not
+necessarily complete (large projects get truncated; use search_files to see
+what didn't fit). Never assume a file's content, structure, or the
+correctness of a change from its name alone - read it first. If there is no
+directory tree and no attached file content either, call search_files to
+see what actually exists before guessing a path; never invent a filename
+you have not confirmed.
 
 # SANDBOXING
 All paths are relative to the current working directory ola was started in.
@@ -391,6 +402,19 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  - นี่คนละเรื่องกับ tool ask_user/read_file/write_file/edit_file ด้านบน: ไฟล์ที่แนบตรงนี้คือ")
 		fmt.Println("    context เริ่มต้นที่แปะเข้า prompt แรกเลย ส่วน tool คือสิ่งที่โมเดลเรียกเองระหว่างทำงาน")
 		fmt.Println()
+		fmt.Println("Auto-generated directory tree (เมื่อไม่ระบุ [files...] เลย):")
+		fmt.Println("  - ถ้าไม่แนบไฟล์ใดๆ เลย ola จะสแกน current directory ทุกระดับ (recursive) แล้วแปะรายชื่อ")
+		fmt.Println("    ไฟล์/โฟลเดอร์ทั้งหมด (ไม่ใช่เนื้อหา) เข้าไปใน prompt แรกให้อัตโนมัติ โมเดลจะได้เห็น scope")
+		fmt.Println("    ของโปรเจกต์ทันทีโดยไม่ต้องเสีย tool-call รอบแรกไปกับการ search_files('*') สำรวจเปล่าๆ")
+		fmt.Printf("  - จำกัดไม่เกิน %d รายการ ถ้าเกินจะแสดง %d รายการแรกพร้อมข้อความเตือนว่าอาจไม่ครบ\n", maxTreeEntries, maxTreeEntries)
+		fmt.Println("  - ยกเว้นโฟลเดอร์ที่เป็น build artifact/dependency/tool metadata ของหลายภาษา (.git, node_modules,")
+		fmt.Println("    vendor, target, .venv, __pycache__, dist, build, .idea, .terraform, ฯลฯ - ดูรายการเต็มใน")
+		fmt.Println("    ซอร์สโค้ด ตัวแปร skipDirNames) ไม่ใช่ .gitignore-aware อาจไม่ตรงกับทุกโปรเจกต์เป๊ะ")
+		fmt.Println("  - ยกเว้นไฟล์ที่เป็น binary/executable ด้วย: เช็คจาก permission bit ที่ executable ได้ (ครอบคลุม")
+		fmt.Println("    binary ที่ compile แล้วแต่ไม่มีนามสกุล เช่นตัว ola เอง), นามสกุลที่รู้จักว่าเป็น binary")
+		fmt.Println("    (.png .zip .so .exe ฯลฯ), และ fallback ด้วยการเช็ค NUL byte ใน 512 byte แรกของไฟล์")
+		fmt.Println("  - ถ้าระบุ [files...] มาเอง (แม้แค่ไฟล์เดียว) จะไม่แปะ directory tree ให้ ถือว่าคุณรู้ scope ที่ต้องการแล้ว")
+		fmt.Println()
 		fmt.Println("หมายเหตุ:")
 		fmt.Println("  - ไม่ต้องพึ่งพา curl/jq/perl/base64 ภายนอกอีกต่อไป ทำงานแบบ native ทั้งหมดใน Go binary เดียว")
 		fmt.Println("  - Tool calling วนได้สูงสุด 25 รอบต่อการรัน 1 ครั้ง ถ้าเกินจะหยุดพร้อม warning (ป้องกัน loop ไม่จบ)")
@@ -522,6 +546,36 @@ func cmdAsk(args []string) int {
 	}
 
 	content := prompt
+
+	// Auto-inject a directory listing when the user didn't attach any files
+	// themselves. This gives the model a map of the project up front instead
+	// of burning a tool-call round just to discover what's there. It is
+	// deliberately a listing only (names, not contents) - the model still has
+	// to read_file/search_files before it can act on anything in it.
+	var treeNote string
+	if len(files) == 0 {
+		cwd, cwdErr := os.Getwd()
+		if cwdErr == nil {
+			tree, truncated, total := buildDirectoryTree(cwd)
+			if total > 0 {
+				content += "\n\n===== โครงสร้างไฟล์ใน current directory (auto-generated, รายชื่อเท่านั้น ไม่ใช่เนื้อหาไฟล์) =====\n"
+				content += tree
+				if truncated {
+					content += fmt.Sprintf("\n(แสดง %d รายการแรก ผลลัพธ์อาจไม่ครบ - ใช้ search_files เพื่อดูส่วนที่เหลือ)\n", maxTreeEntries)
+					treeNote = fmt.Sprintf("auto-injected (%d entries, truncated at %d)", total, maxTreeEntries)
+				} else {
+					treeNote = fmt.Sprintf("auto-injected (%d entries)", total)
+				}
+			} else {
+				treeNote = "skipped (current directory has no listable non-binary entries)"
+			}
+		} else {
+			treeNote = "skipped (could not read current directory)"
+		}
+	} else {
+		treeNote = "skipped (files explicitly attached on the command line)"
+	}
+
 	if len(textFiles) > 0 {
 		if !flagRaw {
 			content += "\n\n===== แนบไฟล์ ====="
@@ -583,6 +637,7 @@ func cmdAsk(args []string) int {
 		fmt.Printf("── Output file: %s ──\n", outputFile)
 		cwd, _ := os.Getwd()
 		fmt.Printf("── Sandbox root (current directory): %s ──\n", cwd)
+		fmt.Printf("── Directory tree in prompt: %s ──\n", treeNote)
 		var pretty map[string]interface{}
 		_ = json.Unmarshal(payload, &pretty)
 		prettyBytes, _ := json.MarshalIndent(pretty, "", "  ")
@@ -612,6 +667,7 @@ func cmdAsk(args []string) int {
 	fmt.Fprintf(outFile, "# num_ctx: %d\n", ctx)
 	fmt.Fprintf(outFile, "# cwd (tool sandbox root): %s\n", cwd)
 	fmt.Fprintln(outFile, "# tools: built-in, always on (read_file, search_files, write_file, edit_file, ask_user)")
+	fmt.Fprintf(outFile, "# directory tree: %s\n", treeNote)
 	if flagNoThink {
 		fmt.Fprintln(outFile, "# thinking: disabled")
 	} else {
@@ -790,9 +846,93 @@ func toolReadFile(args map[string]interface{}) (string, error) {
 	return string(data), nil
 }
 
-var searchSkipDirs = map[string]bool{
-	".git": true, "node_modules": true, "vendor": true, ".cache": true,
+// skipDirNames collects directory names that are conventionally build
+// artifacts, dependency caches, or tool/IDE metadata across a wide range of
+// language ecosystems. It is shared by search_files and the auto-injected
+// directory tree so both "see" the same project shape. This is a static
+// list, not .gitignore-aware - a project with unusual layout may need
+// search_files with a more specific pattern to reach something excluded
+// here.
+var skipDirNames = map[string]bool{
+	// VCS
+	".git": true, ".svn": true, ".hg": true,
+	// JS/TS/Node
+	"node_modules": true, ".pnpm-store": true, ".next": true, ".nuxt": true, ".svelte-kit": true,
+	// Python
+	".venv": true, "venv": true, "__pycache__": true, ".mypy_cache": true, ".pytest_cache": true, ".tox": true,
+	// Rust
+	"target": true, ".cargo": true,
+	// Go / general build output
+	"bin": true, "obj": true, "dist": true, "build": true, "out": true, "vendor": true,
+	// Java/Kotlin/Gradle
+	".gradle": true,
+	// Ruby
+	".bundle": true,
+	// Haskell
+	".stack-work": true,
+	// Elixir/Erlang
+	"_build": true, "deps": true,
+	// iOS/macOS
+	"Pods": true, "DerivedData": true,
+	// Infra
+	".terraform": true,
+	// Editors/IDEs
+	".idea": true, ".vscode": true,
+	// Misc caches
+	".cache": true, "coverage": true,
 }
+
+// binarySkipExts are file extensions that are essentially always binary and
+// not worth listing/reading as text. Files with no extension (common for
+// compiled Linux binaries with no suffix) or an extension not in this list
+// fall through to a content sniff in looksBinaryFile.
+var binarySkipExts = map[string]bool{
+	".exe": true, ".dll": true, ".so": true, ".dylib": true, ".bin": true,
+	".o": true, ".a": true, ".lib": true, ".class": true, ".jar": true, ".war": true,
+	".pyc": true, ".pyo": true, ".pyd": true, ".wasm": true, ".node": true,
+	".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true, ".ico": true, ".bmp": true, ".tiff": true,
+	".pdf": true, ".zip": true, ".tar": true, ".gz": true, ".tgz": true, ".bz2": true, ".xz": true, ".7z": true, ".rar": true,
+	".mp3": true, ".mp4": true, ".mov": true, ".avi": true, ".mkv": true, ".wav": true, ".flac": true, ".ogg": true,
+	".ttf": true, ".otf": true, ".woff": true, ".woff2": true, ".eot": true,
+	".db": true, ".sqlite": true, ".sqlite3": true,
+}
+
+// looksBinaryFile decides whether a file should be excluded from
+// listings/search as binary or executable content:
+//  1. Any executable permission bit set (covers compiled Go/Rust/C binaries,
+//     which very often have no file extension on Linux at all - e.g. the
+//     "ola" binary itself).
+//  2. A known binary extension.
+//  3. Otherwise, sniff the first 512 bytes for a NUL byte - the same basic
+//     heuristic git/most text tools use to decide "is this text".
+func looksBinaryFile(full string, info os.FileInfo) bool {
+	if info.Mode().Perm()&0111 != 0 {
+		return true
+	}
+	if binarySkipExts[strings.ToLower(filepath.Ext(info.Name()))] {
+		return true
+	}
+	f, err := os.Open(full)
+	if err != nil {
+		return false // unreadable: don't block the listing on this alone
+	}
+	defer f.Close()
+	buf := make([]byte, 512)
+	n, _ := f.Read(buf)
+	for i := 0; i < n; i++ {
+		if buf[i] == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// errWalkLimit is a sentinel returned from filepath.Walk callbacks to abort
+// the entire walk (not just the current directory) once a result cap is
+// hit. filepath.SkipDir alone only prunes the current directory's children,
+// which isn't enough to bound a search that keeps finding matches in later
+// sibling directories.
+var errWalkLimit = fmt.Errorf("__walk_limit_reached__")
 
 const searchFileLimit = 500
 const searchGrepLimit = 200
@@ -818,7 +958,7 @@ func toolSearchFiles(args map[string]interface{}) (string, error) {
 			return nil // skip unreadable entries rather than aborting the whole search
 		}
 		if info.IsDir() {
-			if p != cwd && searchSkipDirs[info.Name()] {
+			if p != cwd && skipDirNames[info.Name()] {
 				return filepath.SkipDir
 			}
 			return nil
@@ -828,6 +968,9 @@ func toolSearchFiles(args map[string]interface{}) (string, error) {
 			return matchErr
 		}
 		if !ok {
+			return nil
+		}
+		if looksBinaryFile(p, info) {
 			return nil
 		}
 		rel, relErr := filepath.Rel(cwd, p)
@@ -847,11 +990,11 @@ func toolSearchFiles(args map[string]interface{}) (string, error) {
 		}
 		if len(matches) >= searchFileLimit {
 			limitHit = true
-			return filepath.SkipDir
+			return errWalkLimit
 		}
 		return nil
 	})
-	if walkErr != nil {
+	if walkErr != nil && walkErr != errWalkLimit {
 		return "", fmt.Errorf("ค้นหาไฟล์ผิดพลาด: %v", walkErr)
 	}
 
@@ -877,6 +1020,80 @@ func toolSearchFiles(args map[string]interface{}) (string, error) {
 		return strings.Join(limited, "\n") + grepSuffix + suffix, nil
 	}
 	return strings.Join(matches, "\n") + suffix, nil
+}
+
+// maxTreeEntries caps how many entries the auto-injected directory tree can
+// contain, so a huge repository doesn't blow up the initial prompt's token
+// count before the model has even done anything. If the cap is hit, the
+// model is told the listing is incomplete and pointed at search_files to
+// dig further into parts that got cut off.
+const maxTreeEntries = 1000
+
+type treeEntry struct {
+	relPath string
+	isDir   bool
+}
+
+// buildDirectoryTree walks root recursively (every level, not just the top),
+// skipping directories in skipDirNames and omitting binary/executable files
+// (via looksBinaryFile), and renders the result as an indented tree. It
+// returns the rendered text, whether it was truncated by maxTreeEntries, and
+// the total entry count actually included.
+func buildDirectoryTree(root string) (string, bool, int) {
+	var entries []treeEntry
+	truncated := false
+
+	walkErr := filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if p == root {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, p)
+		if relErr != nil {
+			return nil
+		}
+		if info.IsDir() {
+			if skipDirNames[info.Name()] {
+				return filepath.SkipDir
+			}
+			entries = append(entries, treeEntry{relPath: rel, isDir: true})
+			if len(entries) >= maxTreeEntries {
+				truncated = true
+				return errWalkLimit
+			}
+			return nil
+		}
+		if looksBinaryFile(p, info) {
+			return nil
+		}
+		entries = append(entries, treeEntry{relPath: rel, isDir: false})
+		if len(entries) >= maxTreeEntries {
+			truncated = true
+			return errWalkLimit
+		}
+		return nil
+	})
+	if walkErr != nil && walkErr != errWalkLimit {
+		// Best-effort feature: on unexpected walk errors, fall back to
+		// whatever was collected so far rather than failing the whole
+		// request over a directory listing.
+		truncated = true
+	}
+
+	sort.Slice(entries, func(i, j int) bool { return entries[i].relPath < entries[j].relPath })
+
+	var b strings.Builder
+	for _, e := range entries {
+		depth := strings.Count(e.relPath, string(os.PathSeparator))
+		name := filepath.Base(e.relPath)
+		if e.isDir {
+			name += "/"
+		}
+		b.WriteString(strings.Repeat("  ", depth) + name + "\n")
+	}
+	return b.String(), truncated, len(entries)
 }
 
 func toolWriteFile(args map[string]interface{}) (string, error) {
