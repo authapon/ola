@@ -127,10 +127,14 @@ the normal case and only reach for it when it actually applies.
   ola has a local search backend configured for this session. Both accept
   a list, not just one item - if you need to search or read several things,
   put them all in a single call; independent items run in parallel
-  automatically, so there is no benefit to calling them one at a time. If
-  you do not see these tools in your list, you have no way to reach the
-  internet this session - say so plainly instead of guessing at "current"
-  facts, prices, versions, or inventing URLs.
+  automatically, so there is no benefit to calling them one at a time.
+  web_fetch by default does a plain HTTP fetch and strips the page down to
+  text - it does not execute JavaScript, so a page that renders its content
+  client-side may come back empty or thin; say so if that happens rather
+  than guessing at what the page would have shown. If you do not see these
+  tools in your list, you have no way to reach the internet this session -
+  say so plainly instead of guessing at "current" facts, prices, versions,
+  or inventing URLs.
 
 # WHEN NO FILES ARE ATTACHED
 If the user's message includes an auto-generated directory tree section, it
@@ -502,9 +506,17 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("Web search / fetch (ปิดโดย default จนกว่าจะตั้งค่า):")
 		fmt.Println("  ตั้ง OLA_SEARXNG_API_BASE (หรือ --searxng-url) เพื่อเปิด tool 'web_search' - เรียก local SearXNG")
 		fmt.Println("  instance ผ่าน JSON API (ต้องเปิด 'formats: json' ใน settings.yml ของ SearXNG เองก่อน)")
-		fmt.Println("  ตั้ง OLA_FETCH_API_BASE (หรือ --fetch-url) เพื่อเปิด tool 'web_fetch' - เรียก local scrape")
-		fmt.Println("  service (Playwright-based) ที่รับ POST {base}/scrape {\"url\":...} แล้วคืน markdown/text")
-		fmt.Println("  ola ไม่ได้ฝัง Playwright ไว้ในตัวไบนารีเอง - เป็นแค่ HTTP client เรียก service แยกที่คุณรันเอง")
+		fmt.Println("  เปิด tool 'web_fetch' ได้ 2 แบบ:")
+		fmt.Println("    --web-fetch (หรือ OLA_WEB_FETCH_DIRECT=1)  โหมด direct - ola fetch ด้วย HTTP GET เอง แล้วตัด")
+		fmt.Println("                                                 HTML เหลือแต่ข้อความส่งกลับ ไม่ต้องมี service เสริม")
+		fmt.Println("                                                 แต่ไม่รัน JavaScript หน้าที่ render ด้วย JS ล้วนๆ")
+		fmt.Println("                                                 อาจได้ข้อความว่าง")
+		fmt.Println("    --fetch-url (หรือ OLA_FETCH_API_BASE)       โหมด shim - เรียก local scrape service ที่คุณรันเอง")
+		fmt.Println("                                                 (เช่น ครอบ Playwright) รับ POST {base}/scrape")
+		fmt.Println("                                                 {\"url\":...} คืน markdown/text - รองรับหน้าที่ต้อง")
+		fmt.Println("                                                 render ด้วย JS ก่อน ถ้าตั้งค่านี้จะมีสิทธิ์เหนือกว่า")
+		fmt.Println("                                                 --web-fetch เสมอ")
+		fmt.Println("  ola ไม่ได้ฝัง Playwright ไว้ในตัวไบนารีเอง โหมด shim เป็นแค่ HTTP client เรียก service แยก")
 		fmt.Println("  ทั้งสอง tool รับ list ของ query/url ได้ในเรียกเดียว แล้วจะยิงแบบขนาน (bounded concurrency)")
 		fmt.Println("  โดยอัตโนมัติ ไม่ต้องเรียกทีละรายการ")
 		fmt.Println()
@@ -521,7 +533,8 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  OLA_OUTPUT_FILE           ไฟล์ output เริ่มต้น (override ด้วย -o, default: output.txt)")
 		fmt.Println("  OLA_TOPIC                 topic สำหรับส่ง notification ไป ntfy.sh (override ด้วย -x)")
 		fmt.Println("  OLA_SEARXNG_API_BASE      Host ของ SearXNG instance (override ด้วย --searxng-url) เปิด web_search")
-		fmt.Println("  OLA_FETCH_API_BASE        Host ของ scrape/Playwright service (override ด้วย --fetch-url) เปิด web_fetch")
+		fmt.Println("  OLA_FETCH_API_BASE        Host ของ scrape/Playwright shim (override ด้วย --fetch-url) เปิด web_fetch โหมด shim")
+		fmt.Println("  OLA_WEB_FETCH_DIRECT      ตั้งเป็น 1/true เพื่อเปิด web_fetch โหมด direct (override ด้วย --web-fetch)")
 		fmt.Println("  OLA_SEARCH_MAX_RESULTS    ผลลัพธ์สูงสุดต่อคำค้น (default: 5)")
 		fmt.Println("  OLA_SEARCH_CONCURRENCY    จำนวนคำค้นที่ยิงพร้อมกันสูงสุด (default: 3)")
 		fmt.Println("  OLA_FETCH_CONCURRENCY     จำนวน URL ที่ fetch พร้อมกันสูงสุด (default: 2)")
@@ -547,7 +560,8 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("      --allow <list>   binary เพิ่มเติมที่อนุญาตให้ run_command เรียกได้ คั่นด้วย comma เช่น \"golangci-lint,staticcheck\"")
 		fmt.Println("      --cmd-timeout <sec>  timeout ต่อการเรียก run_command/verify หนึ่งครั้ง (default: 60)")
 		fmt.Println("      --searxng-url <u>    override OLA_SEARXNG_API_BASE (เปิด web_search)")
-		fmt.Println("      --fetch-url <u>      override OLA_FETCH_API_BASE (เปิด web_fetch)")
+		fmt.Println("      --fetch-url <u>      override OLA_FETCH_API_BASE (เปิด web_fetch โหมด shim, มีสิทธิ์เหนือ --web-fetch)")
+		fmt.Println("      --web-fetch          เปิด web_fetch โหมด direct (HTTP GET + ตัด HTML เอง ไม่ต้องมี service เสริม)")
 		fmt.Println("      --no-web-search      ปิด web_search/web_fetch แม้จะตั้ง env/flag ไว้ก็ตาม")
 		fmt.Println("      --search-max-results <n>  override OLA_SEARCH_MAX_RESULTS")
 		fmt.Println("      --search-concurrency <n>  override OLA_SEARCH_CONCURRENCY")
@@ -606,7 +620,7 @@ func cmdAsk(args []string) int {
 	var buildCmd, testCmd, allowList string
 	var cmdTimeoutSec int
 	var searxngURL, fetchURL string
-	var flagNoWebSearch bool
+	var flagNoWebSearch, flagWebFetch bool
 	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
 
 	fs.StringVar(&model, "m", "", "")
@@ -637,6 +651,7 @@ func cmdAsk(args []string) int {
 	fs.StringVar(&promptFile, "prompt-file", "", "")
 	fs.StringVar(&searxngURL, "searxng-url", "", "")
 	fs.StringVar(&fetchURL, "fetch-url", "", "")
+	fs.BoolVar(&flagWebFetch, "web-fetch", false, "")
 	fs.BoolVar(&flagNoWebSearch, "no-web-search", false, "")
 	fs.IntVar(&searchMaxResults, "search-max-results", 0, "")
 	fs.IntVar(&searchConcurrency, "search-concurrency", 0, "")
@@ -856,7 +871,7 @@ func cmdAsk(args []string) int {
 	// OLA_FETCH_API_BASE, or the matching --searxng-url/--fetch-url flag),
 	// so a session on a machine without that local stack running never
 	// even sees these tools.
-	searchCfg := resolveSearchConfig(searxngURL, fetchURL, searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec, flagNoWebSearch)
+	searchCfg := resolveSearchConfig(searxngURL, fetchURL, flagWebFetch, searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec, flagNoWebSearch)
 
 	// Only add run_command to the tool list when there's a detected
 	// toolchain and the user hasn't disabled verification - a session with
@@ -918,10 +933,13 @@ func cmdAsk(args []string) int {
 			fmt.Println("── web_search: disabled (OLA_SEARXNG_API_BASE/--searxng-url not set, or --no-web-search) ──")
 		}
 		if searchCfg.fetchEnabled() {
-			fmt.Printf("── web_fetch: enabled (fetch service: %s, concurrency %d) ──\n",
-				searchCfg.FetchBase, searchCfg.FetchConcurrency)
+			mode := "direct (plain HTTP, no external service)"
+			if searchCfg.fetchUsesShim() {
+				mode = fmt.Sprintf("shim (%s)", searchCfg.FetchBase)
+			}
+			fmt.Printf("── web_fetch: enabled (mode: %s, concurrency %d) ──\n", mode, searchCfg.FetchConcurrency)
 		} else {
-			fmt.Println("── web_fetch: disabled (OLA_FETCH_API_BASE/--fetch-url not set, or --no-web-search) ──")
+			fmt.Println("── web_fetch: disabled (use --web-fetch for direct mode, or --fetch-url for a shim) ──")
 		}
 		var pretty map[string]interface{}
 		_ = json.Unmarshal(payload, &pretty)
@@ -964,8 +982,11 @@ func cmdAsk(args []string) int {
 		fmt.Fprintln(outFile, "# web_search: disabled")
 	}
 	if searchCfg.fetchEnabled() {
-		fmt.Fprintf(outFile, "# web_fetch: enabled (fetch service: %s, concurrency %d)\n",
-			searchCfg.FetchBase, searchCfg.FetchConcurrency)
+		mode := "direct (plain HTTP, no external service)"
+		if searchCfg.fetchUsesShim() {
+			mode = fmt.Sprintf("shim (%s)", searchCfg.FetchBase)
+		}
+		fmt.Fprintf(outFile, "# web_fetch: enabled (mode: %s, concurrency %d)\n", mode, searchCfg.FetchConcurrency)
 	} else {
 		fmt.Fprintln(outFile, "# web_fetch: disabled")
 	}

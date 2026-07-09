@@ -1,18 +1,29 @@
 // search.go - optional web_search / web_fetch tools backed by:
 //   - a local SearXNG instance for web_search (its native JSON API)
-//   - a local Playwright-backed HTTP scrape service for web_fetch
+//   - plain HTTP GET + HTML-to-text extraction for web_fetch, by default
 //
-// Design note: ola talks to BOTH over plain net/http only, exactly like it
-// already talks to Ollama itself. It deliberately does NOT embed a
-// Playwright/Puppeteer Go binding - doing so would pull in a Node.js driver
-// process and downloaded browser binaries at runtime, breaking the
-// single-native-Go-binary design this project otherwise holds to (see the
-// package doc comment in main.go). Instead, OLA_FETCH_API_BASE is expected
-// to point at a small local HTTP service - your own wrapper around
-// Playwright, or a Browserless-compatible instance - that accepts:
+// Design note: ola talks to SearXNG over plain net/http only, exactly like
+// it already talks to Ollama itself - no embedded browser automation. For
+// web_fetch, the *default* mode goes one step further and needs nothing
+// external at all: ola does a plain http.Get on the target URL itself and
+// strips the HTML down to readable text with the standard library only (no
+// headless browser, no Playwright, no extra process). This covers the
+// large majority of pages (docs, blog posts, articles, READMEs, API
+// references) without any extra infrastructure.
+//
+// It does NOT execute JavaScript, so client-side-rendered pages (content
+// that only appears after JS runs) will come back empty or thin. For that
+// minority of cases, web_fetch can optionally be pointed at a local
+// Playwright-backed HTTP scrape service instead (OLA_FETCH_API_BASE /
+// --fetch-url) - when that's configured it takes precedence over direct
+// mode automatically. The service just needs to accept:
 //
 //	POST {base}/scrape   {"url": "https://..."}
 //	  -> {"ok": true, "title": "...", "markdown": "...", "text": "..."}
+//
+// Either way, ola itself never links against a browser automation library -
+// it stays a single native Go binary with no runtime dependency beyond an
+// HTTP client.
 //
 // Both tools accept a *list* of queries/URLs and fan them out concurrently
 // (bounded by OLA_SEARCH_CONCURRENCY / OLA_FETCH_CONCURRENCY) so a model
@@ -22,11 +33,13 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,15 +54,27 @@ import (
 const (
 	defaultSearchMaxResults  = 5
 	defaultSearchConcurrency = 3
-	defaultFetchConcurrency  = 2 // browser tabs are far heavier than HTTP requests
-	defaultSearchTimeoutSec  = 20
-	defaultFetchTimeoutSec   = 30
+	// defaultFetchConcurrency covers both fetch modes. Direct mode (plain
+	// HTTP GET, the default) is cheap enough that this could go higher, but
+	// this same knob also applies when OLA_FETCH_API_BASE points at a
+	// Playwright-backed shim, where each concurrent fetch is a real browser
+	// tab - keeping the shared default modest is the safer choice; raise it
+	// per-run with --fetch-concurrency when only direct mode is in play.
+	defaultFetchConcurrency = 4
+	defaultSearchTimeoutSec = 20
+	defaultFetchTimeoutSec  = 30
 
 	// maxWebResultOutput caps how much text a single search/fetch result
 	// contributes to the model's context, same rationale as
 	// maxRunCommandOutput in coding.go: one verbose page or bloated result
 	// set must not blow the context budget by itself.
 	maxWebResultOutput = 6000
+
+	// maxFetchDownloadBytes caps how much of a response body direct-mode
+	// fetch will read before giving up, independent of the eventual
+	// truncation to maxWebResultOutput - a multi-hundred-MB response must
+	// not be downloaded in full just to throw most of it away afterwards.
+	maxFetchDownloadBytes = 6 << 20 // 6MB
 )
 
 // searchConfig holds resolved settings for the web_search/web_fetch tools.
@@ -59,7 +84,8 @@ const (
 // error out just confuses a local model into calling it anyway.
 type searchConfig struct {
 	SearXNGBase       string
-	FetchBase         string
+	FetchBase         string // shim mode (optional, JS-capable) - takes precedence over FetchDirect when set
+	FetchDirect       bool   // direct mode: plain http.Get + HTML-to-text, no external service needed
 	MaxResults        int
 	SearchConcurrency int
 	FetchConcurrency  int
@@ -68,12 +94,21 @@ type searchConfig struct {
 }
 
 func (c searchConfig) searchEnabled() bool { return c.SearXNGBase != "" }
-func (c searchConfig) fetchEnabled() bool  { return c.FetchBase != "" }
+func (c searchConfig) fetchEnabled() bool  { return c.FetchBase != "" || c.FetchDirect }
+
+// fetchUsesShim reports whether web_fetch should use the Playwright-backed
+// HTTP shim for this config. Shim mode wins whenever it's configured,
+// because it can render JavaScript and direct mode can't - --web-fetch /
+// OLA_WEB_FETCH_DIRECT is a "no external service available" fallback, not
+// meant to silently override a shim the user deliberately set up.
+func (c searchConfig) fetchUsesShim() bool { return c.FetchBase != "" }
 
 // resolveSearchConfig applies flag > env > default precedence. Pass 0/""
-// for any flag value the user didn't explicitly set. disable forces both
-// tools off regardless of env/flags (wired to --no-web-search).
-func resolveSearchConfig(searxngURL, fetchURL string, maxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int, disable bool) searchConfig {
+// for any flag value the user didn't explicitly set. fetchDirectFlag wires
+// --web-fetch (the "turn on direct-mode fetch" opt-in - no external service
+// needed). disable forces everything off regardless of env/flags (wired to
+// --no-web-search).
+func resolveSearchConfig(searxngURL, fetchURL string, fetchDirectFlag bool, maxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int, disable bool) searchConfig {
 	if disable {
 		return searchConfig{}
 	}
@@ -85,6 +120,7 @@ func resolveSearchConfig(searxngURL, fetchURL string, maxResults, searchConcurre
 	if fetch == "" {
 		fetch = os.Getenv("OLA_FETCH_API_BASE")
 	}
+	fetchDirect := fetchDirectFlag || envBool("OLA_WEB_FETCH_DIRECT")
 	if maxResults <= 0 {
 		maxResults = envInt("OLA_SEARCH_MAX_RESULTS", defaultSearchMaxResults)
 	}
@@ -103,6 +139,7 @@ func resolveSearchConfig(searxngURL, fetchURL string, maxResults, searchConcurre
 	return searchConfig{
 		SearXNGBase:       strings.TrimRight(base, "/"),
 		FetchBase:         strings.TrimRight(fetch, "/"),
+		FetchDirect:       fetchDirect,
 		MaxResults:        maxResults,
 		SearchConcurrency: searchConcurrency,
 		FetchConcurrency:  fetchConcurrency,
@@ -121,6 +158,11 @@ func envInt(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+func envBool(key string) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -155,9 +197,10 @@ var webFetchTool = ollamaTool{
 	Type: "function",
 	Function: ollamaToolFunction{
 		Name: "web_fetch",
-		Description: "โหลดเนื้อหาหน้าเว็บที่ render แล้ว (ผ่าน headless browser ในเครื่อง) จาก URL " +
+		Description: "โหลดเนื้อหาหน้าเว็บจาก URL แล้วดึงเฉพาะข้อความ (ตัด HTML/script/style ออก) กลับมาให้ " +
 			"รองรับหลาย URL พร้อมกันในเรียกเดียว (รันแบบขนานให้อัตโนมัติ) เนื้อหาที่ยาวเกินไปจะถูก truncate " +
-			"เฉพาะ http/https URL สาธารณะเท่านั้น",
+			"เฉพาะ http/https URL สาธารณะเท่านั้น ปกติเป็นการ fetch แบบ HTTP ธรรมดา (ไม่รัน JavaScript) " +
+			"ถ้าหน้าเว็บ render เนื้อหาด้วย JavaScript ล้วนๆ อาจได้ข้อความว่างหรือไม่ครบ",
 		Parameters: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -268,9 +311,129 @@ func toolWebSearch(args map[string]interface{}, cfg searchConfig) (string, error
 }
 
 // ─────────────────────────────────────────────────────────────────
-// web_fetch: talks to a local Playwright-backed HTTP scrape shim - see the
-// package doc comment above for the expected contract.
+// web_fetch: two modes.
+//   - direct (default): plain http.Get + HTML-to-text extraction, no
+//     external service required. Cannot execute JavaScript.
+//   - shim (optional, set OLA_FETCH_API_BASE/--fetch-url): delegates to a
+//     local Playwright-backed HTTP scrape service for JS-rendered pages.
+//     See the package doc comment above for the expected contract.
 // ─────────────────────────────────────────────────────────────────
+
+// fetchOne dispatches to shim or direct mode per cfg.fetchUsesShim().
+func fetchOne(client *http.Client, cfg searchConfig, rawURL string) (string, error) {
+	if cfg.fetchUsesShim() {
+		return fetchOneShim(client, cfg.FetchBase, rawURL)
+	}
+	return fetchOneDirect(client, rawURL)
+}
+
+// ── direct mode ─────────────────────────────────────────────────
+
+var (
+	reHTMLScript      = regexp.MustCompile(`(?is)<script\b[^>]*>.*?</script>`)
+	reHTMLStyle       = regexp.MustCompile(`(?is)<style\b[^>]*>.*?</style>`)
+	reHTMLComment     = regexp.MustCompile(`(?s)<!--.*?-->`)
+	reHTMLTitle       = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
+	reHTMLBlockClose  = regexp.MustCompile(`(?i)</\s*(p|div|br|li|h[1-6]|tr|table|section|article|header|footer|ul|ol|blockquote|pre)\s*>`)
+	reHTMLTag         = regexp.MustCompile(`(?s)<[^>]+>`)
+	reCollapseSpaces  = regexp.MustCompile(`[ \t\f\v]+`)
+	reCollapseBlanks  = regexp.MustCompile(`\n{3,}`)
+	reUserAgentString = "Mozilla/5.0 (compatible; ola-web-fetch/1.0; +https://github.com/)"
+)
+
+// htmlToText strips an HTML document down to a plain-text approximation of
+// its visible content, using only the standard library (regexp + html
+// entity unescaping - no full HTML parser, no external dependency). This is
+// intentionally a rough "poor man's readability", not a proper
+// main-content extractor: it will still include nav/footer/boilerplate
+// text that a real reader-mode would drop. That trade-off is deliberate -
+// it keeps web_fetch's default mode dependency-free - and is generally
+// good enough for a coding assistant skimming docs/articles/READMEs.
+func htmlToText(body string) (title, text string) {
+	if m := reHTMLTitle.FindStringSubmatch(body); len(m) > 1 {
+		title = strings.TrimSpace(html.UnescapeString(reHTMLTag.ReplaceAllString(m[1], "")))
+	}
+	s := reHTMLScript.ReplaceAllString(body, " ")
+	s = reHTMLStyle.ReplaceAllString(s, " ")
+	s = reHTMLComment.ReplaceAllString(s, " ")
+	s = reHTMLBlockClose.ReplaceAllString(s, "\n") // turn block boundaries into line breaks first
+	s = reHTMLTag.ReplaceAllString(s, " ")         // then drop all remaining tags
+	s = html.UnescapeString(s)
+	s = reCollapseSpaces.ReplaceAllString(s, " ")
+
+	var lines []string
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	text = reCollapseBlanks.ReplaceAllString(strings.Join(lines, "\n"), "\n\n")
+	return title, text
+}
+
+// fetchOneDirect is the production entry point for direct mode: SSRF policy
+// (validateFetchURL) is enforced here, then delegates to doDirectFetch for
+// the actual HTTP GET + content extraction. Kept separate so tests can
+// exercise doDirectFetch's mechanics (content-type handling, HTML-to-text)
+// against a local httptest server without tripping the loopback rejection
+// that a *production* fetch target correctly should trip.
+func fetchOneDirect(client *http.Client, rawURL string) (string, error) {
+	if err := validateFetchURL(rawURL); err != nil {
+		return "", err
+	}
+	return doDirectFetch(client, rawURL)
+}
+
+func doDirectFetch(client *http.Client, rawURL string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return "", err
+	}
+	// A generic browser-like UA and Accept header: several sites reject or
+	// serve a stripped-down response to requests that look like a bare
+	// script client, independent of any JS-rendering requirement.
+	req.Header.Set("User-Agent", reUserAgentString)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,text/plain;q=0.9,application/json;q=0.8,*/*;q=0.5")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch URL ไม่สำเร็จ: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<10))
+		return "", fmt.Errorf("HTTP %d จาก %s: %s", resp.StatusCode, rawURL, truncateText(string(body), 200))
+	}
+
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxFetchDownloadBytes))
+	if err != nil {
+		return "", fmt.Errorf("อ่าน response body ไม่ได้: %w", err)
+	}
+
+	switch {
+	case strings.Contains(ct, "html"):
+		title, text := htmlToText(string(body))
+		if strings.TrimSpace(text) == "" {
+			return "", fmt.Errorf(
+				"หน้านี้ไม่เหลือข้อความหลังตัด HTML ออก - เป็นไปได้ว่าเนื้อหา render ด้วย JavaScript ล้วนๆ " +
+					"(ตั้ง OLA_FETCH_API_BASE/--fetch-url ให้ชี้ไปยัง Playwright-based scrape service ถ้าต้อง fetch หน้าแบบนี้)")
+		}
+		header := ""
+		if title != "" {
+			header = "# " + title + "\n\n"
+		}
+		return truncateText(header+text, maxWebResultOutput), nil
+	case strings.Contains(ct, "text/") || strings.Contains(ct, "json") || strings.Contains(ct, "xml"):
+		return truncateText(string(body), maxWebResultOutput), nil
+	default:
+		return "", fmt.Errorf("Content-Type %q ไม่ใช่ text/html/json - web_fetch (direct mode) รองรับเฉพาะเนื้อหาที่เป็นข้อความ", ct)
+	}
+}
+
+// ── shim mode ────────────────────────────────────────────────────
 
 type fetchShimResponse struct {
 	OK       bool   `json:"ok"`
@@ -281,7 +444,7 @@ type fetchShimResponse struct {
 	Message  string `json:"message"`
 }
 
-func fetchOne(client *http.Client, base, rawURL string) (string, error) {
+func fetchOneShim(client *http.Client, base, rawURL string) (string, error) {
 	if err := validateFetchURL(rawURL); err != nil {
 		return "", err
 	}
@@ -299,7 +462,7 @@ func fetchOne(client *http.Client, base, rawURL string) (string, error) {
 		return "", fmt.Errorf("เรียก fetch service ไม่สำเร็จ: %w", err)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20)) // 4MB safety cap
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxFetchDownloadBytes))
 	if err != nil {
 		return "", err
 	}
@@ -335,7 +498,8 @@ func fetchOne(client *http.Client, base, rawURL string) (string, error) {
 
 func toolWebFetch(args map[string]interface{}, cfg searchConfig) (string, error) {
 	if !cfg.fetchEnabled() {
-		return "", fmt.Errorf("web_fetch ไม่ได้ถูกตั้งค่า (ต้องตั้ง OLA_FETCH_API_BASE หรือ --fetch-url)")
+		return "", fmt.Errorf("web_fetch ไม่ได้ถูกตั้งค่า (เปิดโหมด direct ด้วย --web-fetch/OLA_WEB_FETCH_DIRECT=1 " +
+			"หรือใช้ shim ด้วย OLA_FETCH_API_BASE/--fetch-url)")
 	}
 	urls := stringsFromArg(args["urls"])
 	if len(urls) == 0 {
@@ -356,7 +520,7 @@ func toolWebFetch(args map[string]interface{}, cfg searchConfig) (string, error)
 		go func(idx int, target string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			r, err := fetchOne(client, cfg.FetchBase, target)
+			r, err := fetchOne(client, cfg, target)
 			if err != nil {
 				results[idx] = fmt.Sprintf("=== url: %s ===\nERROR: %v", target, err)
 				return
