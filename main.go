@@ -21,11 +21,13 @@
 //	write_file     - create or overwrite a file with full content
 //	edit_file      - unique search/replace inside an existing file
 //	ask_user       - block on stdin and ask the human a question
+//	get_current_time - real system date/time, optionally in a given IANA
+//	                 timezone (models have no reliable notion of "now")
 //
 // "coding" (see coding.go) is a longer-running, requirements-file-driven
 // loop meant to run unattended: instead of a prompt, it reads a
 // requirements.md-style file and works through an implement/verify/fix
-// cycle on its own, using the same five base tools above plus four more
+// cycle on its own, using the same six base tools above plus four more
 // (add_tasks, mark_task_done, run_command, report_complete). It has its own
 // system prompt, its own (much higher) iteration cap plus a wall-clock
 // timeout, and a verification gate: report_complete does not end the
@@ -116,6 +118,13 @@ the normal case and only reach for it when it actually applies.
   destructive/hard-to-reverse change (e.g. overwriting a large existing
   file). Do not use it for things you can reasonably decide yourself - state
   the assumption instead and move on.
+- get_current_time(timezone?): the real current date/time from the system
+  clock, optionally converted into a given IANA timezone (e.g.
+  "Asia/Bangkok"). You have no reliable way to know what day or time it is
+  right now on your own - call this rather than guessing whenever the task
+  actually depends on the current date/time (e.g. "what's today's date",
+  computing a deadline, stamping a file). Don't call it for tasks that don't
+  need it.
 - run_command(command): ONLY present in your tool list when ola has
   detected a known build/test toolchain in the current directory (e.g. a
   go.mod) and verification is enabled for this session. If you do not see
@@ -452,6 +461,25 @@ var builtinTools = []ollamaTool{
 			},
 		},
 	},
+	{
+		Type: "function",
+		Function: ollamaToolFunction{
+			Name: "get_current_time",
+			Description: "รับค่าวันที่/เวลาปัจจุบันจริงจากนาฬิกาของระบบ (ไม่ใช่จากความจำหรือการเดาของโมเดล) " +
+				"ใช้เมื่อ task ต้องรู้วันที่/เวลาปัจจุบัน เช่น ถูกถามว่าวันนี้วันที่เท่าไหร่, คำนวณ deadline/อายุ, " +
+				"หรือใส่ timestamp ลงไฟล์ - อย่าเดาวันที่ปัจจุบันเอง เรียก tool นี้แทน",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"timezone": map[string]interface{}{
+						"type": "string",
+						"description": "IANA timezone name เช่น \"Asia/Bangkok\", \"UTC\", \"America/New_York\" " +
+							"(default: timezone ของเครื่องที่รัน ola)",
+					},
+				},
+			},
+		},
+	},
 }
 
 // runCommandTool is the "run_command" tool schema shared by "ask" (added
@@ -485,7 +513,7 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println()
 		fmt.Println("เรียก Ollama ผ่าน HTTP API (/api/chat) พร้อม streaming + thinking + timing")
 		fmt.Println("และ built-in tool calling ที่เปิดใช้งานเสมอ (ไม่มี flag ปิด/เปิด):")
-		fmt.Println("  read_file, search_files, write_file, edit_file, ask_user")
+		fmt.Println("  read_file, search_files, write_file, edit_file, ask_user, get_current_time")
 		fmt.Println("  รวมถึง run_command / web_search / web_fetch แบบมีเงื่อนไข (ดูหัวข้อ Verify และ Web search ด้านล่าง)")
 		fmt.Println()
 		fmt.Println("ทุก path ที่ tool ใช้อ้างอิงจาก current directory ที่รัน ola อยู่เสมอ")
@@ -969,10 +997,10 @@ func cmdAsk(args []string) int {
 	fmt.Fprintf(outFile, "# num_ctx: %d\n", ctx)
 	fmt.Fprintf(outFile, "# cwd (tool sandbox root): %s\n", cwd)
 	if verifyEnabled {
-		fmt.Fprintf(outFile, "# tools: read_file, search_files, write_file, edit_file, ask_user, run_command (detected: %s, build: %q, test: %q, cmd-timeout: %ds, max %d auto-verify round(s))\n",
+		fmt.Fprintf(outFile, "# tools: read_file, search_files, write_file, edit_file, ask_user, get_current_time, run_command (detected: %s, build: %q, test: %q, cmd-timeout: %ds, max %d auto-verify round(s))\n",
 			cmds.Label, cmds.BuildCmd, cmds.TestCmd, cmdTimeoutSec, maxAskVerifyRounds)
 	} else {
-		fmt.Fprintln(outFile, "# tools: read_file, search_files, write_file, edit_file, ask_user (run_command not offered: no detected toolchain, or --no-verify)")
+		fmt.Fprintln(outFile, "# tools: read_file, search_files, write_file, edit_file, ask_user, get_current_time (run_command not offered: no detected toolchain, or --no-verify)")
 	}
 	fmt.Fprintf(outFile, "# directory tree: %s\n", treeNote)
 	if searchCfg.searchEnabled() {
@@ -1583,14 +1611,42 @@ func toolAskUser(args map[string]interface{}, ntfyTopic, red, reset string) (str
 	return answer, nil
 }
 
+// toolGetCurrentTime returns the real current date/time from the system
+// clock - not something a model has any reliable way to know on its own
+// (local models especially have no notion of "now"; even their training
+// cutoff doesn't tell them what day it is when they're actually running).
+// Optional IANA timezone name to convert into; defaults to the local
+// timezone of the machine ola is running on.
+func toolGetCurrentTime(args map[string]interface{}) (string, error) {
+	now := time.Now()
+	if tzName, _ := args["timezone"].(string); tzName != "" {
+		loc, err := time.LoadLocation(tzName)
+		if err != nil {
+			return "", fmt.Errorf(
+				"timezone %q ไม่ถูกต้อง (ต้องเป็น IANA timezone name เช่น \"Asia/Bangkok\", \"UTC\", \"America/New_York\"): %w",
+				tzName, err)
+		}
+		now = now.In(loc)
+	}
+	return fmt.Sprintf(
+		"current_time: %s\nday_of_week: %s\ndate: %s\ntime: %s\nunix_timestamp: %d\ntimezone: %s",
+		now.Format("2006-01-02 15:04:05 -0700 MST"),
+		now.Weekday().String(),
+		now.Format("2006-01-02"),
+		now.Format("15:04:05"),
+		now.Unix(),
+		now.Location().String(),
+	), nil
+}
+
 // dispatchToolCall executes a single tool call, printing it (and its
 // result) to the terminal in red, logging the full exchange to outFile, and
 // returning the string that should be sent back to the model as the
 // content of a role:"tool" message.
 //
-// extra is an optional hook for tool names beyond the five base ones
+// extra is an optional hook for tool names beyond the six base ones
 // handled directly below (name, parsed-args) -> (result, error, handled).
-// "ask" passes nil, since it only ever offers the base five tools to the
+// "ask" passes nil, since it only ever offers the base six tools to the
 // model in the first place. "coding" (see coding.go) passes a closure
 // covering add_tasks/mark_task_done/run_command/report_complete, so those
 // get the same printing/logging/error-handling treatment as the base tools
@@ -1622,6 +1678,8 @@ func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.Fil
 		}
 	case "ask_user":
 		result, err = toolAskUser(args, ntfyTopic, red, reset)
+	case "get_current_time":
+		result, err = toolGetCurrentTime(args)
 	default:
 		if extra != nil {
 			if r, e, handled := extra(tc.Function.Name, args); handled {

@@ -124,6 +124,12 @@ requirements is actually built and actually works.
   when that happens, pick the most reasonable default yourself, state the
   assumption explicitly in your next message, and keep going. Do not call
   ask_user repeatedly for the same question.
+- get_current_time(timezone?): the real current date/time from the system
+  clock, optionally converted into a given IANA timezone. You have no
+  reliable way to know what day or time it is right now on your own - call
+  this rather than guessing whenever the task actually depends on it (e.g.
+  computing a deadline, stamping a file, a requirement phrased relative to
+  "today").
 - add_tasks(tasks): register your implementation plan as a checklist, one
   short string per concrete task. Call this ONCE, early, right after you've
   read the requirements and looked over the repository - not per file, per
@@ -901,7 +907,7 @@ func codingUsage(fs *flag.FlagSet) func() {
 		fmt.Println("(default: requirements.md), วางแผนเป็น task checklist, implement, เรียก build/test")
 		fmt.Println("ของโปรเจกต์เอง วนแก้จนกว่าจะผ่านจริง แล้วจึงรายงานว่าสำเร็จ")
 		fmt.Println()
-		fmt.Println("Tool ที่เปิดใช้เสมอ (นอกเหนือจาก 5 ตัวของ ask): add_tasks, mark_task_done,")
+		fmt.Println("Tool ที่เปิดใช้เสมอ (นอกเหนือจาก 6 ตัวของ ask): add_tasks, mark_task_done,")
 		fmt.Println("run_command (allowlisted ตาม toolchain ที่ตรวจพบ), report_complete")
 		fmt.Println("รวมถึง web_search / web_fetch แบบมีเงื่อนไข (ดูหัวข้อ Web search ด้านล่าง)")
 		fmt.Println()
