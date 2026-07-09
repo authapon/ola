@@ -1,33 +1,39 @@
 // search.go - optional web_search / web_fetch tools backed by:
+//
 //   - a local SearXNG instance for web_search (its native JSON API)
-//   - plain HTTP GET + HTML-to-text extraction for web_fetch, by default
 //
-// Design note: ola talks to SearXNG over plain net/http only, exactly like
-// it already talks to Ollama itself - no embedded browser automation. For
-// web_fetch, the *default* mode goes one step further and needs nothing
-// external at all: ola does a plain http.Get on the target URL itself and
-// strips the HTML down to readable text with the standard library only (no
-// headless browser, no Playwright, no extra process). This covers the
-// large majority of pages (docs, blog posts, articles, READMEs, API
-// references) without any extra infrastructure.
+//   - one of three modes for web_fetch, in order of precedence:
 //
-// It does NOT execute JavaScript, so client-side-rendered pages (content
-// that only appears after JS runs) will come back empty or thin. For that
-// minority of cases, web_fetch can optionally be pointed at a local
-// Playwright-backed HTTP scrape service instead (OLA_FETCH_API_BASE /
-// --fetch-url) - when that's configured it takes precedence over direct
-// mode automatically. The service just needs to accept:
+//     1. shim (OLA_FETCH_API_BASE / --fetch-url): delegates to your own local
+//     HTTP scrape service - see the contract below. Most flexible, but
+//     requires you to run and maintain that service.
+//     2. cdp (OLA_FETCH_CDP_BASE / --fetch-cdp-url, see cdp.go): talks directly
+//     to a Chromium/Chrome instance's own remote-debugging protocol - the
+//     SAME protocol Playwright itself uses internally - with no wrapper
+//     service needed at all, just the browser's debugging port. This is the
+//     recommended way to get real JavaScript rendering without writing or
+//     running anything extra.
+//     3. direct (OLA_WEB_FETCH_DIRECT / --web-fetch, the zero-config default
+//     once enabled): plain http.Get + HTML-to-text extraction, entirely
+//     within ola itself. No JavaScript execution, but needs nothing external
+//     at all - not even a browser.
+//
+// Design note: ola talks to SearXNG and shim-mode fetch over plain
+// net/http, and to CDP-mode fetch over a minimal hand-rolled WebSocket
+// client (see cdp.go) - no embedded browser automation library, no
+// Node.js driver process, in any mode. ola remains a single native Go
+// binary with no runtime dependency beyond an HTTP/WebSocket client either
+// way.
+//
+// The shim contract, if you use it:
 //
 //	POST {base}/scrape   {"url": "https://..."}
 //	  -> {"ok": true, "title": "...", "markdown": "...", "text": "..."}
 //
-// Either way, ola itself never links against a browser automation library -
-// it stays a single native Go binary with no runtime dependency beyond an
-// HTTP client.
-//
-// Both tools accept a *list* of queries/URLs and fan them out concurrently
-// (bounded by OLA_SEARCH_CONCURRENCY / OLA_FETCH_CONCURRENCY) so a model
-// asking about several things at once doesn't pay for them serially.
+// Both web_search and web_fetch accept a *list* of queries/URLs and fan
+// them out concurrently (bounded by OLA_SEARCH_CONCURRENCY /
+// OLA_FETCH_CONCURRENCY) so a model asking about several things at once
+// doesn't pay for them serially.
 package main
 
 import (
@@ -84,7 +90,8 @@ const (
 // error out just confuses a local model into calling it anyway.
 type searchConfig struct {
 	SearXNGBase       string
-	FetchBase         string // shim mode (optional, JS-capable) - takes precedence over FetchDirect when set
+	FetchBase         string // shim mode (optional, JS-capable) - highest precedence
+	FetchCDPBase      string // CDP mode (optional, JS-capable, no wrapper needed) - precedence between shim and direct
 	FetchDirect       bool   // direct mode: plain http.Get + HTML-to-text, no external service needed
 	MaxResults        int
 	SearchConcurrency int
@@ -94,21 +101,43 @@ type searchConfig struct {
 }
 
 func (c searchConfig) searchEnabled() bool { return c.SearXNGBase != "" }
-func (c searchConfig) fetchEnabled() bool  { return c.FetchBase != "" || c.FetchDirect }
+func (c searchConfig) fetchEnabled() bool {
+	return c.FetchBase != "" || c.FetchCDPBase != "" || c.FetchDirect
+}
 
 // fetchUsesShim reports whether web_fetch should use the Playwright-backed
-// HTTP shim for this config. Shim mode wins whenever it's configured,
-// because it can render JavaScript and direct mode can't - --web-fetch /
-// OLA_WEB_FETCH_DIRECT is a "no external service available" fallback, not
-// meant to silently override a shim the user deliberately set up.
+// HTTP shim for this config. Shim mode wins whenever it's configured, since
+// it's the most capable/customizable option and a deliberate setup choice.
 func (c searchConfig) fetchUsesShim() bool { return c.FetchBase != "" }
+
+// fetchUsesCDP reports whether web_fetch should talk directly to a
+// browser's remote-debugging protocol (see cdp.go). Wins over direct mode
+// whenever configured and no shim is set, since it can render JavaScript
+// and direct mode can't.
+func (c searchConfig) fetchUsesCDP() bool { return c.FetchBase == "" && c.FetchCDPBase != "" }
+
+// fetchModeLabel is a short human-readable description of the active
+// web_fetch mode, used in dry-run/log output.
+func (c searchConfig) fetchModeLabel() string {
+	switch {
+	case c.fetchUsesShim():
+		return fmt.Sprintf("shim (%s)", c.FetchBase)
+	case c.fetchUsesCDP():
+		return fmt.Sprintf("cdp (%s)", c.FetchCDPBase)
+	case c.FetchDirect:
+		return "direct (plain HTTP, no external service)"
+	default:
+		return "disabled"
+	}
+}
 
 // resolveSearchConfig applies flag > env > default precedence. Pass 0/""
 // for any flag value the user didn't explicitly set. fetchDirectFlag wires
 // --web-fetch (the "turn on direct-mode fetch" opt-in - no external service
 // needed). disable forces everything off regardless of env/flags (wired to
-// --no-web-search).
-func resolveSearchConfig(searxngURL, fetchURL string, fetchDirectFlag bool, maxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int, disable bool) searchConfig {
+// --no-web-search). Fetch mode precedence when more than one is configured:
+// shim > cdp > direct (see fetchUsesShim/fetchUsesCDP).
+func resolveSearchConfig(searxngURL, fetchURL, fetchCDPURL string, fetchDirectFlag bool, maxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int, disable bool) searchConfig {
 	if disable {
 		return searchConfig{}
 	}
@@ -119,6 +148,10 @@ func resolveSearchConfig(searxngURL, fetchURL string, fetchDirectFlag bool, maxR
 	fetch := fetchURL
 	if fetch == "" {
 		fetch = os.Getenv("OLA_FETCH_API_BASE")
+	}
+	fetchCDP := fetchCDPURL
+	if fetchCDP == "" {
+		fetchCDP = os.Getenv("OLA_FETCH_CDP_BASE")
 	}
 	fetchDirect := fetchDirectFlag || envBool("OLA_WEB_FETCH_DIRECT")
 	if maxResults <= 0 {
@@ -139,6 +172,7 @@ func resolveSearchConfig(searxngURL, fetchURL string, fetchDirectFlag bool, maxR
 	return searchConfig{
 		SearXNGBase:       strings.TrimRight(base, "/"),
 		FetchBase:         strings.TrimRight(fetch, "/"),
+		FetchCDPBase:      strings.TrimRight(fetchCDP, "/"),
 		FetchDirect:       fetchDirect,
 		MaxResults:        maxResults,
 		SearchConcurrency: searchConcurrency,
@@ -200,7 +234,8 @@ var webFetchTool = ollamaTool{
 		Description: "โหลดเนื้อหาหน้าเว็บจาก URL แล้วดึงเฉพาะข้อความ (ตัด HTML/script/style ออก) กลับมาให้ " +
 			"รองรับหลาย URL พร้อมกันในเรียกเดียว (รันแบบขนานให้อัตโนมัติ) เนื้อหาที่ยาวเกินไปจะถูก truncate " +
 			"เฉพาะ http/https URL สาธารณะเท่านั้น ปกติเป็นการ fetch แบบ HTTP ธรรมดา (ไม่รัน JavaScript) " +
-			"ถ้าหน้าเว็บ render เนื้อหาด้วย JavaScript ล้วนๆ อาจได้ข้อความว่างหรือไม่ครบ",
+			"แต่ถ้ามีการตั้งค่า cdp/shim mode ไว้ จะ render JavaScript ผ่านเบราว์เซอร์จริงได้ด้วย - ไม่รู้ล่วงหน้าว่า " +
+			"โหมดไหนกำลังทำงานอยู่ ถ้าได้ข้อความว่างหรือดูไม่ครบให้บอกตามตรงแทนการเดา",
 		Parameters: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -321,10 +356,14 @@ func toolWebSearch(args map[string]interface{}, cfg searchConfig) (string, error
 
 // fetchOne dispatches to shim or direct mode per cfg.fetchUsesShim().
 func fetchOne(client *http.Client, cfg searchConfig, rawURL string) (string, error) {
-	if cfg.fetchUsesShim() {
+	switch {
+	case cfg.fetchUsesShim():
 		return fetchOneShim(client, cfg.FetchBase, rawURL)
+	case cfg.fetchUsesCDP():
+		return fetchOneCDP(client, cfg.FetchCDPBase, rawURL, cfg.FetchTimeout)
+	default:
+		return fetchOneDirect(client, rawURL)
 	}
-	return fetchOneDirect(client, rawURL)
 }
 
 // ── direct mode ─────────────────────────────────────────────────
@@ -498,8 +537,8 @@ func fetchOneShim(client *http.Client, base, rawURL string) (string, error) {
 
 func toolWebFetch(args map[string]interface{}, cfg searchConfig) (string, error) {
 	if !cfg.fetchEnabled() {
-		return "", fmt.Errorf("web_fetch ไม่ได้ถูกตั้งค่า (เปิดโหมด direct ด้วย --web-fetch/OLA_WEB_FETCH_DIRECT=1 " +
-			"หรือใช้ shim ด้วย OLA_FETCH_API_BASE/--fetch-url)")
+		return "", fmt.Errorf("web_fetch ไม่ได้ถูกตั้งค่า (เปิดโหมด direct ด้วย --web-fetch/OLA_WEB_FETCH_DIRECT=1, " +
+			"โหมด cdp ด้วย OLA_FETCH_CDP_BASE/--fetch-cdp-url, หรือโหมด shim ด้วย OLA_FETCH_API_BASE/--fetch-url)")
 	}
 	urls := stringsFromArg(args["urls"])
 	if len(urls) == 0 {
