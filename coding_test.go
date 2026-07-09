@@ -50,6 +50,130 @@ func TestSplitCommandSegments(t *testing.T) {
 	}
 }
 
+func TestIsVerifiableEditGatesByToolchainExtension(t *testing.T) {
+	cases := []struct {
+		path, label string
+		forceAny    bool
+		want        bool
+	}{
+		{"main.go", "go", false, true},
+		{"notes.txt", "go", false, false},
+		{"README.md", "go", false, false},
+		{"package.json", "node", false, true},
+		{"index.js", "node", false, true},
+		{"design.txt", "node", false, false},
+		{"lib.rs", "rust", false, true},
+		{"app.py", "python", false, true},
+		{"anything.txt", "generic", false, false},
+		// An explicit --build-cmd/--test-cmd override means the user opted
+		// in deliberately - any file counts, regardless of extension.
+		{"notes.txt", "go", true, true},
+		{"", "go", false, false},
+	}
+	for _, c := range cases {
+		got := isVerifiableEdit(c.path, c.label, c.forceAny)
+		if got != c.want {
+			t.Errorf("isVerifiableEdit(%q, %q, %v) = %v, want %v", c.path, c.label, c.forceAny, got, c.want)
+		}
+	}
+}
+
+func TestRunBuildOnlyPassesAndFails(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	if err := os.WriteFile("go.mod", []byte("module buildonlytest\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("main.go", []byte("package main\n\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmds := detectProjectCommands(dir)
+
+	passed, report := runBuildOnly(cmds, 5*time.Second)
+	if !passed {
+		t.Fatalf("expected build-only check to pass on valid code, got: %s", report)
+	}
+
+	// Now break the build and confirm the light check catches it.
+	if err := os.WriteFile("main.go", []byte("package main\n\nfunc main() {\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	passed, report = runBuildOnly(cmds, 5*time.Second)
+	if passed {
+		t.Fatal("expected build-only check to fail on broken code")
+	}
+	if !strings.Contains(report, "exit_code") {
+		t.Fatalf("expected failure report to include exit_code, got: %s", report)
+	}
+}
+
+// TestMarkTaskDoneRejectedWhenBuildBroken exercises dispatchCodingToolCall
+// directly (no HTTP mock needed) to confirm mark_task_done's build-only
+// light gate rejects the call - and does NOT mark the task done - when the
+// project doesn't currently build, then succeeds once it's fixed.
+func TestMarkTaskDoneRejectedWhenBuildBroken(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	if err := os.WriteFile("go.mod", []byte("module marktest\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Broken from the start.
+	if err := os.WriteFile("main.go", []byte("package main\n\nfunc main() {\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmds := detectProjectCommands(dir)
+
+	state := newCodingState()
+	state.addTasks([]string{"do the thing"})
+
+	outFile, err := os.CreateTemp(dir, "log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+
+	rc := &codingRunContext{
+		outFile: outFile, state: state, allowed: cmds.AllowBins,
+		cmdTO: 5 * time.Second, cmds: cmds,
+	}
+
+	markArgs, _ := json.Marshal(map[string]interface{}{"task_id": "T0", "note": "done"})
+	tc := toolCall{Function: toolCallFunction{Name: "mark_task_done", Arguments: markArgs}}
+
+	result, isReport := dispatchCodingToolCall(tc, rc)
+	if isReport {
+		t.Fatal("mark_task_done must never report as report_complete")
+	}
+	if !strings.Contains(result, "ถูกปฏิเสธ") {
+		t.Fatalf("expected mark_task_done to be rejected while build is broken, got: %s", result)
+	}
+	if state.Tasks[0].Done {
+		t.Fatal("task must not be marked done when the build-only gate rejects it")
+	}
+
+	// Fix the build and retry - should now succeed and actually mark done.
+	if err := os.WriteFile("main.go", []byte("package main\n\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	result, _ = dispatchCodingToolCall(tc, rc)
+	if strings.Contains(result, "ถูกปฏิเสธ") {
+		t.Fatalf("expected mark_task_done to succeed once build is fixed, got: %s", result)
+	}
+	if !state.Tasks[0].Done {
+		t.Fatal("expected task to be marked done after the build-only gate passes")
+	}
+}
+
 func TestCodingStateAddAndMarkDone(t *testing.T) {
 	s := newCodingState()
 	added := s.addTasks([]string{"Set up scaffolding", "Implement feature X"})

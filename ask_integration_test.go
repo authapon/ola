@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -27,6 +28,122 @@ import (
 // build/test re-check after a plain final answer (never trusting the
 // model's own claim that a change works), and clean loop termination once
 // verification actually passes.
+// TestCmdAskVerifyDisabledForNonCodeFileEdit is the regression test for the
+// "vibe coding" bug: editing a plain-text/doc file inside a directory that
+// happens to have a detected toolchain (here: a go.mod) must NOT trigger
+// ola's auto-verify machinery. Before the isVerifiableEdit fix, filesChanged
+// was set for ANY successful write_file/edit_file call regardless of what
+// was edited, so a "fix a typo in notes.txt" session inside a Go repo would
+// still try to "go build" it - or worse, misdetect a completely unrelated
+// toolchain (e.g. Node) in a directory that also happened to have a
+// package.json lying around, and try to run that instead.
+func TestCmdAskVerifyDisabledForNonCodeFileEdit(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	if err := os.WriteFile("go.mod", []byte("module doctest\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("notes.txt", []byte("this is a note\nwith a typo: helllo\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var round int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&round, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if n == 1 {
+			argsJSON := fmt.Sprintf(`{"path":"notes.txt","old_str":%q,"new_str":%q}`, "helllo", "hello")
+			fmt.Fprint(w, streamLine("", "edit_file", argsJSON, true))
+			return
+		}
+		// If verify had (wrongly) kicked in, this would be round 2 seeing a
+		// [verify]-fed-back tool message instead of a clean final answer.
+		fmt.Fprint(w, streamLine("แก้ typo ให้แล้วครับ", "", "", true))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdAsk([]string{"-m", "mock-model", "-o", "ask-doc.log", "fix the typo in notes.txt"})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdAsk to exit 0, got %d", exitCode)
+	}
+	if got := atomic.LoadInt32(&round); got != 2 {
+		t.Fatalf("expected exactly 2 rounds (edit, final answer - no verify round), got %d", got)
+	}
+
+	fixed, err := os.ReadFile("notes.txt")
+	if err != nil {
+		t.Fatalf("expected notes.txt to exist: %v", err)
+	}
+	if !strings.Contains(string(fixed), "hello") {
+		t.Fatalf("expected the typo fix to have been applied, got: %s", fixed)
+	}
+
+	log, err := os.ReadFile("ask-doc.log")
+	if err != nil {
+		t.Fatalf("expected output log to exist: %v", err)
+	}
+	if strings.Contains(string(log), "[verify]") {
+		t.Fatalf("expected NO verify/build attempt for a plain .txt doc edit in a Go repo, got:\n%s", log)
+	}
+	if !strings.Contains(string(log), "[verify-skip]") {
+		t.Fatalf("expected a '[verify-skip] ...' note explaining why verify was skipped, got:\n%s", log)
+	}
+}
+
+// TestCmdAskPromptFile confirms -f/--prompt-file reads the prompt text from
+// a file instead of requiring it as a positional argument, and that in this
+// mode every remaining positional argument is treated as an attachment.
+func TestCmdAskPromptFile(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	if err := os.WriteFile("prompt.txt", []byte("สรุปไฟล์ที่แนบมาให้หน่อย\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("attached.txt", []byte("เนื้อหาไฟล์แนบ\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotBody string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("รับทราบครับ", "", "", true))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdAsk([]string{"-m", "mock-model", "-o", "ask-pf.log", "-f", "prompt.txt", "attached.txt"})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdAsk to exit 0, got %d", exitCode)
+	}
+	if !strings.Contains(gotBody, "สรุปไฟล์ที่แนบมาให้หน่อย") {
+		t.Fatalf("expected the prompt file's content to be used as the prompt, got request body: %s", gotBody)
+	}
+	if !strings.Contains(gotBody, "เนื้อหาไฟล์แนบ") {
+		t.Fatalf("expected attached.txt's content to be attached since -f leaves all positionals as attachments, got: %s", gotBody)
+	}
+}
+
 func TestCmdAskAutoVerifyLoop(t *testing.T) {
 	dir := t.TempDir()
 	origWD, _ := os.Getwd()

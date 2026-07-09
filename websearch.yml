@@ -1,0 +1,49 @@
+version: "3.8"
+
+services:
+  playwright:
+    image: mcr.microsoft.com/playwright:latest
+    container_name: playwright
+    ports:
+      - 127.0.0.1:3000:3000
+    command: npx -y playwright@latest run-server --port 3000 --host 0.0.0.0
+    networks:
+      - ai-net
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    ports:
+      - 127.0.0.1:3001:8080
+    volumes:
+      # การ Mount โฟลเดอร์จากเครื่อง (Bind Mount) ใน Swarm
+      # จำเป็นต้องระบุ constraint ให้รันเฉพาะบน Manager node
+      - ./searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080/
+      - SEARXNG_SECRET=${SEARXNG_SECRET:-my_super_secret_key_change_me}
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+    networks:
+      - ai-net
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints:
+          - node.role == manager # บังคับให้รันบน Manager node ที่มีโฟลเดอร์ ./searxng
+
+networks:
+  ai-net:
+    driver: overlay
+    attachable: true
