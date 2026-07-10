@@ -45,17 +45,15 @@ func TestHtmlToTextStripsScriptStyleTagsAndExtractsTitle(t *testing.T) {
 	}
 }
 
-// TestDoDirectFetchRunsInParallel confirms the underlying direct-fetch
-// function is safe and fast to call concurrently (goroutine-safe, no shared
-// mutable state) against a mock HTML server - mirroring the worker-pool
-// pattern toolWebFetch itself uses. It calls doDirectFetch (not
-// toolWebFetch/fetchOneDirect) because the mock server necessarily lives on
-// loopback, which the production SSRF guard in fetchOneDirect correctly
-// rejects as a fetch *target* - see TestToolWebFetchDirectModeRejectsPrivateURLs
-// for that guard's own test. toolWebFetch's real concurrent fan-out
-// mechanism is already exercised end-to-end in shim mode by
-// TestToolWebFetchRunsURLsInParallel; fetchOne dispatches to the same
-// worker-pool code regardless of mode.
+// TestDoDirectFetchRunsInParallel confirms doDirectFetch is safe and fast
+// to call concurrently (goroutine-safe, no shared mutable state) against a
+// mock HTML server - mirroring the worker-pool pattern toolWebFetch itself
+// uses (see TestToolWebFetchRunsURLsInParallel for the end-to-end version
+// through toolWebFetch/fetchOneDirect). It calls doDirectFetch directly
+// (not fetchOneDirect/toolWebFetch) because the mock server necessarily
+// lives on loopback, which the production SSRF guard in fetchOneDirect
+// correctly rejects as a fetch *target* - see
+// TestToolWebFetchDirectModeRejectsPrivateURLs for that guard's own test.
 func TestDoDirectFetchRunsInParallel(t *testing.T) {
 	var hits int32
 	mux := http.NewServeMux()
@@ -121,11 +119,12 @@ func TestDoDirectFetchNonHTMLPassthrough(t *testing.T) {
 	}
 }
 
-// TestDoDirectFetchSuggestsShimForJSOnlyPages confirms a page whose body is
+// TestDoDirectFetchErrorsOnJSOnlyPages confirms a page whose body is
 // essentially an empty shell (typical of a client-side-rendered SPA with no
-// server-rendered content) produces a helpful error pointing at shim mode,
-// rather than silently returning nothing useful.
-func TestDoDirectFetchSuggestsShimForJSOnlyPages(t *testing.T) {
+// server-rendered content) produces a helpful, honest error saying
+// web_fetch cannot execute JavaScript, rather than silently returning
+// nothing useful or pointing at a scrape mode that no longer exists.
+func TestDoDirectFetchErrorsOnJSOnlyPages(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
@@ -142,81 +141,25 @@ func TestDoDirectFetchSuggestsShimForJSOnlyPages(t *testing.T) {
 	if !strings.Contains(err.Error(), "JavaScript") {
 		t.Fatalf("expected a hint about JS-rendered content, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "OLA_FETCH_API_BASE") {
-		t.Fatalf("expected the hint to point at the shim-mode env var, got: %v", err)
-	}
 }
 
 func TestToolWebFetchDirectModeRejectsPrivateURLs(t *testing.T) {
-	cfg := resolveSearchConfig("", "", "", true, 0, 0, 0, 0, 0, false)
+	cfg := resolveSearchConfig("", 0, 0, 0, 0, 0, false)
 	result, err := toolWebFetch(map[string]interface{}{"urls": []interface{}{"http://127.0.0.1:9/admin"}}, cfg)
 	if err != nil {
 		t.Fatalf("expected batch call to succeed with an ERROR slot, got err: %v", err)
 	}
 	if !strings.Contains(result, "ERROR") {
-		t.Fatalf("expected the SSRF guard to reject a private-IP URL in direct mode too, got: %s", result)
+		t.Fatalf("expected the SSRF guard to reject a private-IP URL, got: %s", result)
 	}
 }
 
-func TestResolveSearchConfigCDPModeEnables(t *testing.T) {
-	cfg := resolveSearchConfig("", "", "http://cdp-host:9222", false, 0, 0, 0, 0, 0, false)
+func TestResolveSearchConfigFetchEnabledByDefault(t *testing.T) {
+	// web_fetch needs no configuration at all - it must be enabled the
+	// instant a session isn't explicitly disabled with --no-web-search.
+	cfg := resolveSearchConfig("", 0, 0, 0, 0, 0, false)
 	if !cfg.fetchEnabled() {
-		t.Fatal("expected fetchEnabled() true when FetchCDPBase is set")
-	}
-	if !cfg.fetchUsesCDP() {
-		t.Fatal("expected fetchUsesCDP() true when only FetchCDPBase is set")
-	}
-	if cfg.fetchUsesShim() {
-		t.Fatal("expected fetchUsesShim() false when no shim URL is set")
-	}
-}
-
-func TestResolveSearchConfigShimBeatsCDP(t *testing.T) {
-	cfg := resolveSearchConfig("", "http://shim:3000", "http://cdp-host:9222", false, 0, 0, 0, 0, 0, false)
-	if !cfg.fetchUsesShim() {
-		t.Fatal("expected shim mode to win when both FetchBase and FetchCDPBase are set")
-	}
-	if cfg.fetchUsesCDP() {
-		t.Fatal("expected fetchUsesCDP() false when shim also configured (shim takes precedence)")
-	}
-}
-
-func TestResolveSearchConfigCDPBeatsDirect(t *testing.T) {
-	cfg := resolveSearchConfig("", "", "http://cdp-host:9222", true /* --web-fetch */, 0, 0, 0, 0, 0, false)
-	if !cfg.fetchUsesCDP() {
-		t.Fatal("expected CDP mode to win over direct mode when both are configured")
-	}
-}
-
-func TestResolveSearchConfigFetchCDPBaseEnvVar(t *testing.T) {
-	os.Setenv("OLA_FETCH_CDP_BASE", "http://env-cdp:9222")
-	defer os.Unsetenv("OLA_FETCH_CDP_BASE")
-
-	cfg := resolveSearchConfig("", "", "", false, 0, 0, 0, 0, 0, false)
-	if !cfg.fetchUsesCDP() {
-		t.Fatal("expected OLA_FETCH_CDP_BASE env var to enable CDP mode")
-	}
-	if cfg.FetchCDPBase != "http://env-cdp:9222" {
-		t.Fatalf("expected FetchCDPBase from env, got %q", cfg.FetchCDPBase)
-	}
-}
-
-func TestFetchModeLabel(t *testing.T) {
-	cases := []struct {
-		name string
-		cfg  searchConfig
-		want string
-	}{
-		{"disabled", searchConfig{}, "disabled"},
-		{"direct", searchConfig{FetchDirect: true}, "direct (plain HTTP, no external service)"},
-		{"cdp", searchConfig{FetchCDPBase: "http://x:9222"}, "cdp (http://x:9222)"},
-		{"shim", searchConfig{FetchBase: "http://y:3000"}, "shim (http://y:3000)"},
-		{"shim beats cdp and direct", searchConfig{FetchBase: "http://y:3000", FetchCDPBase: "http://x:9222", FetchDirect: true}, "shim (http://y:3000)"},
-	}
-	for _, c := range cases {
-		if got := c.cfg.fetchModeLabel(); got != c.want {
-			t.Errorf("%s: fetchModeLabel() = %q, want %q", c.name, got, c.want)
-		}
+		t.Fatal("expected fetchEnabled() true by default with no flags/env set at all")
 	}
 }
 
@@ -226,7 +169,7 @@ func TestResolveSearchConfigFlagOverridesEnv(t *testing.T) {
 	defer os.Unsetenv("OLA_SEARXNG_API_BASE")
 	defer os.Unsetenv("OLA_SEARCH_MAX_RESULTS")
 
-	cfg := resolveSearchConfig("http://flag-searxng:9000", "", "", false, 0, 0, 0, 0, 0, false)
+	cfg := resolveSearchConfig("http://flag-searxng:9000", 0, 0, 0, 0, 0, false)
 	if cfg.SearXNGBase != "http://flag-searxng:9000" {
 		t.Fatalf("expected flag to win over env, got %q", cfg.SearXNGBase)
 	}
@@ -236,61 +179,23 @@ func TestResolveSearchConfigFlagOverridesEnv(t *testing.T) {
 	if !cfg.searchEnabled() {
 		t.Fatal("expected searchEnabled() true when SearXNGBase is set")
 	}
-	if cfg.fetchEnabled() {
-		t.Fatal("expected fetchEnabled() false when no fetch base is configured")
+	if !cfg.fetchEnabled() {
+		t.Fatal("expected fetchEnabled() true regardless of SearXNG configuration (web_fetch is always-on)")
 	}
 }
 
 func TestResolveSearchConfigDisableWins(t *testing.T) {
 	os.Setenv("OLA_SEARXNG_API_BASE", "http://env-searxng:8080")
-	os.Setenv("OLA_FETCH_API_BASE", "http://env-fetch:3000")
 	defer os.Unsetenv("OLA_SEARXNG_API_BASE")
-	defer os.Unsetenv("OLA_FETCH_API_BASE")
 
-	cfg := resolveSearchConfig("", "", "", false, 0, 0, 0, 0, 0, true /* --no-web-search */)
+	cfg := resolveSearchConfig("", 0, 0, 0, 0, 0, true /* --no-web-search */)
 	if cfg.searchEnabled() || cfg.fetchEnabled() {
 		t.Fatalf("expected --no-web-search to force both tools off, got %+v", cfg)
 	}
 }
 
-func TestResolveSearchConfigWebFetchFlagEnablesDirectMode(t *testing.T) {
-	cfg := resolveSearchConfig("", "", "", true /* --web-fetch */, 0, 0, 0, 0, 0, false)
-	if !cfg.fetchEnabled() {
-		t.Fatal("expected --web-fetch to enable fetchEnabled()")
-	}
-	if cfg.fetchUsesShim() {
-		t.Fatal("expected direct mode (no FetchBase configured) to not use the shim")
-	}
-	if !cfg.FetchDirect {
-		t.Fatal("expected FetchDirect to be true")
-	}
-}
-
-func TestResolveSearchConfigWebFetchDirectEnvVar(t *testing.T) {
-	os.Setenv("OLA_WEB_FETCH_DIRECT", "true")
-	defer os.Unsetenv("OLA_WEB_FETCH_DIRECT")
-
-	cfg := resolveSearchConfig("", "", "", false, 0, 0, 0, 0, 0, false)
-	if !cfg.fetchEnabled() {
-		t.Fatal("expected OLA_WEB_FETCH_DIRECT=true to enable fetchEnabled()")
-	}
-}
-
-func TestResolveSearchConfigShimTakesPrecedenceOverDirect(t *testing.T) {
-	// Both a shim URL AND --web-fetch are set - shim should win, since it
-	// can render JS and direct mode is meant as the "no service available"
-	// fallback, not something that silently overrides a deliberate shim.
-	cfg := resolveSearchConfig("", "http://fetch-shim:3000", "", true, 0, 0, 0, 0, 0, false)
-	if !cfg.fetchUsesShim() {
-		t.Fatal("expected shim mode to take precedence when both FetchBase and --web-fetch are set")
-	}
-	if cfg.FetchBase != "http://fetch-shim:3000" {
-		t.Fatalf("expected FetchBase to be preserved, got %q", cfg.FetchBase)
-	}
-}
-
 func TestResolveSearchConfigDefaults(t *testing.T) {
-	cfg := resolveSearchConfig("http://x:1", "http://y:2", "", false, 0, 0, 0, 0, 0, false)
+	cfg := resolveSearchConfig("http://x:1", 0, 0, 0, 0, 0, false)
 	if cfg.MaxResults != defaultSearchMaxResults {
 		t.Fatalf("expected default max results %d, got %d", defaultSearchMaxResults, cfg.MaxResults)
 	}
@@ -323,9 +228,9 @@ func TestToolWebSearchRunsQueriesInParallel(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	cfg := resolveSearchConfig(srv.URL, "", "", false, 0, 4, 0, 5, 0, false)
+	cfg := resolveSearchConfig(srv.URL, 0, 4, 0, 5, 0, false)
 	args := map[string]interface{}{
-		"queries": []interface{}{"golang", "ollama", "searxng", "playwright"},
+		"queries": []interface{}{"golang", "ollama", "searxng", "ripgrep"},
 	}
 
 	start := time.Now()
@@ -340,7 +245,7 @@ func TestToolWebSearchRunsQueriesInParallel(t *testing.T) {
 	if elapsed > 400*time.Millisecond {
 		t.Fatalf("expected concurrent fan-out (~150ms), took %s - looks serial", elapsed)
 	}
-	for _, q := range []string{"golang", "ollama", "searxng", "playwright"} {
+	for _, q := range []string{"golang", "ollama", "searxng", "ripgrep"} {
 		if !strings.Contains(result, q) {
 			t.Fatalf("expected result to mention query %q, got: %s", q, result)
 		}
@@ -348,7 +253,7 @@ func TestToolWebSearchRunsQueriesInParallel(t *testing.T) {
 }
 
 func TestToolWebSearchDisabledReturnsError(t *testing.T) {
-	cfg := resolveSearchConfig("", "", "", false, 0, 0, 0, 0, 0, false)
+	cfg := resolveSearchConfig("", 0, 0, 0, 0, 0, false)
 	_, err := toolWebSearch(map[string]interface{}{"queries": []interface{}{"x"}}, cfg)
 	if err == nil {
 		t.Fatal("expected error when web_search is not configured")
@@ -371,7 +276,7 @@ func TestToolWebSearchPartialFailureStillReturnsGoodResults(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	cfg := resolveSearchConfig(srv.URL, "", "", false, 0, 2, 0, 5, 0, false)
+	cfg := resolveSearchConfig(srv.URL, 0, 2, 0, 5, 0, false)
 	result, err := toolWebSearch(map[string]interface{}{"queries": []interface{}{"good", "bad"}}, cfg)
 	if err != nil {
 		t.Fatalf("expected batch call itself to succeed even with one bad query, got err: %v", err)
@@ -384,27 +289,39 @@ func TestToolWebSearchPartialFailureStillReturnsGoodResults(t *testing.T) {
 	}
 }
 
-// TestToolWebFetchRunsURLsInParallel mirrors the search concurrency test for
-// web_fetch against a mock scrape shim.
+// TestToolWebFetchRunsURLsInParallel mirrors the search concurrency test,
+// but against a plain direct-mode HTML server (web_fetch's only mode).
+//
+// toolWebFetch's SSRF guard (validateFetchURL) rejects the target URL if it
+// resolves to a loopback/private address, which a plain httptest.Server
+// URL always does - so, unlike the old shim-mode version of this test
+// (which only ever talked to a *local scrape service*, never the target
+// URL itself), we can't just point straight at srv.URL. Instead: use URLs
+// on the reserved, guaranteed-NXDOMAIN ".invalid" TLD (RFC 2606) - a failed
+// DNS lookup makes validateFetchURL let the URL through (see its "DNS
+// hiccup/offline" comment) - and swap in a RoundTripper that redirects the
+// actual dial to the local test server regardless of the requested host,
+// so the fetch still really happens end-to-end.
 func TestToolWebFetchRunsURLsInParallel(t *testing.T) {
 	var hits int32
 	mux := http.NewServeMux()
-	mux.HandleFunc("/scrape", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hits, 1)
 		time.Sleep(150 * time.Millisecond)
-		var body map[string]string
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		resp := fetchShimResponse{OK: true, Title: "Title", Markdown: "content for " + body["url"]}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, "<html><body><p>content for %s</p></body></html>", r.URL.Path)
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	cfg := resolveSearchConfig("", srv.URL, "", false, 0, 0, 4, 0, 5, false)
+	origTransport := http.DefaultTransport
+	http.DefaultTransport = &redirectAllTransport{target: srv.Listener.Addr().String()}
+	defer func() { http.DefaultTransport = origTransport }()
+
+	cfg := resolveSearchConfig("", 0, 0, 4, 0, 5, false)
 	urls := []interface{}{
-		"https://example.com/a", "https://example.com/b",
-		"https://example.com/c", "https://example.com/d",
+		"http://a.example.invalid/a", "http://b.example.invalid/b",
+		"http://c.example.invalid/c", "http://d.example.invalid/d",
 	}
 
 	start := time.Now()
@@ -414,39 +331,35 @@ func TestToolWebFetchRunsURLsInParallel(t *testing.T) {
 		t.Fatalf("toolWebFetch returned error: %v", err)
 	}
 	if atomic.LoadInt32(&hits) != 4 {
-		t.Fatalf("expected 4 upstream hits, got %d", hits)
+		t.Fatalf("expected 4 upstream hits, got %d - result was: %s", hits, result)
 	}
 	if elapsed > 400*time.Millisecond {
 		t.Fatalf("expected concurrent fan-out (~150ms), took %s - looks serial", elapsed)
 	}
 	for _, u := range []string{"/a", "/b", "/c", "/d"} {
-		if !strings.Contains(result, u) {
-			t.Fatalf("expected result to mention url %q, got: %s", u, result)
+		if !strings.Contains(result, "content for "+u) {
+			t.Fatalf("expected result to mention content for %q, got: %s", u, result)
 		}
 	}
 }
 
-func TestToolWebFetchNonJSONShimFallsBackToRawBody(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/scrape", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		_, _ = w.Write([]byte("plain text content from a minimal shim"))
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
+// redirectAllTransport is a test-only http.RoundTripper that dials target
+// no matter what host/port the request was addressed to - used above to
+// let a fetch to a fake, never-resolving hostname actually land on a local
+// httptest.Server.
+type redirectAllTransport struct {
+	target string
+	base   http.Transport
+}
 
-	cfg := resolveSearchConfig("", srv.URL, "", false, 0, 0, 1, 0, 5, false)
-	result, err := toolWebFetch(map[string]interface{}{"urls": []interface{}{"https://example.com"}}, cfg)
-	if err != nil {
-		t.Fatalf("expected non-JSON body to be used as a fallback, got err: %v", err)
-	}
-	if !strings.Contains(result, "plain text content from a minimal shim") {
-		t.Fatalf("expected raw body fallback content, got: %s", result)
-	}
+func (rt *redirectAllTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	req.URL.Host = rt.target
+	return rt.base.RoundTrip(req)
 }
 
 func TestToolWebFetchRejectsPrivateAndLocalURLs(t *testing.T) {
-	cfg := resolveSearchConfig("", "http://127.0.0.1:9", "", false, 0, 0, 0, 0, 0, false)
+	cfg := resolveSearchConfig("", 0, 0, 0, 0, 0, false)
 	cases := []string{
 		"http://localhost:11434/api/tags",
 		"http://127.0.0.1:8080/admin",
@@ -471,10 +384,10 @@ func TestValidateFetchURLAllowsPublicHTTPS(t *testing.T) {
 }
 
 func TestToolWebFetchDisabledReturnsError(t *testing.T) {
-	cfg := resolveSearchConfig("", "", "", false, 0, 0, 0, 0, 0, false)
+	cfg := resolveSearchConfig("", 0, 0, 0, 0, 0, true /* --no-web-search */)
 	_, err := toolWebFetch(map[string]interface{}{"urls": []interface{}{"https://example.com"}}, cfg)
 	if err == nil {
-		t.Fatal("expected error when web_fetch is not configured")
+		t.Fatal("expected error when web_fetch has been explicitly disabled via --no-web-search")
 	}
 }
 

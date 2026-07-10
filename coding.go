@@ -114,10 +114,13 @@ requirements is actually built and actually works.
 # AVAILABLE TOOLS
 - read_file(path) / search_files(pattern, query?): inspect the existing
   repository. Always read before editing.
-- write_file(path, content) / edit_file(path, old_str, new_str): make real,
-  immediate changes to files on disk. Same rules as always: edit_file's
-  old_str must be an exact, unique match; use write_file for new files or
-  genuine full rewrites.
+- write_file(path, content, reason) / edit_file(path, old_str, new_str, reason):
+  make real, immediate changes to files on disk. Same rules as always:
+  edit_file's old_str must be an exact, unique match; use write_file for
+  new files or genuine full rewrites. "reason" is a short (one sentence)
+  explanation of what this file/change does and why - it's surfaced
+  directly to the human (e.g. in a push notification), so write it for
+  that audience, not for yourself.
 - ask_user(question, options?): ask a human a direct question. This session
   may or may not have an interactive terminal attached. If it doesn't, this
   tool will fail with an explanatory error instead of blocking forever -
@@ -150,19 +153,20 @@ requirements is actually built and actually works.
   build/test/lint entry points instead of trying to route around the
   restriction. Use this liberally while implementing, to catch problems
   early instead of discovering them all at once at the end.
-- web_search(queries, max_results?) / web_fetch(urls): ONLY present when
-  ola has a local search backend configured for this session. Both accept
-  a list, not just one item - if you need to search or read several things,
-  put them all in a single call; independent items run in parallel
-  automatically. web_fetch may or may not execute JavaScript depending on
-  how this session is configured (a real browser via its own
-  remote-debugging protocol, an external scrape service, or a plain HTTP
-  fetch with no JS at all) - you cannot tell which from here. If a fetched
-  page comes back empty or clearly thin for what the URL should contain,
-  say so plainly rather than guessing at what it would have shown. If you
-  do not see these tools in your list, you have no way to reach the
-  internet this session - say so plainly instead of guessing at "current"
-  facts, library versions, or API details, or inventing URLs.
+- web_search(queries, max_results?): ONLY present when ola has a local
+  SearXNG search backend configured for this session (opt-in). Accepts a
+  list, not just one item - independent queries run in parallel
+  automatically.
+- web_fetch(urls): present by default in every session (no configuration
+  needed) unless started with --no-web-search. Accepts a list of URLs, run
+  in parallel automatically. Always a plain HTTP GET with HTML stripped to
+  text - never executes JavaScript. A page that's essentially an empty
+  shell without JS (a client-side-rendered SPA) comes back as an explicit
+  error, not empty/thin content - say so plainly rather than guessing at
+  what it would have shown. If you do not see web_search/web_fetch in your
+  tool list at all, you have no way to reach the internet this session -
+  say so plainly instead of guessing at "current" facts, library versions,
+  or API details, or inventing URLs.
 - report_complete(summary): declare that every task is implemented and the
   project builds/tests cleanly. IMPORTANT: this does not end the session by
   itself. ola will independently re-run the project's build/test command
@@ -170,7 +174,9 @@ requirements is actually built and actually works.
   fed back as a tool result and you are expected to fix it and call
   report_complete again - do not call report_complete speculatively before
   you have already run the build/tests yourself via run_command and seen
-  them pass.
+  them pass. Once verification actually passes, this summary is what gets
+  sent as the "work finished" push notification, so write it for a human
+  glancing at their phone, not just "done".
 
 # WORKFLOW
 1. Read the requirements file and look over the repository (search_files /
@@ -911,7 +917,7 @@ func codingUsage(fs *flag.FlagSet) func() {
 		fmt.Println()
 		fmt.Println("Tool ที่เปิดใช้เสมอ (นอกเหนือจาก 6 ตัวของ ask): add_tasks, mark_task_done,")
 		fmt.Println("run_command (allowlisted ตาม toolchain ที่ตรวจพบ), report_complete")
-		fmt.Println("รวมถึง web_search / web_fetch แบบมีเงื่อนไข (ดูหัวข้อ Web search ด้านล่าง)")
+		fmt.Println("รวมถึง web_fetch (เปิดอัตโนมัติเสมอ) และ web_search แบบมีเงื่อนไข (ดูหัวข้อ Web search ด้านล่าง)")
 		fmt.Println()
 		fmt.Println("mark_task_done มี build-only light gate ในตัว: ถ้าโปรเจกต์ build ไม่ผ่าน ola จะปฏิเสธ")
 		fmt.Println("ไม่ให้ปิด task นั้น (ป้อนผล build กลับให้โมเดลแก้ก่อน) เพื่อจับบั๊กตั้งแต่ task ที่ทำให้เกิด")
@@ -945,10 +951,7 @@ func codingUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  --max-duration <dur>    เพดานเวลารวมของ session เช่น \"2h\", \"45m\" (default: 3h)")
 		fmt.Println("  --cmd-timeout <sec>     timeout ต่อการเรียก run_command/verify หนึ่งครั้ง (default: 120)")
 		fmt.Println("  --searxng-url <u>       override OLA_SEARXNG_API_BASE (เปิด web_search)")
-		fmt.Println("  --fetch-url <u>         override OLA_FETCH_API_BASE (เปิด web_fetch โหมด shim, สิทธิ์สูงสุด)")
-		fmt.Println("  --fetch-cdp-url <u>     override OLA_FETCH_CDP_BASE (เปิด web_fetch โหมด cdp เช่น http://localhost:9222)")
-		fmt.Println("  --web-fetch             เปิด web_fetch โหมด direct (HTTP GET + ตัด HTML เอง ไม่ต้องมี service เสริม)")
-		fmt.Println("  --no-web-search         ปิด web_search/web_fetch แม้จะตั้ง env/flag ไว้ก็ตาม")
+		fmt.Println("  --no-web-search         ปิดทั้ง web_search และ web_fetch (web_fetch เปิดอัตโนมัติเสมอ - นี่คือทางเดียวที่ปิดได้)")
 		fmt.Println("  --search-max-results <n>   override OLA_SEARCH_MAX_RESULTS")
 		fmt.Println("  --search-concurrency <n>   override OLA_SEARCH_CONCURRENCY")
 		fmt.Println("  --fetch-concurrency <n>    override OLA_FETCH_CONCURRENCY")
@@ -976,8 +979,8 @@ func cmdCoding(args []string) int {
 	var model, ctxStr, outputFile, topic, reqFile, buildCmd, testCmd, allowList, maxDurStr string
 	var flagKey, flagNoThink, flagDryRun, flagHelp, flagReplan bool
 	var maxIterations, cmdTimeoutSec int
-	var searxngURL, fetchURL, fetchCDPURL string
-	var flagNoWebSearch, flagWebFetch bool
+	var searxngURL string
+	var flagNoWebSearch bool
 	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
 
 	fs.StringVar(&model, "m", "", "")
@@ -1004,9 +1007,6 @@ func cmdCoding(args []string) int {
 	fs.StringVar(&maxDurStr, "max-duration", defaultMaxCodingDuration.String(), "")
 	fs.IntVar(&cmdTimeoutSec, "cmd-timeout", defaultCmdTimeoutSec, "")
 	fs.StringVar(&searxngURL, "searxng-url", "", "")
-	fs.StringVar(&fetchURL, "fetch-url", "", "")
-	fs.StringVar(&fetchCDPURL, "fetch-cdp-url", "", "")
-	fs.BoolVar(&flagWebFetch, "web-fetch", false, "")
 	fs.BoolVar(&flagNoWebSearch, "no-web-search", false, "")
 	fs.IntVar(&searchMaxResults, "search-max-results", 0, "")
 	fs.IntVar(&searchConcurrency, "search-concurrency", 0, "")
@@ -1101,7 +1101,7 @@ func cmdCoding(args []string) int {
 		}
 	}
 
-	searchCfg := resolveSearchConfig(searxngURL, fetchURL, fetchCDPURL, flagWebFetch, searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec, flagNoWebSearch)
+	searchCfg := resolveSearchConfig(searxngURL, searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec, flagNoWebSearch)
 
 	// Load or reset task state.
 	var state *codingState
@@ -1170,9 +1170,9 @@ func cmdCoding(args []string) int {
 			fmt.Println("── web_search: disabled (OLA_SEARXNG_API_BASE/--searxng-url not set, or --no-web-search) ──")
 		}
 		if searchCfg.fetchEnabled() {
-			fmt.Printf("── web_fetch: enabled (mode: %s, concurrency %d) ──\n", searchCfg.fetchModeLabel(), searchCfg.FetchConcurrency)
+			fmt.Printf("── web_fetch: enabled (direct mode - plain HTTP, no external service, no JavaScript; concurrency %d) ──\n", searchCfg.FetchConcurrency)
 		} else {
-			fmt.Println("── web_fetch: disabled (use --web-fetch for direct mode, --fetch-cdp-url for CDP, or --fetch-url for a shim) ──")
+			fmt.Println("── web_fetch: disabled (--no-web-search was set) ──")
 		}
 		var pretty map[string]interface{}
 		_ = json.Unmarshal(payload, &pretty)
@@ -1201,7 +1201,7 @@ func cmdCoding(args []string) int {
 		fmt.Fprintln(outFile, "# web_search: disabled")
 	}
 	if searchCfg.fetchEnabled() {
-		fmt.Fprintf(outFile, "# web_fetch: enabled (mode: %s, concurrency %d)\n", searchCfg.fetchModeLabel(), searchCfg.FetchConcurrency)
+		fmt.Fprintf(outFile, "# web_fetch: enabled (direct mode - plain HTTP, no external service, no JavaScript; concurrency %d)\n", searchCfg.FetchConcurrency)
 	} else {
 		fmt.Fprintln(outFile, "# web_fetch: disabled")
 	}
@@ -1227,6 +1227,8 @@ func cmdCoding(args []string) int {
 	sessionStart := time.Now()
 	lastStatusCode := 0
 	iteration := 0
+	var lastAnswer string     // most recent assistant content, fallback notification summary
+	notifiedComplete := false // true once the verified-completion notification below has fired
 
 	for {
 		iteration++
@@ -1255,6 +1257,7 @@ func cmdCoding(args []string) int {
 		outcome := streamResponse(resp.Body, outFile, cCyan, cBold, cDim, cReset)
 		resp.Body.Close()
 		lastStatusCode = resp.StatusCode
+		lastAnswer = outcome.Content
 		if resp.StatusCode >= 400 {
 			break
 		}
@@ -1294,7 +1297,8 @@ func cmdCoding(args []string) int {
 				fmt.Printf("%s✓ verify ผ่าน - งานเสร็จสมบูรณ์%s\n", cDim, cReset)
 				fmt.Fprintf(outFile, "\n[complete] %s\n", reportSummary)
 				if ntfyTopic != "" {
-					sendNotification(ntfyTopic, "Work Finnished: "+reportSummary)
+					sendNotification(ntfyTopic, formatFinishNotification("Work Finished", reportSummary))
+					notifiedComplete = true
 				}
 				lastStatusCode = 200
 				break
@@ -1316,8 +1320,20 @@ func cmdCoding(args []string) int {
 		fmt.Fprintf(outFile, "🔁 session: %d round(s), total %s\n", iteration, fmtDur(time.Since(sessionStart)))
 	}
 
-	if ntfyTopic != "" && lastStatusCode >= 400 {
-		sendNotification(ntfyTopic, fmt.Sprintf("Work Failed: HTTP %d", lastStatusCode))
+	// Send a notification on every exit path, not just the clean
+	// report_complete+verify success above: an HTTP failure, or a session
+	// that ended for some other reason (iteration/duration cap reached, or
+	// the model gave a plain final answer without ever getting a
+	// report_complete to verify) still counts as "the job is over" from the
+	// user's point of view, and they deserve a summary either way instead
+	// of silence.
+	if ntfyTopic != "" {
+		switch {
+		case lastStatusCode >= 400:
+			sendNotification(ntfyTopic, fmt.Sprintf("Work Failed: HTTP %d", lastStatusCode))
+		case !notifiedComplete:
+			sendNotification(ntfyTopic, formatFinishNotification("Work Ended (ยังไม่ผ่าน verify แบบสมบูรณ์)", lastAnswer))
+		}
 	}
 
 	if lastStatusCode >= 400 {

@@ -102,17 +102,23 @@ the normal case and only reach for it when it actually applies.
   the file's base name, e.g. "*.go"), optionally filtered to lines
   containing "query". Use this to locate files before you know the exact
   path.
-- write_file(path, content): create a new file, or overwrite an existing
-  one completely, with "content" as the full and final file content. Only
-  use this for new files or when a full rewrite is genuinely simpler/safer
-  than a targeted edit; prefer edit_file for small changes to existing
-  files.
-- edit_file(path, old_str, new_str): replace one exact, unique occurrence of
-  old_str with new_str inside an existing file. old_str must match the
-  current file content exactly (including whitespace) and must be unique in
-  the file - include enough surrounding context to make it unique. If the
-  tool reports "not found" or "not unique", re-read the file and retry with
-  a corrected old_str; do not guess repeatedly.
+- write_file(path, content, reason): create a new file, or overwrite an
+  existing one completely, with "content" as the full and final file
+  content. Only use this for new files or when a full rewrite is genuinely
+  simpler/safer than a targeted edit; prefer edit_file for small changes to
+  existing files. "reason" is a short (one sentence) explanation of what
+  this file is/does and why you're writing it now - it is surfaced directly
+  to the human (e.g. in a push notification), so make it something a human
+  glancing at their phone would understand without the rest of this
+  conversation.
+- edit_file(path, old_str, new_str, reason): replace one exact, unique
+  occurrence of old_str with new_str inside an existing file. old_str must
+  match the current file content exactly (including whitespace) and must be
+  unique in the file - include enough surrounding context to make it
+  unique. If the tool reports "not found" or "not unique", re-read the file
+  and retry with a corrected old_str; do not guess repeatedly. "reason" is a
+  short (one sentence) explanation of what this specific change does and
+  why - same audience/purpose as write_file's reason above.
 - ask_user(question, options?): pause and ask the human a direct question.
   Use this only when a requirement is genuinely ambiguous, or before a
   destructive/hard-to-reverse change (e.g. overwriting a large existing
@@ -132,20 +138,21 @@ the normal case and only reach for it when it actually applies.
   entirely - there is nothing to run, and you should not claim otherwise.
   When it is present, only allowlisted binaries relevant to this project's
   toolchain may run; arbitrary shell commands are rejected.
-- web_search(queries, max_results?) / web_fetch(urls): ONLY present when
-  ola has a local search backend configured for this session. Both accept
-  a list, not just one item - if you need to search or read several things,
-  put them all in a single call; independent items run in parallel
-  automatically, so there is no benefit to calling them one at a time.
-  web_fetch may or may not execute JavaScript depending on how this session
-  is configured (a real browser via its own remote-debugging protocol, an
-  external scrape service, or a plain HTTP fetch with no JS at all) - you
-  cannot tell which from here. If a fetched page comes back empty or clearly
-  thin for what the URL should contain, say so plainly rather than guessing
-  at what it would have shown. If you do not see these tools in your list,
-  you have no way to reach the internet this session - say so plainly
-  instead of guessing at "current" facts, prices, versions, or inventing
-  URLs.
+- web_search(queries, max_results?): ONLY present when ola has a local
+  SearXNG search backend configured for this session (opt-in). Accepts a
+  list, not just one item - if you need to search several things, put them
+  all in a single call; independent queries run in parallel automatically.
+- web_fetch(urls): present in every session by default (no configuration
+  needed) unless this session was explicitly started with --no-web-search.
+  Accepts a list of URLs, run in parallel automatically. It always does a
+  plain HTTP GET and strips HTML down to visible text - it never executes
+  JavaScript, full stop. A page that renders its content entirely via
+  JavaScript (a client-side SPA with no server-rendered text) will come
+  back as an explicit error, not empty/thin content - if that happens, say
+  so plainly rather than guessing at what the page would have shown. If you
+  do not see web_search/web_fetch in your tool list at all, you have no way
+  to reach the internet this session - say so plainly instead of guessing
+  at "current" facts, prices, versions, or inventing URLs.
 
 # WHEN NO FILES ARE ATTACHED
 If the user's message includes an auto-generated directory tree section, it
@@ -177,7 +184,10 @@ tool. Never suggest workarounds to escape this sandbox.
    If the task did not involve editing source code, or run_command is not
    available, skip straight to step 6.
 6. When there is nothing further to do, respond with a normal final answer
-   (no tool call) summarizing what changed and why.
+   (no tool call) summarizing what changed and why - this final answer is
+   also what gets sent as the "work finished" push notification (see
+   ntfy.sh notification below), so make sure it stands on its own as a
+   short summary, not just "done".
 
 # VERIFYING CODE CHANGES
 This section only applies when run_command appears in your tool list AND
@@ -411,8 +421,12 @@ var builtinTools = []ollamaTool{
 						"type":        "string",
 						"description": "Full, final content of the file.",
 					},
+					"reason": map[string]interface{}{
+						"type":        "string",
+						"description": "Short (one sentence) explanation of what this file is/does and why you're writing it now. Surfaced directly to the human (e.g. in a push notification), so write it for that audience.",
+					},
 				},
-				"required": []string{"path", "content"},
+				"required": []string{"path", "content", "reason"},
 			},
 		},
 	},
@@ -436,8 +450,12 @@ var builtinTools = []ollamaTool{
 						"type":        "string",
 						"description": "Text to replace old_str with.",
 					},
+					"reason": map[string]interface{}{
+						"type":        "string",
+						"description": "Short (one sentence) explanation of what this specific change does and why. Surfaced directly to the human (e.g. in a push notification), so write it for that audience.",
+					},
 				},
-				"required": []string{"path", "old_str", "new_str"},
+				"required": []string{"path", "old_str", "new_str", "reason"},
 			},
 		},
 	},
@@ -516,7 +534,7 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("เรียก Ollama ผ่าน HTTP API (/api/chat) พร้อม streaming + thinking + timing")
 		fmt.Println("และ built-in tool calling ที่เปิดใช้งานเสมอ (ไม่มี flag ปิด/เปิด):")
 		fmt.Println("  read_file, search_files, write_file, edit_file, ask_user, get_current_time")
-		fmt.Println("  รวมถึง run_command / web_search / web_fetch แบบมีเงื่อนไข (ดูหัวข้อ Verify และ Web search ด้านล่าง)")
+		fmt.Println("  รวมถึง web_fetch (เปิดอัตโนมัติเสมอ) และ run_command / web_search แบบมีเงื่อนไข (ดูหัวข้อ Verify และ Web search ด้านล่าง)")
 		fmt.Println()
 		fmt.Println("ทุก path ที่ tool ใช้อ้างอิงจาก current directory ที่รัน ola อยู่เสมอ")
 		fmt.Println("(ไม่มี --workdir ให้ตั้งค่า) และไม่สามารถหลุดออกไปนอก directory นี้ได้")
@@ -533,28 +551,15 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  สำหรับโปรเจกต์ Go) การแก้ไฟล์เอกสาร/ข้อความ (.txt, .md, ฯลฯ) จะไม่ trigger build/test อัตโนมัติ")
 		fmt.Println("  เว้นแต่ระบุ --build-cmd/--test-cmd เอง ซึ่งถือว่าตั้งใจ override แล้ว")
 		fmt.Println()
-		fmt.Println("Web search / fetch (ปิดโดย default จนกว่าจะตั้งค่า):")
-		fmt.Println("  ตั้ง OLA_SEARXNG_API_BASE (หรือ --searxng-url) เพื่อเปิด tool 'web_search' - เรียก local SearXNG")
-		fmt.Println("  instance ผ่าน JSON API (ต้องเปิด 'formats: json' ใน settings.yml ของ SearXNG เองก่อน)")
-		fmt.Println("  เปิด tool 'web_fetch' ได้ 3 แบบ (ถ้าตั้งไว้มากกว่า 1 แบบ ลำดับสิทธิ์คือ shim > cdp > direct):")
-		fmt.Println("    --web-fetch (หรือ OLA_WEB_FETCH_DIRECT=1)  โหมด direct - ola fetch ด้วย HTTP GET เอง แล้วตัด")
-		fmt.Println("                                                 HTML เหลือแต่ข้อความส่งกลับ ไม่ต้องมี service เสริม")
-		fmt.Println("                                                 เลย แต่ไม่รัน JavaScript หน้าที่ render ด้วย JS")
-		fmt.Println("                                                 ล้วนๆ อาจได้ข้อความว่าง")
-		fmt.Println("    --fetch-cdp-url (หรือ OLA_FETCH_CDP_BASE)   โหมด cdp - คุยตรงกับ Chrome DevTools Protocol ของ")
-		fmt.Println("                                                 เบราว์เซอร์ที่รันอยู่แล้ว (เช่น container Playwright/")
-		fmt.Println("                                                 Chromium เดิมของคุณ) โดยไม่ต้องเขียน wrapper service")
-		fmt.Println("                                                 เพิ่มเลย - แค่ชี้ไปที่ remote-debugging port (เช่น")
-		fmt.Println("                                                 http://localhost:9222) เบราว์เซอร์ฝั่งนั้นต้องเปิดด้วย")
-		fmt.Println("                                                 flag --remote-debugging-address=0.0.0.0")
-		fmt.Println("                                                 --remote-debugging-port=9222 --remote-allow-origins=*")
-		fmt.Println("                                                 render JavaScript ได้จริงเพราะใช้เบราว์เซอร์จริง")
-		fmt.Println("    --fetch-url (หรือ OLA_FETCH_API_BASE)       โหมด shim - เรียก local scrape service ที่คุณเขียน/รันเอง")
-		fmt.Println("                                                 รับ POST {base}/scrape {\"url\":...} คืน markdown/text")
-		fmt.Println("                                                 ใช้เมื่อต้องการ logic เสริมนอกเหนือจาก cdp เปล่าๆ")
-		fmt.Println("                                                 (เช่น anti-bot, PDF, screenshot)")
-		fmt.Println("  ola ไม่ได้ฝัง Playwright/Node.js ไว้ในตัวไบนารีเอง ทั้งโหมด cdp และ shim เป็นแค่ HTTP/WebSocket")
-		fmt.Println("  client ธรรมดาที่เขียนด้วย Go ล้วนคุยไปหา service/เบราว์เซอร์ที่แยกรันอยู่ต่างหาก")
+		fmt.Println("Web search / fetch:")
+		fmt.Println("  web_search ปิดโดย default จนกว่าจะตั้งค่า: ตั้ง OLA_SEARXNG_API_BASE (หรือ --searxng-url)")
+		fmt.Println("  เพื่อเปิด tool 'web_search' - เรียก local SearXNG instance ผ่าน JSON API (ต้องเปิด")
+		fmt.Println("  'formats: json' ใน settings.yml ของ SearXNG เองก่อน)")
+		fmt.Println("  web_fetch เปิดอัตโนมัติเสมอ ไม่ต้องตั้งค่าอะไรเลย - ola fetch ด้วย HTTP GET ธรรมดา")
+		fmt.Println("  (plain net/http ในตัวเอง ไม่มี Playwright/เบราว์เซอร์/service เสริมใดๆ) แล้วตัด HTML")
+		fmt.Println("  เหลือแต่ข้อความส่งกลับ ไม่รัน JavaScript ไม่ว่ากรณีใด หน้าที่ render ด้วย JS ล้วนๆ (เช่น")
+		fmt.Println("  SPA ที่ server ไม่คืนข้อความมาด้วย) จะได้ error ที่บอกชัดเจนแทนที่จะได้ผลลัพธ์ว่าง/ไม่ครบ")
+		fmt.Println("  ปิดทั้ง web_search และ web_fetch พร้อมกันได้ด้วย --no-web-search")
 		fmt.Println("  ทั้งสอง tool รับ list ของ query/url ได้ในเรียกเดียว แล้วจะยิงแบบขนาน (bounded concurrency)")
 		fmt.Println("  โดยอัตโนมัติ ไม่ต้องเรียกทีละรายการ")
 		fmt.Println()
@@ -571,13 +576,10 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  OLA_OUTPUT_FILE           ไฟล์ output เริ่มต้น (override ด้วย -o, default: output.txt)")
 		fmt.Println("  OLA_TOPIC                 topic สำหรับส่ง notification ไป ntfy.sh (override ด้วย -x)")
 		fmt.Println("  OLA_SEARXNG_API_BASE      Host ของ SearXNG instance (override ด้วย --searxng-url) เปิด web_search")
-		fmt.Println("  OLA_FETCH_API_BASE        Host ของ scrape shim (override ด้วย --fetch-url) เปิด web_fetch โหมด shim")
-		fmt.Println("  OLA_FETCH_CDP_BASE        Host ของ Chrome DevTools remote-debugging port (override ด้วย --fetch-cdp-url)")
-		fmt.Println("                            เปิด web_fetch โหมด cdp เช่น http://localhost:9222")
-		fmt.Println("  OLA_WEB_FETCH_DIRECT      ตั้งเป็น 1/true เพื่อเปิด web_fetch โหมด direct (override ด้วย --web-fetch)")
+		fmt.Println("                            (web_fetch ไม่ต้องตั้งค่าใดๆ - เปิดอัตโนมัติเสมอ ดูหัวข้อ Web search ด้านบน)")
 		fmt.Println("  OLA_SEARCH_MAX_RESULTS    ผลลัพธ์สูงสุดต่อคำค้น (default: 5)")
 		fmt.Println("  OLA_SEARCH_CONCURRENCY    จำนวนคำค้นที่ยิงพร้อมกันสูงสุด (default: 3)")
-		fmt.Println("  OLA_FETCH_CONCURRENCY     จำนวน URL ที่ fetch พร้อมกันสูงสุด (default: 2)")
+		fmt.Println("  OLA_FETCH_CONCURRENCY     จำนวน URL ที่ fetch พร้อมกันสูงสุด (default: 4)")
 		fmt.Println("  OLA_SEARCH_TIMEOUT_SEC    timeout ต่อคำค้นหนึ่งครั้ง วินาที (default: 20)")
 		fmt.Println("  OLA_FETCH_TIMEOUT_SEC     timeout ต่อ URL หนึ่งครั้ง วินาที (default: 30)")
 		fmt.Println()
@@ -600,10 +602,7 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("      --allow <list>   binary เพิ่มเติมที่อนุญาตให้ run_command เรียกได้ คั่นด้วย comma เช่น \"golangci-lint,staticcheck\"")
 		fmt.Println("      --cmd-timeout <sec>  timeout ต่อการเรียก run_command/verify หนึ่งครั้ง (default: 60)")
 		fmt.Println("      --searxng-url <u>    override OLA_SEARXNG_API_BASE (เปิด web_search)")
-		fmt.Println("      --fetch-url <u>      override OLA_FETCH_API_BASE (เปิด web_fetch โหมด shim, สิทธิ์สูงสุด)")
-		fmt.Println("      --fetch-cdp-url <u>  override OLA_FETCH_CDP_BASE (เปิด web_fetch โหมด cdp เช่น http://localhost:9222)")
-		fmt.Println("      --web-fetch          เปิด web_fetch โหมด direct (HTTP GET + ตัด HTML เอง ไม่ต้องมี service เสริม)")
-		fmt.Println("      --no-web-search      ปิด web_search/web_fetch แม้จะตั้ง env/flag ไว้ก็ตาม")
+		fmt.Println("      --no-web-search      ปิดทั้ง web_search และ web_fetch (web_fetch เปิดอัตโนมัติเสมอ - นี่คือทางเดียวที่ปิดได้)")
 		fmt.Println("      --search-max-results <n>  override OLA_SEARCH_MAX_RESULTS")
 		fmt.Println("      --search-concurrency <n>  override OLA_SEARCH_CONCURRENCY")
 		fmt.Println("      --fetch-concurrency <n>   override OLA_FETCH_CONCURRENCY")
@@ -660,8 +659,8 @@ func cmdAsk(args []string) int {
 	var flagNoVerify bool
 	var buildCmd, testCmd, allowList string
 	var cmdTimeoutSec int
-	var searxngURL, fetchURL, fetchCDPURL string
-	var flagNoWebSearch, flagWebFetch bool
+	var searxngURL string
+	var flagNoWebSearch bool
 	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
 
 	fs.StringVar(&model, "m", "", "")
@@ -691,9 +690,6 @@ func cmdAsk(args []string) int {
 	fs.StringVar(&promptFile, "f", "", "")
 	fs.StringVar(&promptFile, "prompt-file", "", "")
 	fs.StringVar(&searxngURL, "searxng-url", "", "")
-	fs.StringVar(&fetchURL, "fetch-url", "", "")
-	fs.StringVar(&fetchCDPURL, "fetch-cdp-url", "", "")
-	fs.BoolVar(&flagWebFetch, "web-fetch", false, "")
 	fs.BoolVar(&flagNoWebSearch, "no-web-search", false, "")
 	fs.IntVar(&searchMaxResults, "search-max-results", 0, "")
 	fs.IntVar(&searchConcurrency, "search-concurrency", 0, "")
@@ -907,13 +903,14 @@ func cmdAsk(args []string) int {
 		userMsg,
 	}
 
-	// web_search/web_fetch: same "only offer what can actually work"
-	// principle as run_command above. Only added to the tool list when the
-	// corresponding backend is actually configured (OLA_SEARXNG_API_BASE /
-	// OLA_FETCH_API_BASE, or the matching --searxng-url/--fetch-url flag),
-	// so a session on a machine without that local stack running never
-	// even sees these tools.
-	searchCfg := resolveSearchConfig(searxngURL, fetchURL, fetchCDPURL, flagWebFetch, searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec, flagNoWebSearch)
+	// web_search stays opt-in, following the same "only offer what can
+	// actually work" principle as run_command above: it's only added to the
+	// tool list when OLA_SEARXNG_API_BASE / --searxng-url is actually
+	// configured, so a session on a machine without a local SearXNG running
+	// never even sees it. web_fetch needs no such configuration - it's a
+	// single zero-config direct-HTTP mode that's on by default - so it's
+	// always added unless --no-web-search turned everything off.
+	searchCfg := resolveSearchConfig(searxngURL, searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec, flagNoWebSearch)
 
 	// Only add run_command to the tool list when there's a detected
 	// toolchain and the user hasn't disabled verification - a session with
@@ -975,9 +972,9 @@ func cmdAsk(args []string) int {
 			fmt.Println("── web_search: disabled (OLA_SEARXNG_API_BASE/--searxng-url not set, or --no-web-search) ──")
 		}
 		if searchCfg.fetchEnabled() {
-			fmt.Printf("── web_fetch: enabled (mode: %s, concurrency %d) ──\n", searchCfg.fetchModeLabel(), searchCfg.FetchConcurrency)
+			fmt.Printf("── web_fetch: enabled (direct mode - plain HTTP, no external service, no JavaScript; concurrency %d) ──\n", searchCfg.FetchConcurrency)
 		} else {
-			fmt.Println("── web_fetch: disabled (use --web-fetch for direct mode, --fetch-cdp-url for CDP, or --fetch-url for a shim) ──")
+			fmt.Println("── web_fetch: disabled (--no-web-search was set) ──")
 		}
 		var pretty map[string]interface{}
 		_ = json.Unmarshal(payload, &pretty)
@@ -1020,7 +1017,7 @@ func cmdAsk(args []string) int {
 		fmt.Fprintln(outFile, "# web_search: disabled")
 	}
 	if searchCfg.fetchEnabled() {
-		fmt.Fprintf(outFile, "# web_fetch: enabled (mode: %s, concurrency %d)\n", searchCfg.fetchModeLabel(), searchCfg.FetchConcurrency)
+		fmt.Fprintf(outFile, "# web_fetch: enabled (direct mode - plain HTTP, no external service, no JavaScript; concurrency %d)\n", searchCfg.FetchConcurrency)
 	} else {
 		fmt.Fprintln(outFile, "# web_fetch: disabled")
 	}
@@ -1095,6 +1092,7 @@ func cmdAsk(args []string) int {
 	iteration := 0
 	filesChanged := false // true once write_file/edit_file has succeeded at least once this session
 	verifyRounds := 0
+	var lastAnswer string // most recent assistant content, used as the "work finished" notification summary
 
 	for {
 		iteration++
@@ -1140,6 +1138,7 @@ func cmdAsk(args []string) int {
 		outcome := streamResponse(resp.Body, outFile, cCyan, cBold, cDim, cReset)
 		resp.Body.Close()
 		lastStatusCode = resp.StatusCode
+		lastAnswer = outcome.Content
 
 		if resp.StatusCode >= 400 {
 			break
@@ -1213,12 +1212,15 @@ func cmdAsk(args []string) int {
 		fmt.Fprintf(outFile, "🔁 session: %d round(s), total %s\n", iteration, sessionTotal)
 	}
 
-	// Send ntfy.sh notification based on final response status
+	// Send ntfy.sh notification based on final response status. On success,
+	// lastAnswer (the model's own final answer text) is included as the
+	// summary, so the notification itself says what was done instead of
+	// just "done".
 	if ntfyTopic != "" {
 		if lastStatusCode >= 400 {
 			sendNotification(ntfyTopic, fmt.Sprintf("Work Failed: HTTP %d", lastStatusCode))
 		} else {
-			sendNotification(ntfyTopic, "Work Finnished")
+			sendNotification(ntfyTopic, formatFinishNotification("Work Finished", lastAnswer))
 		}
 	}
 
@@ -1675,12 +1677,12 @@ func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.Fil
 	case "write_file":
 		result, err = toolWriteFile(args)
 		if err == nil && ntfyTopic != "" {
-			sendNotification(ntfyTopic, fmt.Sprintf("[WRITE] %v", args["path"]))
+			sendNotification(ntfyTopic, formatFileChangeNotification("WRITE", args))
 		}
 	case "edit_file":
 		result, err = toolEditFile(args)
 		if err == nil && ntfyTopic != "" {
-			sendNotification(ntfyTopic, fmt.Sprintf("[EDIT] %v", args["path"]))
+			sendNotification(ntfyTopic, formatFileChangeNotification("EDIT", args))
 		}
 	case "ask_user":
 		result, err = toolAskUser(args, ntfyTopic, red, reset)
@@ -1714,6 +1716,43 @@ func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.Fil
 // ─────────────────────────────────────────────────────────────────
 // ntfy.sh notification
 // ─────────────────────────────────────────────────────────────────
+
+// maxNotificationSummary caps how much of a model-supplied explanation
+// (write_file/edit_file's "reason", or the final answer / report_complete
+// summary at the end of a session) gets included in a single ntfy.sh push
+// notification - the full detail is always in the terminal output and the
+// -o log file; the notification just needs to be readable on a phone lock
+// screen, not a complete transcript.
+const maxNotificationSummary = 500
+
+// formatFileChangeNotification builds the ntfy.sh message body for a
+// write_file/edit_file call: the path being changed, plus the model's own
+// "reason" explaining what the change does and why - so the notification
+// alone tells a human more than just "some file changed", without needing
+// to open the log. Falls back gracefully if an older/misbehaving model call
+// didn't include a reason.
+func formatFileChangeNotification(action string, args map[string]interface{}) string {
+	path, _ := args["path"].(string)
+	reason, _ := args["reason"].(string)
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return fmt.Sprintf("[%s] %s", action, path)
+	}
+	return fmt.Sprintf("[%s] %s - %s", action, path, truncateText(reason, maxNotificationSummary))
+}
+
+// formatFinishNotification builds the ntfy.sh message body for the end of
+// a session: a short label plus however much of the model's own summary of
+// what it did fits (the final answer for "ask", or report_complete's
+// summary for "coding") - so, like formatFileChangeNotification above, the
+// notification itself carries a real summary instead of just "done".
+func formatFinishNotification(label, summary string) string {
+	summary = strings.TrimSpace(summary)
+	if summary == "" {
+		return label
+	}
+	return label + ": " + truncateText(summary, maxNotificationSummary)
+}
 
 func sendNotification(topic, message string) {
 	url := "https://ntfy.sh/" + topic
