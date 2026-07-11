@@ -186,7 +186,78 @@ func TestDispatchToolCallRecordsChangesWhenCollectorProvided(t *testing.T) {
 	}
 }
 
-// TestDispatchToolCallWithoutCollectorStillWorks confirms omitting the
+// TestDispatchToolCallLogsLoadTimeForFileTools confirms read_file - a tool
+// that loads data from local disk - gets a [tool_load_time] line logged
+// alongside its normal [tool_result], so a session that feels slow can be
+// diagnosed as "waiting on disk I/O" rather than assumed to be "the model
+// thinking slowly".
+func TestDispatchToolCallLogsLoadTimeForFileTools(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	if err := os.WriteFile("hello.txt", []byte("hi there"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	outFile, err := os.CreateTemp(dir, "log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+
+	argsJSON, _ := json.Marshal(map[string]interface{}{"path": "hello.txt"})
+	tc := toolCall{Function: toolCallFunction{Name: "read_file", Arguments: argsJSON}}
+
+	result := dispatchToolCall(tc, "", "", "", outFile, nil)
+	if strings.HasPrefix(result, "ERROR:") {
+		t.Fatalf("expected read_file to succeed, got: %s", result)
+	}
+
+	logged, err := os.ReadFile(outFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(logged), "[tool_load_time] read_file") {
+		t.Fatalf("expected a [tool_load_time] entry for read_file, got:\n%s", logged)
+	}
+	if !strings.Contains(string(logged), "โหลดไฟล์") {
+		t.Fatalf("expected the load-time entry to be labeled as a local file load, got:\n%s", logged)
+	}
+}
+
+// TestDispatchToolCallSkipsLoadTimeForNonLoadTools confirms tools that
+// don't represent a data load - get_current_time here, which does no I/O
+// at all - never get a [tool_load_time] line, so the load-timing output
+// stays meaningful (only appears for actual file/network loads) instead of
+// becoming noise on every single tool call regardless of what it does.
+func TestDispatchToolCallSkipsLoadTimeForNonLoadTools(t *testing.T) {
+	dir := t.TempDir()
+	outFile, err := os.CreateTemp(dir, "log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+
+	argsJSON, _ := json.Marshal(map[string]interface{}{"timezone": "UTC"})
+	tc := toolCall{Function: toolCallFunction{Name: "get_current_time", Arguments: argsJSON}}
+
+	result := dispatchToolCall(tc, "", "", "", outFile, nil)
+	if strings.HasPrefix(result, "ERROR:") {
+		t.Fatalf("expected get_current_time to succeed, got: %s", result)
+	}
+
+	logged, err := os.ReadFile(outFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(logged), "[tool_load_time]") {
+		t.Fatalf("expected no [tool_load_time] entry for get_current_time (no I/O involved), got:\n%s", logged)
+	}
+}
 // trailing collector (the pre-existing call shape used elsewhere, e.g.
 // TestDispatchToolCallGetCurrentTime in time_test.go) still compiles and
 // behaves identically - the collector is opt-in, not required.

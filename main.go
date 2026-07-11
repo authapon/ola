@@ -333,6 +333,15 @@ type ollamaStreamChunk struct {
 	// time so a slow first round doesn't get misread as "the model is
 	// thinking slowly" when it's actually still loading into VRAM/RAM.
 	LoadDuration int64 `json:"load_duration"`
+	// PromptEvalDuration is how long Ollama spent ingesting/evaluating the
+	// prompt (ns) before it could start generating tokens - distinct from
+	// both LoadDuration (getting the model into memory at all) and
+	// EvalDuration (actually generating the reply). A long prompt (big
+	// attached files, a large auto-injected directory tree, accumulated
+	// tool results) shows up here, not in EvalDuration, so a session that
+	// feels slow to *start* responding can be told apart from one that's
+	// just generating a long answer.
+	PromptEvalDuration int64 `json:"prompt_eval_duration"`
 }
 
 var imageExts = map[string]bool{
@@ -765,14 +774,38 @@ func cmdAsk(args []string) int {
 		outputFile = "output.txt"
 	}
 
+	// Terminal colors, resolved early (rather than just before the request
+	// loop, as before) so the prompt/attachment-loading timing lines below
+	// - printed before outFile even exists - can use the same red/dim
+	// styling as every other stat line instead of being plain, unstyled
+	// text.
+	isTTY := isTerminalStdout()
+	cReset, cCyan, cBold, cDim, cRed := terminalColors(isTTY)
+
+	// loadTimings collects human-readable "what took how long to load"
+	// notes gathered while building the initial prompt (prompt file,
+	// auto-injected directory tree, attached text/image files) - printed to
+	// the terminal as they happen, and re-logged into outFile's header once
+	// outFile is opened further down, since none of this I/O happens after
+	// that point (it's the up-front session start-up cost, not part of the
+	// model round-trip that streamResponse already times separately).
+	var loadTimings []string
+	logLoad := func(label string, elapsed time.Duration) {
+		note := fmt.Sprintf("%s: %s", label, fmtLoadDur(elapsed))
+		loadTimings = append(loadTimings, note)
+		fmt.Printf("%s📥 %s%s\n", cDim, note, cReset)
+	}
+
 	var prompt string
 	var files []string
 	if promptFile != "" {
+		fileLoadStart := time.Now()
 		data, err := os.ReadFile(promptFile)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: อ่านไฟล์ prompt %s ไม่ได้: %v\n", promptFile, err)
 			return 1
 		}
+		logLoad(fmt.Sprintf("prompt file %s", promptFile), time.Since(fileLoadStart))
 		prompt = strings.TrimRight(string(data), "\n")
 		if strings.TrimSpace(prompt) == "" {
 			fmt.Fprintf(os.Stderr, "error: ไฟล์ prompt %s ว่างเปล่า\n", promptFile)
@@ -852,7 +885,9 @@ func cmdAsk(args []string) int {
 	var treeNote string
 	if len(files) == 0 {
 		if cwdErr == nil {
+			treeLoadStart := time.Now()
 			tree, truncated, total := buildDirectoryTree(cwd)
+			logLoad(fmt.Sprintf("directory tree (%s)", cwd), time.Since(treeLoadStart))
 			if total > 0 {
 				content += "\n\n===== โครงสร้างไฟล์ใน current directory (auto-generated, รายชื่อเท่านั้น ไม่ใช่เนื้อหาไฟล์) =====\n"
 				content += tree
@@ -873,6 +908,7 @@ func cmdAsk(args []string) int {
 	}
 
 	if len(textFiles) > 0 {
+		textLoadStart := time.Now()
 		if !flagRaw {
 			content += "\n\n===== แนบไฟล์ ====="
 		}
@@ -887,16 +923,21 @@ func cmdAsk(args []string) int {
 			}
 			content += "\n" + string(data)
 		}
+		logLoad(fmt.Sprintf("attached text files (%d)", len(textFiles)), time.Since(textLoadStart))
 	}
 
 	userMsg := ollamaMessage{Role: "user", Content: content}
-	for _, img := range imageFiles {
-		data, err := os.ReadFile(img)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: encode รูป %s ไม่ได้\n", img)
-			return 1
+	if len(imageFiles) > 0 {
+		imageLoadStart := time.Now()
+		for _, img := range imageFiles {
+			data, err := os.ReadFile(img)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: encode รูป %s ไม่ได้\n", img)
+				return 1
+			}
+			userMsg.Images = append(userMsg.Images, base64.StdEncoding.EncodeToString(data))
 		}
-		userMsg.Images = append(userMsg.Images, base64.StdEncoding.EncodeToString(data))
+		logLoad(fmt.Sprintf("attached image files (%d)", len(imageFiles)), time.Since(imageLoadStart))
 	}
 
 	messages := []ollamaMessage{
@@ -958,6 +999,9 @@ func cmdAsk(args []string) int {
 		fmt.Printf("── Output file: %s ──\n", outputFile)
 		fmt.Printf("── Sandbox root (current directory): %s ──\n", cwd)
 		fmt.Printf("── Directory tree in prompt: %s ──\n", treeNote)
+		for _, lt := range loadTimings {
+			fmt.Printf("── Load time - %s ──\n", lt)
+		}
 		fmt.Printf("── Detected toolchain: %s (build: %q, test: %q) ──\n", cmds.Label, cmds.BuildCmd, cmds.TestCmd)
 		if verifyEnabled {
 			fmt.Printf("── Verify: enabled (run_command offered; cmd-timeout %ds, max %d auto-verify round(s)) ──\n", cmdTimeoutSec, maxAskVerifyRounds)
@@ -1011,6 +1055,9 @@ func cmdAsk(args []string) int {
 		fmt.Fprintln(outFile, "# tools: read_file, search_files, write_file, edit_file, ask_user, get_current_time (run_command not offered: no detected toolchain, or --no-verify)")
 	}
 	fmt.Fprintf(outFile, "# directory tree: %s\n", treeNote)
+	for _, lt := range loadTimings {
+		fmt.Fprintf(outFile, "# load_time: %s\n", lt)
+	}
 	if searchCfg.searchEnabled() {
 		fmt.Fprintf(outFile, "# web_search: enabled (SearXNG: %s, max-results %d, concurrency %d)\n",
 			searchCfg.SearXNGBase, searchCfg.MaxResults, searchCfg.SearchConcurrency)
@@ -1050,10 +1097,10 @@ func cmdAsk(args []string) int {
 		ntfyTopic = os.Getenv("OLA_TOPIC")
 	}
 
-	// Terminal colors. Tool calls print in red so they're visually distinct
-	// from thinking (cyan) and the final answer (bold/default).
-	isTTY := isTerminalStdout()
-	cReset, cCyan, cBold, cDim, cRed := terminalColors(isTTY)
+	// Terminal colors were already resolved above (isTTY, cReset, cCyan,
+	// cBold, cDim, cRed) so the prompt/attachment-loading timing lines
+	// could use them too. Tool calls print in red so they're visually
+	// distinct from thinking (cyan) and the final answer (bold/default).
 
 	// extraTools handles run_command, web_search, and web_fetch - each only
 	// when actually enabled/advertised - and dispatchToolCall falls back to
@@ -1669,6 +1716,7 @@ func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.Fil
 	fmt.Printf("%s🔧 tool_call: %s(%s)%s\n", red, tc.Function.Name, string(argsPreview), reset)
 	fmt.Fprintf(outFile, "\n[tool_call] %s(%s)\n", tc.Function.Name, string(argsPreview))
 
+	loadStart := time.Now()
 	var result string
 	var err error
 	switch tc.Function.Name {
@@ -1705,6 +1753,7 @@ func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.Fil
 		}
 		err = fmt.Errorf("ไม่รู้จัก tool: %s", tc.Function.Name)
 	}
+	loadElapsed := time.Since(loadStart)
 
 	if err != nil {
 		result = "ERROR: " + err.Error()
@@ -1718,7 +1767,36 @@ func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.Fil
 		fmt.Printf("%s   ✓ %s%s\n", red, preview, reset)
 	}
 	fmt.Fprintf(outFile, "[tool_result] %s\n", result)
+
+	// Surface how long this call spent loading data - local files
+	// (read_file/search_files) or external network data (web_search/
+	// web_fetch) - so a slow session can be told apart as "waiting on the
+	// model" vs. "waiting on disk/network I/O". Skipped for ask_user (its
+	// elapsed time is however long the human took to answer, not a load
+	// time) and for tools with no meaningful I/O of their own.
+	if loadIcon, loadLabel := toolLoadTimingLabel(tc.Function.Name); loadIcon != "" {
+		loadStr := fmtLoadDur(loadElapsed)
+		fmt.Printf("%s   %s %s: %s%s\n", red, loadIcon, loadLabel, loadStr, reset)
+		fmt.Fprintf(outFile, "[tool_load_time] %s (%s): %s\n", tc.Function.Name, loadLabel, loadStr)
+	}
 	return result
+}
+
+// toolLoadTimingLabel classifies a tool name for the "how long did loading
+// take" line printed/logged after each tool call. Returns an empty icon
+// for tools that don't represent a data load (ask_user, get_current_time,
+// mutation-only calls like write_file/edit_file, control-flow calls like
+// mark_task_done/report_complete) so their timing isn't reported as if it
+// were I/O latency.
+func toolLoadTimingLabel(name string) (icon, label string) {
+	switch name {
+	case "read_file", "search_files":
+		return "📂", "โหลดไฟล์ (local)"
+	case "web_search", "web_fetch":
+		return "🌐", "โหลดข้อมูลภายนอก (network)"
+	default:
+		return "", ""
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -1921,18 +1999,34 @@ func fmtDur(d time.Duration) string {
 	return fmt.Sprintf("%dh %dm %.1fs", h, m, rem)
 }
 
+// fmtLoadDur formats short I/O-bound durations - local file reads,
+// directory-tree scans, individual tool calls like read_file/web_fetch -
+// with millisecond precision below one second. fmtDur's 0.1s granularity
+// is the right call for round-trip/thinking/preload times that are
+// usually multiple seconds, but it would flatten every fast local read
+// down to an uninformative "0.0s" and hide the very difference (e.g. a
+// slow network web_fetch vs. an instant local read_file) this is meant to
+// surface.
+func fmtLoadDur(d time.Duration) string {
+	if d < time.Second {
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
+	return fmtDur(d)
+}
+
 // streamOutcome accumulates everything relevant from one streamed
 // /api/chat round: the assistant's text, its thinking (if any), any tool
 // calls it made, and timing/token stats for that round.
 type streamOutcome struct {
-	Content        string
-	Thinking       string
-	ToolCalls      []toolCall
-	PromptTokens   int
-	EvalTokens     int
-	EvalDurationNS int64
-	LoadDurationNS int64
-	ThinkDuration  time.Duration
+	Content              string
+	Thinking             string
+	ToolCalls            []toolCall
+	PromptTokens         int
+	EvalTokens           int
+	EvalDurationNS       int64
+	LoadDurationNS       int64
+	PromptEvalDurationNS int64
+	ThinkDuration        time.Duration
 }
 
 func streamResponse(body io.Reader, outFile *os.File, cyan, bold, dim, reset string) streamOutcome {
@@ -1985,6 +2079,7 @@ func streamResponse(body io.Reader, outFile *os.File, cyan, bold, dim, reset str
 						out.EvalTokens = chunk.EvalCount
 						out.EvalDurationNS = chunk.EvalDuration
 						out.LoadDurationNS = chunk.LoadDuration
+						out.PromptEvalDurationNS = chunk.PromptEvalDuration
 					}
 				}
 			}
@@ -2002,6 +2097,11 @@ func streamResponse(body io.Reader, outFile *os.File, cyan, bold, dim, reset str
 		preloadStr := fmtDur(time.Duration(out.LoadDurationNS))
 		fmt.Printf("%s📦 preload (model load into memory): %s%s\n", dim, preloadStr, reset)
 		fmt.Fprintf(outFile, "📦 preload (model load into memory): %s\n", preloadStr)
+	}
+	if out.PromptEvalDurationNS > 0 {
+		promptEvalStr := fmtLoadDur(time.Duration(out.PromptEvalDurationNS))
+		fmt.Printf("%s📝 prompt eval (ประมวลผล prompt เข้า context): %s%s\n", dim, promptEvalStr, reset)
+		fmt.Fprintf(outFile, "📝 prompt eval (ประมวลผล prompt เข้า context): %s\n", promptEvalStr)
 	}
 	total := time.Since(start)
 	totalStr := fmtDur(total)

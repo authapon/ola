@@ -66,3 +66,68 @@ func TestStreamResponseNoPreloadLineWhenZero(t *testing.T) {
 		t.Fatalf("expected no preload line when load_duration is 0, got:\n%s", logged)
 	}
 }
+
+// TestStreamResponseReportsPromptEvalDuration confirms prompt_eval_duration
+// from the final NDJSON chunk - Ollama's time spent ingesting the prompt
+// before it could start generating - is captured separately from
+// load_duration (getting the model into memory) and eval_duration
+// (generating the reply), and surfaced in both the terminal output and the
+// log file. This is what lets a session that's slow to *start* answering
+// (e.g. a huge auto-injected directory tree or attached file) be told apart
+// from one that's just generating a long reply.
+func TestStreamResponseReportsPromptEvalDuration(t *testing.T) {
+	// prompt_eval_duration=450ms, well under fmtLoadDur's 1s cutoff, so it
+	// should be reported with millisecond precision rather than rounded to
+	// "0.5s" by the coarser fmtDur used for preload/round.
+	chunk := `{"message":{"role":"assistant","content":"hi"},"done":true,"prompt_eval_count":500,"eval_count":5,"eval_duration":500000000,"load_duration":0,"prompt_eval_duration":450000000}` + "\n"
+
+	outFile, err := os.CreateTemp(t.TempDir(), "stream-test-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+
+	out := streamResponse(strings.NewReader(chunk), outFile, "", "", "", "")
+
+	if out.PromptEvalDurationNS != 450000000 {
+		t.Fatalf("expected PromptEvalDurationNS to be captured as 450ms (450000000ns), got %d", out.PromptEvalDurationNS)
+	}
+
+	logged, err := os.ReadFile(outFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(logged), "prompt eval") {
+		t.Fatalf("expected the log to mention prompt eval time, got:\n%s", logged)
+	}
+	if !strings.Contains(string(logged), "450ms") {
+		t.Fatalf("expected the log to report the prompt eval time with ms precision (450ms), got:\n%s", logged)
+	}
+}
+
+// TestStreamResponseNoPromptEvalLineWhenZero mirrors
+// TestStreamResponseNoPreloadLineWhenZero: a chunk that doesn't report
+// prompt_eval_duration at all (some model/proxy setups omit it) must not
+// produce a spurious "prompt eval: 0ms" line on every single round.
+func TestStreamResponseNoPromptEvalLineWhenZero(t *testing.T) {
+	chunk := `{"message":{"role":"assistant","content":"hi"},"done":true,"eval_duration":100000000,"load_duration":0,"prompt_eval_duration":0}` + "\n"
+
+	outFile, err := os.CreateTemp(t.TempDir(), "stream-test-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+
+	out := streamResponse(strings.NewReader(chunk), outFile, "", "", "", "")
+	if out.PromptEvalDurationNS != 0 {
+		t.Fatalf("expected PromptEvalDurationNS 0, got %d", out.PromptEvalDurationNS)
+	}
+
+	logged, err := os.ReadFile(outFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(logged), "prompt eval") {
+		t.Fatalf("expected no prompt eval line when prompt_eval_duration is 0, got:\n%s", logged)
+	}
+}

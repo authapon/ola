@@ -1081,11 +1081,30 @@ func cmdCoding(args []string) int {
 		outputFile = "output.txt"
 	}
 
+	// Terminal colors, resolved early (same rationale as cmdAsk in main.go)
+	// so the requirements-file/directory-tree load timing lines below -
+	// printed before outFile exists - use the same dim styling as every
+	// other stat line.
+	isTTY := isTerminalStdout()
+	cReset, cCyan, cBold, cDim, cRed := terminalColors(isTTY)
+
+	// loadTimings mirrors cmdAsk's collector: notes on how long start-up
+	// I/O (requirements file, auto-injected directory tree) took, printed
+	// live and re-logged into outFile's header once it's open.
+	var loadTimings []string
+	logLoad := func(label string, elapsed time.Duration) {
+		note := fmt.Sprintf("%s: %s", label, fmtLoadDur(elapsed))
+		loadTimings = append(loadTimings, note)
+		fmt.Printf("%s📥 %s%s\n", cDim, note, cReset)
+	}
+
+	reqLoadStart := time.Now()
 	reqData, err := os.ReadFile(reqFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: อ่านไฟล์ requirements %s ไม่ได้: %v\n", reqFile, err)
 		return 1
 	}
+	logLoad(fmt.Sprintf("requirements file %s", reqFile), time.Since(reqLoadStart))
 
 	cwd, _ := os.Getwd()
 	cmds := detectProjectCommands(cwd)
@@ -1126,7 +1145,9 @@ func cmdCoding(args []string) int {
 	// tree-injection helper "ask" uses, since coding never takes attached
 	// files either - the model always needs to see the repo shape).
 	content := "# Requirements\n\n" + string(reqData)
+	treeLoadStart := time.Now()
 	tree, truncated, total := buildDirectoryTree(cwd)
+	logLoad(fmt.Sprintf("directory tree (%s)", cwd), time.Since(treeLoadStart))
 	if total > 0 {
 		content += "\n\n===== โครงสร้างไฟล์ใน current directory (auto-generated, รายชื่อเท่านั้น) =====\n" + tree
 		if truncated {
@@ -1168,6 +1189,9 @@ func cmdCoding(args []string) int {
 		fmt.Printf("── Requirements file: %s ──\n", reqFile)
 		fmt.Printf("── Detected toolchain: %s (build: %q test: %q) ──\n", cmds.Label, cmds.BuildCmd, cmds.TestCmd)
 		fmt.Printf("── Sandbox root (current directory): %s ──\n", cwd)
+		for _, lt := range loadTimings {
+			fmt.Printf("── Load time - %s ──\n", lt)
+		}
 		if searchCfg.searchEnabled() {
 			fmt.Printf("── web_search: enabled (SearXNG: %s, max-results %d, concurrency %d) ──\n",
 				searchCfg.SearXNGBase, searchCfg.MaxResults, searchCfg.SearchConcurrency)
@@ -1199,6 +1223,9 @@ func cmdCoding(args []string) int {
 	fmt.Fprintf(outFile, "# host: %s\n# model: %s\n# num_ctx: %d\n", host, model, ctx)
 	fmt.Fprintf(outFile, "# cwd (sandbox root): %s\n# requirements: %s\n", cwd, reqFile)
 	fmt.Fprintf(outFile, "# detected toolchain: %s (build: %q test: %q)\n", cmds.Label, cmds.BuildCmd, cmds.TestCmd)
+	for _, lt := range loadTimings {
+		fmt.Fprintf(outFile, "# load_time: %s\n", lt)
+	}
 	if searchCfg.searchEnabled() {
 		fmt.Fprintf(outFile, "# web_search: enabled (SearXNG: %s, max-results %d, concurrency %d)\n",
 			searchCfg.SearXNGBase, searchCfg.MaxResults, searchCfg.SearchConcurrency)
@@ -1218,9 +1245,6 @@ func cmdCoding(args []string) int {
 	if ntfyTopic == "" {
 		ntfyTopic = os.Getenv("OLA_TOPIC")
 	}
-
-	isTTY := isTerminalStdout()
-	cReset, cCyan, cBold, cDim, cRed := terminalColors(isTTY)
 
 	rc := &codingRunContext{
 		ntfyTopic: ntfyTopic, red: cRed, reset: cReset, outFile: outFile,
