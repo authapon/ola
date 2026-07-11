@@ -78,6 +78,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // ─────────────────────────────────────────────────────────────────
@@ -1092,7 +1093,8 @@ func cmdAsk(args []string) int {
 	iteration := 0
 	filesChanged := false // true once write_file/edit_file has succeeded at least once this session
 	verifyRounds := 0
-	var lastAnswer string // most recent assistant content, used as the "work finished" notification summary
+	var lastAnswer string       // most recent assistant content, used as the "work finished" notification summary
+	var sessionChanges []string // recorded write_file/edit_file entries this session, for buildWorkSummary
 
 	for {
 		iteration++
@@ -1187,7 +1189,7 @@ func cmdAsk(args []string) int {
 			ToolCalls: outcome.ToolCalls,
 		})
 		for _, tc := range outcome.ToolCalls {
-			result := dispatchToolCall(tc, ntfyTopic, cRed, cReset, outFile, extraTools)
+			result := dispatchToolCall(tc, ntfyTopic, cRed, cReset, outFile, extraTools, &sessionChanges)
 			if (tc.Function.Name == "write_file" || tc.Function.Name == "edit_file") && !strings.HasPrefix(result, "ERROR:") {
 				var editArgs map[string]interface{}
 				_ = json.Unmarshal(tc.Function.Arguments, &editArgs)
@@ -1213,14 +1215,14 @@ func cmdAsk(args []string) int {
 	}
 
 	// Send ntfy.sh notification based on final response status. On success,
-	// lastAnswer (the model's own final answer text) is included as the
-	// summary, so the notification itself says what was done instead of
-	// just "done".
+	// buildWorkSummary combines the model's own final answer with the list
+	// of files this session actually touched, so the notification says
+	// what was done instead of just "done".
 	if ntfyTopic != "" {
 		if lastStatusCode >= 400 {
 			sendNotification(ntfyTopic, fmt.Sprintf("Work Failed: HTTP %d", lastStatusCode))
 		} else {
-			sendNotification(ntfyTopic, formatFinishNotification("Work Finished", lastAnswer))
+			sendNotification(ntfyTopic, buildWorkSummary("Work Finished", sessionChanges, lastAnswer))
 		}
 	}
 
@@ -1601,7 +1603,7 @@ func toolAskUser(args map[string]interface{}, ntfyTopic, red, reset string) (str
 	}
 
 	if ntfyTopic != "" {
-		sendNotification(ntfyTopic, "[ASK] "+question)
+		sendNotification(ntfyTopic, truncateWords("[ASK] "+question, maxNotificationWords))
 	}
 
 	fmt.Printf("%s⏸  ola ถามว่า: %s%s\n", red, question, reset)
@@ -1659,7 +1661,7 @@ func toolGetCurrentTime(args map[string]interface{}) (string, error) {
 // covering add_tasks/mark_task_done/run_command/report_complete, so those
 // get the same printing/logging/error-handling treatment as the base tools
 // without duplicating that plumbing.
-func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.File, extra func(name string, args map[string]interface{}) (string, error, bool)) string {
+func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.File, extra func(name string, args map[string]interface{}) (string, error, bool), changeLog ...*[]string) string {
 	var args map[string]interface{}
 	_ = json.Unmarshal(tc.Function.Arguments, &args)
 
@@ -1676,13 +1678,19 @@ func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.Fil
 		result, err = toolSearchFiles(args)
 	case "write_file":
 		result, err = toolWriteFile(args)
-		if err == nil && ntfyTopic != "" {
-			sendNotification(ntfyTopic, formatFileChangeNotification("WRITE", args))
+		if err == nil {
+			recordChange(changeLog, formatFileChangeNotification("WRITE", args))
+			if ntfyTopic != "" {
+				sendNotification(ntfyTopic, formatFileChangeNotification("WRITE", args))
+			}
 		}
 	case "edit_file":
 		result, err = toolEditFile(args)
-		if err == nil && ntfyTopic != "" {
-			sendNotification(ntfyTopic, formatFileChangeNotification("EDIT", args))
+		if err == nil {
+			recordChange(changeLog, formatFileChangeNotification("EDIT", args))
+			if ntfyTopic != "" {
+				sendNotification(ntfyTopic, formatFileChangeNotification("EDIT", args))
+			}
 		}
 	case "ask_user":
 		result, err = toolAskUser(args, ntfyTopic, red, reset)
@@ -1715,15 +1723,68 @@ func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.Fil
 
 // ─────────────────────────────────────────────────────────────────
 // ntfy.sh notification
+//
+// Every push notification ola sends must (a) actually summarize what
+// happened, not just repeat "done", (b) stay within a readable ~1000-word
+// summary, and (c) always arrive as a plain text message - never silently
+// as a downloadable file. That last point isn't just a style preference:
+// ntfy.sh has a hard ~4096-byte limit on the "message" field, and any body
+// over that limit gets turned into a file attachment ("attachment.txt")
+// automatically, with no opt-in required from the sender (see
+// https://docs.ntfy.sh/publish/#message and the message-size-limit note in
+// https://docs.ntfy.sh/config/). ola never sets Attach/X-Filename/Filename/
+// File/f - the headers/params that deliberately request an attachment -
+// but a long enough plain-text body would trip the same behavior by
+// accident. This matters especially for ola, since summaries are often
+// Thai text, where a single character is commonly 3 bytes in UTF-8 - so a
+// word-count cap alone is not enough of a guarantee.
 // ─────────────────────────────────────────────────────────────────
 
-// maxNotificationSummary caps how much of a model-supplied explanation
-// (write_file/edit_file's "reason", or the final answer / report_complete
-// summary at the end of a session) gets included in a single ntfy.sh push
-// notification - the full detail is always in the terminal output and the
-// -o log file; the notification just needs to be readable on a phone lock
-// screen, not a complete transcript.
-const maxNotificationSummary = 500
+// maxNotificationWords caps a "what was done" summary (write_file/
+// edit_file's own "reason", or the aggregated end-of-session recap built
+// by buildWorkSummary) to at most this many whitespace-separated words -
+// the full detail is always in the terminal output and the -o log file;
+// the notification just needs to be readable on a phone lock screen, not a
+// complete transcript.
+const maxNotificationWords = 1000
+
+// ntfySafeBodyBytes is the hard ceiling every outgoing notification body is
+// clamped to, well under ntfy's documented ~4096-byte message limit. This
+// is the actual guarantee against a text summary silently becoming a file
+// attachment: because Thai text can run well past 4096 bytes long before
+// it reaches 1000 words, this byte cap - not the word cap above - is
+// usually what actually binds for ola's Thai-language summaries.
+const ntfySafeBodyBytes = 3800
+
+// truncateWords trims s to at most maxWords whitespace-separated fields,
+// noting how much was cut. This is a readability/length cap for the
+// human-facing summary (maxNotificationWords) - the hard technical
+// guarantee against ntfy turning the message into a file attachment is
+// truncateUTF8Bytes below, applied unconditionally inside sendNotification.
+func truncateWords(s string, maxWords int) string {
+	fields := strings.Fields(s)
+	if len(fields) <= maxWords {
+		return s
+	}
+	return strings.Join(fields[:maxWords], " ") + fmt.Sprintf("\n...(ตัดข้อความ ทั้งหมดมี %d คำ)", len(fields))
+}
+
+// truncateUTF8Bytes trims s to at most maxBytes bytes without splitting a
+// multi-byte UTF-8 rune in half - unlike a plain s[:maxBytes] byte slice,
+// which would risk corrupting Thai text (each Thai character is commonly 3
+// bytes in UTF-8). This runs as the last step before a notification body
+// goes out over the wire, so it must never produce invalid UTF-8.
+func truncateUTF8Bytes(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	b := []byte(s)
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(b[cut]) {
+		cut--
+	}
+	return string(b[:cut]) + "\n...(ตัดข้อความ)"
+}
 
 // formatFileChangeNotification builds the ntfy.sh message body for a
 // write_file/edit_file call: the path being changed, plus the model's own
@@ -1738,25 +1799,60 @@ func formatFileChangeNotification(action string, args map[string]interface{}) st
 	if reason == "" {
 		return fmt.Sprintf("[%s] %s", action, path)
 	}
-	return fmt.Sprintf("[%s] %s - %s", action, path, truncateText(reason, maxNotificationSummary))
+	return truncateWords(fmt.Sprintf("[%s] %s - %s", action, path, reason), maxNotificationWords)
 }
 
-// formatFinishNotification builds the ntfy.sh message body for the end of
-// a session: a short label plus however much of the model's own summary of
-// what it did fits (the final answer for "ask", or report_complete's
-// summary for "coding") - so, like formatFileChangeNotification above, the
-// notification itself carries a real summary instead of just "done".
-func formatFinishNotification(label, summary string) string {
-	summary = strings.TrimSpace(summary)
-	if summary == "" {
-		return label
+// recordChange appends entry to the optional session-wide change log used
+// to build the end-of-session "what was done" summary (buildWorkSummary).
+// The collector is variadic/optional so existing call sites (and tests)
+// that only care about dispatching a single tool call in isolation don't
+// need to thread one through.
+func recordChange(changeLog []*[]string, entry string) {
+	if len(changeLog) == 0 || changeLog[0] == nil {
+		return
 	}
-	return label + ": " + truncateText(summary, maxNotificationSummary)
+	*changeLog[0] = append(*changeLog[0], entry)
 }
 
+// buildWorkSummary composes the "what was done" body for an end-of-session
+// ntfy.sh notification. Rather than relying solely on the model's own
+// closing remark - which can be as thin as "แก้ไขให้แล้วครับ" - it also
+// lists the concrete actions ola recorded during the session (files
+// written/edited, coding tasks marked done), so the notification is an
+// actual recap of what happened rather than just the model's opinion about
+// it. The result is word-capped at maxNotificationWords; sendNotification
+// applies the further byte-safety net on top of that right before sending.
+func buildWorkSummary(label string, changes []string, modelSummary string) string {
+	var b strings.Builder
+	b.WriteString(label)
+	if modelSummary = strings.TrimSpace(modelSummary); modelSummary != "" {
+		b.WriteString(": ")
+		b.WriteString(modelSummary)
+	}
+	if len(changes) > 0 {
+		fmt.Fprintf(&b, "\n\nสิ่งที่ทำ (%d รายการ):", len(changes))
+		for _, c := range changes {
+			b.WriteString("\n- ")
+			b.WriteString(c)
+		}
+	}
+	return truncateWords(b.String(), maxNotificationWords)
+}
+
+// sendNotification posts message as a single ntfy.sh push notification.
+//
+// message is always run through truncateUTF8Bytes first, regardless of the
+// caller, as the final safety net described in the section comment above:
+// no matter how a message was built, it can never leave this function
+// large enough for ntfy to reinterpret it as a file attachment instead of
+// plain text. Content-Type is always text/plain, and ola never sends the
+// headers ntfy uses to opt into a real file attachment (Attach,
+// X-Filename/Filename/File/f) - so a properly-sized message is always
+// delivered as an ordinary text push notification, never a download.
 func sendNotification(topic, message string) {
+	message = truncateUTF8Bytes(message, ntfySafeBodyBytes)
 	url := "https://ntfy.sh/" + topic
-	resp, err := http.Post(url, "text/plain", strings.NewReader(message))
+	resp, err := http.Post(url, "text/plain; charset=utf-8", strings.NewReader(message))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: ส่ง notification ไม่สำเร็จ: %v\n", err)
 		return

@@ -836,6 +836,7 @@ type codingRunContext struct {
 	cmdTO     time.Duration
 	cmds      projectCommands // needed by mark_task_done's build-only light gate
 	searchCfg searchConfig    // web_search/web_fetch config, may be all-zero (disabled)
+	changes   []string        // recorded write/edit/task-done entries this session, for buildWorkSummary
 }
 
 func dispatchCodingToolCall(tc toolCall, rc *codingRunContext) (result string, isReportComplete bool) {
@@ -859,8 +860,12 @@ func dispatchCodingToolCall(tc toolCall, rc *codingRunContext) (result string, i
 				}
 			}
 			r, e := toolMarkTaskDone(args, rc.state)
-			if e == nil && rc.ntfyTopic != "" {
-				sendNotification(rc.ntfyTopic, "[TASK] "+r)
+			if e == nil {
+				entry := truncateWords("[TASK] "+r, maxNotificationWords)
+				rc.changes = append(rc.changes, entry)
+				if rc.ntfyTopic != "" {
+					sendNotification(rc.ntfyTopic, entry)
+				}
 			}
 			return r, e, true
 		case "run_command":
@@ -885,7 +890,7 @@ func dispatchCodingToolCall(tc toolCall, rc *codingRunContext) (result string, i
 			return "", nil, false
 		}
 	}
-	result = dispatchToolCall(tc, rc.ntfyTopic, rc.red, rc.reset, rc.outFile, extra)
+	result = dispatchToolCall(tc, rc.ntfyTopic, rc.red, rc.reset, rc.outFile, extra, &rc.changes)
 	// ask_user in coding mode needs the extra ASSUMPTIONS.md logging that
 	// the generic base-tool switch in dispatchToolCall doesn't know about;
 	// dispatchToolCall already ran toolAskUser once above via the base
@@ -1297,7 +1302,7 @@ func cmdCoding(args []string) int {
 				fmt.Printf("%s✓ verify ผ่าน - งานเสร็จสมบูรณ์%s\n", cDim, cReset)
 				fmt.Fprintf(outFile, "\n[complete] %s\n", reportSummary)
 				if ntfyTopic != "" {
-					sendNotification(ntfyTopic, formatFinishNotification("Work Finished", reportSummary))
+					sendNotification(ntfyTopic, buildWorkSummary("Work Finished", rc.changes, reportSummary))
 					notifiedComplete = true
 				}
 				lastStatusCode = 200
@@ -1332,7 +1337,7 @@ func cmdCoding(args []string) int {
 		case lastStatusCode >= 400:
 			sendNotification(ntfyTopic, fmt.Sprintf("Work Failed: HTTP %d", lastStatusCode))
 		case !notifiedComplete:
-			sendNotification(ntfyTopic, formatFinishNotification("Work Ended (ยังไม่ผ่าน verify แบบสมบูรณ์)", lastAnswer))
+			sendNotification(ntfyTopic, buildWorkSummary("Work Ended (ยังไม่ผ่าน verify แบบสมบูรณ์)", rc.changes, lastAnswer))
 		}
 	}
 
