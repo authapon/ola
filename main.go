@@ -20,11 +20,13 @@
 //	search_files   - find files by glob pattern, optionally grep their lines
 //	write_file     - create or overwrite a file with full content
 //	edit_file      - unique search/replace inside an existing file
+//	create_folder  - create a directory (and any missing parents)
 //	ask_user       - block on stdin and ask the human a question
 //	get_current_time - real system date/time, optionally in a given IANA
 //	                 timezone (models have no reliable notion of "now")
+//	delay          - block for a fixed "XdXhXmXs" duration before continuing
 //
-// Beyond those six, several more tools are added conditionally, only when
+// Beyond those eight, several more tools are added conditionally, only when
 // the feature they belong to is actually configured for the session (see
 // "ola ask -h" for the exact conditions of each): run_command (a detected
 // build/test toolchain), web_search/web_fetch (network access), read_skill
@@ -45,7 +47,7 @@
 // "coding" (see coding.go) is a longer-running, requirements-file-driven
 // loop meant to run unattended: instead of a prompt, it reads a
 // requirements.md-style file and works through an implement/verify/fix
-// cycle on its own, using the same six base tools above plus four more
+// cycle on its own, using the same eight base tools above plus four more
 // (add_tasks, mark_task_done, run_command, report_complete). It has its own
 // system prompt, its own (much higher) iteration cap plus a wall-clock
 // timeout, and a verification gate: report_complete does not end the
@@ -149,6 +151,11 @@ the normal case and only reach for it when it actually applies.
   and retry with a corrected old_str; do not guess repeatedly. "reason" is a
   short (one sentence) explanation of what this specific change does and
   why - same audience/purpose as write_file's reason above.
+- create_folder(path, reason?): create a directory relative to the current
+  directory, including any missing parent directories (like "mkdir -p"). A
+  no-op success if the directory already exists; fails if that path already
+  exists as a file. "reason" is optional and, like write_file/edit_file's,
+  surfaced directly to the human when set.
 - ask_user(question, options?): pause and ask the human a direct question.
   Use this only when a requirement is genuinely ambiguous, or before a
   destructive/hard-to-reverse change (e.g. overwriting a large existing
@@ -161,6 +168,12 @@ the normal case and only reach for it when it actually applies.
   actually depends on the current date/time (e.g. "what's today's date",
   computing a deadline, stamping a file). Don't call it for tasks that don't
   need it.
+- delay(duration): block for a fixed amount of time before continuing, e.g.
+  to wait out an external process, a rate limit, or a scheduled action.
+  duration uses ola's own compact format "XdXhXmXs" (X is a non-negative
+  integer; d/h/m/s = days/hours/minutes/seconds) - each unit is optional but,
+  when present, must appear in that exact order, e.g. "1d2h30m", "45s",
+  "2h". Capped at 24h per call; a longer wait needs multiple calls.
 - run_command(command): ONLY present in your tool list when ola has
   detected a known build/test toolchain in the current directory (e.g. a
   go.mod) and verification is enabled for this session. If you do not see
@@ -539,6 +552,27 @@ var builtinTools = []ollamaTool{
 	{
 		Type: "function",
 		Function: ollamaToolFunction{
+			Name:        "create_folder",
+			Description: "Create a directory relative to the current directory, including any missing parent directories (like \"mkdir -p\"). A no-op success if the directory already exists; fails if that path already exists as a file.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"path": map[string]interface{}{
+						"type":        "string",
+						"description": "Path relative to the current directory.",
+					},
+					"reason": map[string]interface{}{
+						"type":        "string",
+						"description": "Optional short explanation of what this folder is for. Surfaced directly to the human (e.g. in a push notification) when set.",
+					},
+				},
+				"required": []string{"path"},
+			},
+		},
+	},
+	{
+		Type: "function",
+		Function: ollamaToolFunction{
 			Name:        "ask_user",
 			Description: "Ask the human a direct question and wait for their answer. Only for genuine ambiguity or before destructive/hard-to-reverse changes - do not overuse.",
 			Parameters: map[string]interface{}{
@@ -579,6 +613,27 @@ var builtinTools = []ollamaTool{
 			},
 		},
 	},
+	{
+		Type: "function",
+		Function: ollamaToolFunction{
+			Name: "delay",
+			Description: "หน่วงเวลา (block/sleep) ก่อนทำงานต่อ เป็นระยะเวลาที่กำหนด เช่น เพื่อรอ process ภายนอก, " +
+				"รอ rate limit, หรือรอให้ถึงเวลาที่นัดไว้ - รูปแบบ duration คือ \"XdXhXmXs\" (X คือเลขจำนวนเต็มไม่ติดลบ, " +
+				"d=วัน h=ชั่วโมง m=นาที s=วินาที) แต่ละหน่วยเลือกใส่ได้ตามต้องการ แต่ถ้าใส่ต้องเรียงลำดับนี้เท่านั้น " +
+				"เช่น \"1d2h30m\", \"45s\", \"2h\" จำกัดสูงสุด 24 ชั่วโมงต่อการเรียกหนึ่งครั้ง (รอนานกว่านั้นให้เรียกซ้ำ)",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"duration": map[string]interface{}{
+						"type": "string",
+						"description": "รูปแบบ \"XdXhXmXs\" เช่น \"1d2h30m\", \"45s\", \"2h\" " +
+							"(แต่ละหน่วยเลือกใส่ได้ แต่ต้องเรียงลำดับ d, h, m, s เท่านั้น)",
+					},
+				},
+				"required": []string{"duration"},
+			},
+		},
+	},
 }
 
 // runCommandTool is the "run_command" tool schema shared by "ask" (added
@@ -612,7 +667,7 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println()
 		fmt.Println("เรียก Ollama ผ่าน HTTP API (/api/chat) พร้อม streaming + thinking + timing")
 		fmt.Println("และ built-in tool calling ที่เปิดใช้งานเสมอ (ไม่มี flag ปิด/เปิด):")
-		fmt.Println("  read_file, search_files, write_file, edit_file, ask_user, get_current_time")
+		fmt.Println("  read_file, search_files, write_file, edit_file, create_folder, ask_user, get_current_time, delay")
 		fmt.Println("  รวมถึง web_fetch (เปิดอัตโนมัติเสมอ) และ run_command / web_search / scp_copy แบบมีเงื่อนไข (ดูหัวข้อ Verify, Web search, scp_copy ด้านล่าง)")
 		fmt.Println()
 		fmt.Println("ทุก path ที่ tool ใช้อ้างอิงจาก current directory ที่รัน ola อยู่เสมอ")
@@ -1879,6 +1934,34 @@ func toolEditFile(args map[string]interface{}) (string, error) {
 	return fmt.Sprintf("แก้ไขไฟล์ %s สำเร็จ", path), nil
 }
 
+// toolCreateFolder creates a directory (and any missing parent directories,
+// like "mkdir -p") relative to the current directory, sandboxed the same
+// way as read_file/write_file/edit_file. Deliberately forgiving on the
+// "already exists" case - an already-present directory is reported as
+// success, not an error, since a model retrying a plan shouldn't be
+// penalized for a folder a previous step already made. A path that exists
+// but is a regular file, however, is a real conflict and is rejected.
+func toolCreateFolder(args map[string]interface{}) (string, error) {
+	path, _ := args["path"].(string)
+	if path == "" {
+		return "", fmt.Errorf("ต้องระบุ path")
+	}
+	full, err := sandboxedPath(path)
+	if err != nil {
+		return "", err
+	}
+	if info, statErr := os.Stat(full); statErr == nil {
+		if !info.IsDir() {
+			return "", fmt.Errorf("%s มีอยู่แล้วแต่เป็นไฟล์ ไม่ใช่ directory", path)
+		}
+		return fmt.Sprintf("directory %s มีอยู่แล้ว (ไม่มีการเปลี่ยนแปลง)", path), nil
+	}
+	if err := os.MkdirAll(full, 0755); err != nil {
+		return "", fmt.Errorf("สร้าง directory %s ไม่ได้: %v", path, err)
+	}
+	return fmt.Sprintf("สร้าง directory %s สำเร็จ", path), nil
+}
+
 func isStdinTerminal() bool {
 	return isRealTerminal(os.Stdin)
 }
@@ -1948,14 +2031,104 @@ func toolGetCurrentTime(args map[string]interface{}) (string, error) {
 	), nil
 }
 
+// maxDelayDuration caps how long a single "delay" tool call may block the
+// tool-calling loop - ola has no background/async execution, so a call this
+// long simply hangs the whole session for that long. Generous enough to let
+// the "d" (day) unit in parseDelayDuration's format be genuinely useful for
+// a single call, while still catching an obviously-wrong input (a stray
+// extra digit, a unit typo) before it ties up the process for days.
+const maxDelayDuration = 24 * time.Hour
+
+// delayDurationRe matches ola's own compact duration format, anchored over
+// the whole string: each of the four unit groups is optional, but when
+// present they must appear in this exact order (days, then hours, then
+// minutes, then seconds) - "1h1d" (wrong order) or "1d1d" (repeated unit)
+// simply fail to match at all, rather than being silently reinterpreted.
+var delayDurationRe = regexp.MustCompile(`^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$`)
+
+// parseDelayDuration parses "XdXhXmXs" - e.g. "1d2h30m", "45s", "2h" - NOT
+// Go's own time.ParseDuration, which has no day unit and doesn't enforce a
+// fixed letter order. At least one unit must be present.
+func parseDelayDuration(s string) (time.Duration, error) {
+	const usage = `รูปแบบต้องเป็น "XdXhXmXs" เช่น "1d2h30m", "45s", "2h" ` +
+		`(X คือตัวเลขจำนวนเต็มไม่ติดลบ หน่วยเลือกใส่ได้ตามต้องการ แต่ต้องเรียงลำดับ d, h, m, s เท่านั้น)`
+
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("duration ว่างเปล่า - %s", usage)
+	}
+	m := delayDurationRe.FindStringSubmatch(s)
+	if m == nil || (m[1] == "" && m[2] == "" && m[3] == "" && m[4] == "") {
+		return 0, fmt.Errorf("duration %q ไม่ถูกต้อง - %s", s, usage)
+	}
+
+	var total time.Duration
+	for i, unit := range []time.Duration{24 * time.Hour, time.Hour, time.Minute, time.Second} {
+		if m[i+1] == "" {
+			continue
+		}
+		n, convErr := strconv.Atoi(m[i+1])
+		if convErr != nil {
+			return 0, fmt.Errorf("duration %q ไม่ถูกต้อง - %s", s, usage)
+		}
+		total += time.Duration(n) * unit
+	}
+	return total, nil
+}
+
+// formatDelayDuration renders d back in the same day-aware family
+// parseDelayDuration accepts, unlike time.Duration's own String() (which
+// has no day unit and would print a 1-day delay as "24h0m0s") - so the
+// tool's own success message speaks the same units the caller asked in.
+func formatDelayDuration(d time.Duration) string {
+	total := int64(d / time.Second)
+	days := total / 86400
+	total %= 86400
+	hours := total / 3600
+	total %= 3600
+	minutes := total / 60
+	seconds := total % 60
+
+	var b strings.Builder
+	if days > 0 {
+		fmt.Fprintf(&b, "%dd", days)
+	}
+	if hours > 0 || days > 0 {
+		fmt.Fprintf(&b, "%dh", hours)
+	}
+	if minutes > 0 || hours > 0 || days > 0 {
+		fmt.Fprintf(&b, "%dm", minutes)
+	}
+	fmt.Fprintf(&b, "%ds", seconds)
+	return b.String()
+}
+
+// toolDelay blocks the calling goroutine - and therefore the whole
+// tool-calling loop, since ola runs everything synchronously - for the
+// requested duration, then returns. See parseDelayDuration for the
+// accepted format and maxDelayDuration for the hard ceiling.
+func toolDelay(args map[string]interface{}) (string, error) {
+	raw, _ := args["duration"].(string)
+	d, err := parseDelayDuration(raw)
+	if err != nil {
+		return "", err
+	}
+	if d > maxDelayDuration {
+		return "", fmt.Errorf("duration %s เกินขีดจำกัดสูงสุด %s ต่อการเรียกหนึ่งครั้ง - ถ้าต้องการรอนานกว่านี้ให้เรียก delay ซ้ำหลายครั้ง",
+			formatDelayDuration(d), formatDelayDuration(maxDelayDuration))
+	}
+	time.Sleep(d)
+	return fmt.Sprintf("หน่วงเวลา %s เรียบร้อยแล้ว", formatDelayDuration(d)), nil
+}
+
 // dispatchToolCall executes a single tool call, printing it (and its
 // result) to the terminal in red, logging the full exchange to outFile, and
 // returning the string that should be sent back to the model as the
 // content of a role:"tool" message.
 //
-// extra is an optional hook for tool names beyond the six base ones
+// extra is an optional hook for tool names beyond the eight base ones
 // handled directly below (name, parsed-args) -> (result, error, handled).
-// "ask" passes nil, since it only ever offers the base six tools to the
+// "ask" passes nil, since it only ever offers the base eight tools to the
 // model in the first place. "coding" (see coding.go) passes a closure
 // covering add_tasks/mark_task_done/run_command/report_complete, so those
 // get the same printing/logging/error-handling treatment as the base tools
@@ -1992,10 +2165,20 @@ func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.Fil
 				sendNotification(ntfyTopic, formatFileChangeNotification("EDIT", args))
 			}
 		}
+	case "create_folder":
+		result, err = toolCreateFolder(args)
+		if err == nil {
+			recordChange(changeLog, formatFileChangeNotification("MKDIR", args))
+			if ntfyTopic != "" {
+				sendNotification(ntfyTopic, formatFileChangeNotification("MKDIR", args))
+			}
+		}
 	case "ask_user":
 		result, err = toolAskUser(args, ntfyTopic, red, reset)
 	case "get_current_time":
 		result, err = toolGetCurrentTime(args)
+	case "delay":
+		result, err = toolDelay(args)
 	default:
 		if extra != nil {
 			if r, e, handled := extra(tc.Function.Name, args); handled {
@@ -2078,10 +2261,11 @@ func printWebSearchSummary(queryItems []webSearchQueryItems, red, reset string, 
 	}
 }
 
-// toolLoadTimingLabel classifies a tool name for the "how long did loading
-// take" line printed/logged after each tool call. Returns an empty icon
-// for tools that don't represent a data load (ask_user, get_current_time,
-// mutation-only calls like write_file/edit_file, control-flow calls like
+// toolLoadTimingLabel classifies a tool name for the "how long did this
+// take" line printed/logged after each tool call: either genuine I/O
+// latency (a data load) or a deliberate wait (delay). Returns an empty icon
+// for tools that are neither (ask_user, get_current_time, mutation-only
+// calls like write_file/edit_file/create_folder, control-flow calls like
 // mark_task_done/report_complete) so their timing isn't reported as if it
 // were I/O latency.
 func toolLoadTimingLabel(name string) (icon, label string) {
@@ -2094,6 +2278,8 @@ func toolLoadTimingLabel(name string) (icon, label string) {
 		return "🌐", "โหลดข้อมูลภายนอก (network)"
 	case "scp_copy":
 		return "🌐", "โอนไฟล์ (scp/network)"
+	case "delay":
+		return "⏳", "หน่วงเวลาตามที่ขอ (delay)"
 	default:
 		return "", ""
 	}

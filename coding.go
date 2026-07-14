@@ -126,6 +126,9 @@ requirements is actually built and actually works.
   explanation of what this file/change does and why - it's surfaced
   directly to the human (e.g. in a push notification), so write it for
   that audience, not for yourself.
+- create_folder(path, reason?): create a directory (and any missing parent
+  directories) relative to the current directory. A no-op success if it
+  already exists; fails if that path already exists as a file.
 - ask_user(question, options?): ask a human a direct question. This session
   may or may not have an interactive terminal attached. If it doesn't, this
   tool will fail with an explanatory error instead of blocking forever -
@@ -138,6 +141,11 @@ requirements is actually built and actually works.
   this rather than guessing whenever the task actually depends on it (e.g.
   computing a deadline, stamping a file, a requirement phrased relative to
   "today").
+- delay(duration): block for a fixed amount of time before continuing (e.g.
+  to wait out an external process or a rate limit). duration uses ola's
+  compact "XdXhXmXs" format (X a non-negative integer; d/h/m/s =
+  days/hours/minutes/seconds), each unit optional but, when present, in
+  that exact order - e.g. "1d2h30m", "45s", "2h". Capped at 24h per call.
 - add_tasks(tasks): register your implementation plan as a checklist, one
   short string per concrete task. Call this ONCE, early, right after you've
   read the requirements and looked over the repository - not per file, per
@@ -959,7 +967,7 @@ func codingUsage(fs *flag.FlagSet) func() {
 		fmt.Println("(default: requirements.md), วางแผนเป็น task checklist, implement, เรียก build/test")
 		fmt.Println("ของโปรเจกต์เอง วนแก้จนกว่าจะผ่านจริง แล้วจึงรายงานว่าสำเร็จ")
 		fmt.Println()
-		fmt.Println("Tool ที่เปิดใช้เสมอ (นอกเหนือจาก 6 ตัวของ ask): add_tasks, mark_task_done,")
+		fmt.Println("Tool ที่เปิดใช้เสมอ (นอกเหนือจาก 8 ตัวของ ask): add_tasks, mark_task_done,")
 		fmt.Println("run_command (allowlisted ตาม toolchain ที่ตรวจพบ), report_complete")
 		fmt.Println("รวมถึง web_fetch (เปิดอัตโนมัติเสมอ), web_search และ read_skill แบบมีเงื่อนไข")
 		fmt.Println("(ดูหัวข้อ Web search และ Skills ด้านล่าง)")
