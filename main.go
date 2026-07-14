@@ -87,7 +87,7 @@
 //	OLA_SKILLS_DIR          Comma-separated skill directories (override with --skills-dir);
 //	                        each subdirectory containing a SKILL.md becomes an available
 //	                        skill via the read_skill tool. Opt-in (default: unset/disabled).
-//	OLA_SCP_HOSTS           Comma-separated "alias=user@host[:port]=/remote/root" entries
+//	OLA_SCP_HOSTS           Comma-separated "alias=user@host[:port]/remote/root" entries
 //	                        (override with --scp-hosts); enables the scp_copy tool, opt-in
 //	                        (default: unset/disabled). See scp.go.
 package main
@@ -664,8 +664,8 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  ใช้ scp binary ของระบบเรียกตรงผ่าน argv (ไม่ผ่าน sh -c) ไม่มี tool call ไหนที่ยอมให้โมเดลระบุ")
 		fmt.Println("  user/host/port/remote-root เองได้เลย - ต้องตั้งค่าไว้ล่วงหน้าเท่านั้นผ่าน OLA_SCP_HOSTS โดยโมเดล")
 		fmt.Println("  เลือกได้แค่ \"remote_alias\" จากรายชื่อที่ตั้งไว้ (เหมือนหลักการ allowlist ของ run_command - เดา/พิมพ์")
-		fmt.Println("  host เองไม่ได้) รูปแบบ: \"alias=user@host[:port]=/remote/root\" คั่นหลาย host ด้วย comma เช่น")
-		fmt.Println("    OLA_SCP_HOSTS=\"backup=moo@10.0.0.5:22=/srv/backup,nas=moo@nas.local=/mnt/data\"")
+		fmt.Println("  host เองไม่ได้) รูปแบบ: \"alias=user@host[:port]/remote/root\" คั่นหลาย host ด้วย comma เช่น")
+		fmt.Println("    OLA_SCP_HOSTS=\"backup=moo@10.0.0.5:22/srv/backup,nas=moo@nas.local/mnt/data\"")
 		fmt.Println("  ทั้งฝั่ง local (--scp-local-dir, default: current directory) และฝั่ง remote (root ต่อ alias ด้านบน)")
 		fmt.Println("  ถูก sandbox แบบเดียวกับ read_file/write_file - path ที่จะออกนอกขอบเขตที่กำหนดไว้จะถูกปฏิเสธเสมอ")
 		fmt.Println("  Auth: ใช้ SSH key ที่ config ไว้แล้วในเครื่องเท่านั้น (ssh-agent/~/.ssh/config หรือ --scp-key/OLA_SCP_KEY")
@@ -705,7 +705,7 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  OLA_SKILLS_DIR            Directory (หรือหลาย directory คั่นด้วย comma) ที่เก็บ skill ต่างๆ")
 		fmt.Println("                            (override ด้วย --skills-dir) เปิด tool 'read_skill' - ดูหัวข้อ Skills ด้านบน")
 		fmt.Println("  OLA_SCP_HOSTS             รายชื่อ remote host ที่อนุญาตให้ scp_copy ใช้ได้ (override ด้วย --scp-hosts)")
-		fmt.Println("                            รูปแบบ \"alias=user@host[:port]=/remote/root\" คั่นหลายตัวด้วย comma")
+		fmt.Println("                            รูปแบบ \"alias=user@host[:port]/remote/root\" คั่นหลายตัวด้วย comma")
 		fmt.Println("                            เปิด tool 'scp_copy' - ดูหัวข้อ scp_copy ด้านบน")
 		fmt.Println("  OLA_SCP_LOCAL_DIR         Local sandbox root ของ scp_copy (override ด้วย --scp-local-dir, default: current directory)")
 		fmt.Println("  OLA_SCP_KEY               SSH identity file (-i) สำหรับ scp_copy (override ด้วย --scp-key, default: ใช้ ssh-agent/~/.ssh/config)")
@@ -785,7 +785,7 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  export OLA_TOPIC=mytopic")
 		fmt.Println("  ola ask 'deploy to production'  # ใช้ค่า OLA_TOPIC จาก environment")
 		fmt.Println("  ola ask --skills-dir /mnt/skills/public,/mnt/skills/private 'สร้างสไลด์สรุปบทที่ 5'")
-		fmt.Println("  ola ask --scp-hosts 'backup=moo@10.0.0.5=/srv/backup' 'สำรอง report.txt ไปที่ backup หน่อย'")
+		fmt.Println("  ola ask --scp-hosts 'backup=moo@10.0.0.5/srv/backup' 'สำรอง report.txt ไปที่ backup หน่อย'")
 	}
 }
 

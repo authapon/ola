@@ -89,8 +89,8 @@ type scpHost struct {
 type scpConfig struct {
 	Hosts     map[string]scpHost
 	HostOrder []string // preserves config order, used for stable-ish error listings before sorting
-	LocalRoot string    // absolute path; the sandbox root on the local side (default: cwd)
-	KeyPath   string    // optional -i identity file; empty = rely on ssh-agent/~/.ssh/config
+	LocalRoot string   // absolute path; the sandbox root on the local side (default: cwd)
+	KeyPath   string   // optional -i identity file; empty = rely on ssh-agent/~/.ssh/config
 	Timeout   time.Duration
 	MaxBytes  int64 // 0 disables the cap entirely; resolveSCPConfig never produces 0 unless explicitly forced
 }
@@ -181,24 +181,33 @@ func resolveSCPConfig(hostsFlag, localDirFlag, keyFlag string, timeoutSecFlag in
 	}, warnings
 }
 
-// parseSCPHostEntry parses one "alias=user@host[:port]=/remote/root" entry
+// parseSCPHostEntry parses one "alias=user@host[:port]/remote/root" entry
 // from OLA_SCP_HOSTS/--scp-hosts. This is the ONLY place a remote
 // user/host/port/root is ever set - see the package doc comment above.
-// Example: "backup=moo@10.0.0.5:22=/srv/backup" or, using the default SSH
-// port, "nas=moo@nas.local=/mnt/data".
+// Example: "backup=moo@10.0.0.5:22/srv/backup" or, using the default SSH
+// port, "nas=moo@nas.local/mnt/data".
+//
+// Only ONE "=" is used (between alias and everything else) - the remote
+// root is always an absolute path, so its leading "/" doubles as the
+// delimiter between hostspec and root, with no second "=" needed.
 func parseSCPHostEntry(entry string) (scpHost, error) {
-	parts := strings.SplitN(entry, "=", 3)
-	if len(parts) != 3 {
-		return scpHost{}, fmt.Errorf(`รูปแบบต้องเป็น "alias=user@host[:port]=/remote/root"`)
+	const usage = `รูปแบบต้องเป็น "alias=user@host[:port]/remote/root"`
+
+	eqIdx := strings.Index(entry, "=")
+	if eqIdx < 0 {
+		return scpHost{}, fmt.Errorf("%s", usage)
 	}
-	alias := strings.TrimSpace(parts[0])
-	hostspec := strings.TrimSpace(parts[1])
-	root := strings.TrimSpace(parts[2])
-	if alias == "" || hostspec == "" || root == "" {
-		return scpHost{}, fmt.Errorf("alias/hostspec/remote-root ต้องไม่ว่างเปล่า")
+	alias := strings.TrimSpace(entry[:eqIdx])
+	rest := strings.TrimSpace(entry[eqIdx+1:])
+
+	slashIdx := strings.Index(rest, "/")
+	if slashIdx < 0 {
+		return scpHost{}, fmt.Errorf("%s (ไม่พบ remote root ที่ขึ้นต้นด้วย /)", usage)
 	}
-	if !strings.HasPrefix(root, "/") {
-		return scpHost{}, fmt.Errorf("remote root %q ต้องเป็น absolute path (ขึ้นต้นด้วย /)", root)
+	hostspec := strings.TrimSpace(rest[:slashIdx])
+	root := strings.TrimSpace(rest[slashIdx:])
+	if alias == "" || hostspec == "" {
+		return scpHost{}, fmt.Errorf("alias/hostspec ต้องไม่ว่างเปล่า")
 	}
 
 	userHost := hostspec

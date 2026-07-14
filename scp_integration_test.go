@@ -65,7 +65,7 @@ func TestCmdAskSCPCopyEndToEnd(t *testing.T) {
 
 	exitCode := cmdAsk([]string{
 		"-m", "mock-model", "-o", "ask-scp.log",
-		"--scp-hosts", "backup=moo@testhost=/",
+		"--scp-hosts", "backup=moo@testhost/",
 		"สำรอง report.txt ไปที่ backup หน่อย",
 	})
 	if exitCode != 0 {

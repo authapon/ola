@@ -15,12 +15,12 @@ import (
 
 func TestParseSCPHostEntryValid(t *testing.T) {
 	cases := []struct {
-		entry                              string
+		entry                               string
 		alias, user, host, port, remoteRoot string
 	}{
-		{"backup=moo@10.0.0.5:2222=/srv/backup", "backup", "moo", "10.0.0.5", "2222", "/srv/backup"},
-		{"nas=moo@nas.local=/mnt/data", "nas", "moo", "nas.local", defaultSSHPort, "/mnt/data"},
-		{"  spaced = moo@host = /root  ", "spaced", "moo", "host", defaultSSHPort, "/root"},
+		{"backup=moo@10.0.0.5:2222/srv/backup", "backup", "moo", "10.0.0.5", "2222", "/srv/backup"},
+		{"nas=moo@nas.local/mnt/data", "nas", "moo", "nas.local", defaultSSHPort, "/mnt/data"},
+		{"  spaced = moo@host /root  ", "spaced", "moo", "host", defaultSSHPort, "/root"},
 	}
 	for _, c := range cases {
 		h, err := parseSCPHostEntry(c.entry)
@@ -37,13 +37,12 @@ func TestParseSCPHostEntryValid(t *testing.T) {
 func TestParseSCPHostEntryInvalid(t *testing.T) {
 	bad := []string{
 		"",
-		"noequalsigns",
-		"alias=onlyonefield",
-		"alias=user@host=relative/not/absolute",
-		"alias=missingatsign=/root",
-		"=moo@host=/root",       // empty alias
-		"alias=@host=/root",     // empty user
-		"alias=moo@=/root",      // empty host
+		"noequalsigns",             // no "="
+		"alias=onlyonefield",       // "=" but no "/" -> no remote root
+		"alias=missingatsign/root", // hostspec has no "@"
+		"=moo@host/root",           // empty alias
+		"alias=@host/root",         // empty user
+		"alias=moo@/root",          // empty host
 	}
 	for _, entry := range bad {
 		if _, err := parseSCPHostEntry(entry); err == nil {
@@ -68,8 +67,8 @@ func TestResolveSCPConfigDisabledByDefault(t *testing.T) {
 // applies identically here: an explicit --scp-hosts wins over
 // OLA_SCP_HOSTS.
 func TestResolveSCPConfigFlagOverridesEnv(t *testing.T) {
-	t.Setenv("OLA_SCP_HOSTS", "envalias=moo@envhost=/env/root")
-	cfg, warnings := resolveSCPConfig("flagalias=moo@flaghost=/flag/root", "", "", 0, 0)
+	t.Setenv("OLA_SCP_HOSTS", "envalias=moo@envhost/env/root")
+	cfg, warnings := resolveSCPConfig("flagalias=moo@flaghost/flag/root", "", "", 0, 0)
 	if len(warnings) != 0 {
 		t.Fatalf("expected no warnings, got: %v", warnings)
 	}
@@ -89,7 +88,7 @@ func TestResolveSCPConfigFlagOverridesEnv(t *testing.T) {
 // down every other configured host - the same non-fatal shape loadSkills
 // uses for a bad skill directory.
 func TestResolveSCPConfigSkipsBadEntryButKeepsOthers(t *testing.T) {
-	cfg, warnings := resolveSCPConfig("good=moo@goodhost=/root,bad-entry-no-root", "", "", 0, 0)
+	cfg, warnings := resolveSCPConfig("good=moo@goodhost/root,bad-entry-no-root", "", "", 0, 0)
 	if len(warnings) != 1 {
 		t.Fatalf("expected exactly 1 warning for the malformed entry, got %d: %v", len(warnings), warnings)
 	}
@@ -105,7 +104,7 @@ func TestResolveSCPConfigSkipsBadEntryButKeepsOthers(t *testing.T) {
 // an already-seen alias is rejected with a warning and the first
 // definition wins, rather than silently overwriting it.
 func TestResolveSCPConfigWarnsOnDuplicateAlias(t *testing.T) {
-	cfg, warnings := resolveSCPConfig("dup=moo@first=/root1,dup=moo@second=/root2", "", "", 0, 0)
+	cfg, warnings := resolveSCPConfig("dup=moo@first/root1,dup=moo@second/root2", "", "", 0, 0)
 	if len(warnings) != 1 || !strings.Contains(warnings[0], "ซ้ำ") {
 		t.Fatalf("expected exactly 1 duplicate-alias warning, got: %v", warnings)
 	}
@@ -122,7 +121,7 @@ func TestResolveSCPConfigDefaultsLocalRootToCwd(t *testing.T) {
 	}
 	defer os.Chdir(origWD)
 
-	cfg, _ := resolveSCPConfig("alias=moo@host=/root", "", "", 0, 0)
+	cfg, _ := resolveSCPConfig("alias=moo@host/root", "", "", 0, 0)
 	// Resolve symlinks on both sides (macOS/some CI temp dirs are
 	// themselves behind a symlink) so this comparison is robust.
 	wantAbs, _ := filepath.EvalSymlinks(dir)
@@ -133,7 +132,7 @@ func TestResolveSCPConfigDefaultsLocalRootToCwd(t *testing.T) {
 }
 
 func TestResolveSCPConfigTimeoutAndMaxBytesDefaults(t *testing.T) {
-	cfg, _ := resolveSCPConfig("alias=moo@host=/root", "", "", 0, 0)
+	cfg, _ := resolveSCPConfig("alias=moo@host/root", "", "", 0, 0)
 	if cfg.Timeout != defaultSCPTimeoutSec*time.Second {
 		t.Fatalf("expected default timeout %ds, got %s", defaultSCPTimeoutSec, cfg.Timeout)
 	}
