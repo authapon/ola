@@ -416,3 +416,318 @@ func TestWebSearchToolNotOfferedWhenDisabled_sanity(t *testing.T) {
 		t.Fatalf("unexpected web_fetch tool name: %s", webFetchTool.Function.Name)
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────
+// Ollama Web Search API backend (no self-hosted SearXNG required) +
+// backend precedence + the terminal/log "found N results, here's every
+// title+link" summary that rides on top of whichever backend actually ran.
+// ─────────────────────────────────────────────────────────────────
+
+func TestResolveOllamaSearchConfigFlagOverridesEnv(t *testing.T) {
+	os.Setenv("OLA_OLLAMA_SEARCH_API_KEY", "env-key")
+	os.Setenv("OLLAMA_API_KEY", "generic-env-key")
+	os.Setenv("OLA_OLLAMA_SEARCH_API_BASE", "http://mock-ollama:1234")
+	defer os.Unsetenv("OLA_OLLAMA_SEARCH_API_KEY")
+	defer os.Unsetenv("OLLAMA_API_KEY")
+	defer os.Unsetenv("OLA_OLLAMA_SEARCH_API_BASE")
+
+	apiKey, base := resolveOllamaSearchConfig("flag-key")
+	if apiKey != "flag-key" {
+		t.Fatalf("expected --ollama-search-key flag to win over both env vars, got %q", apiKey)
+	}
+	if base != "http://mock-ollama:1234" {
+		t.Fatalf("expected OLA_OLLAMA_SEARCH_API_BASE to override the default base, got %q", base)
+	}
+}
+
+func TestResolveOllamaSearchConfigFallsBackToGenericOllamaAPIKeyEnv(t *testing.T) {
+	os.Unsetenv("OLA_OLLAMA_SEARCH_API_KEY")
+	os.Setenv("OLLAMA_API_KEY", "generic-env-key")
+	defer os.Unsetenv("OLLAMA_API_KEY")
+
+	// No flag, no ola-specific env var - must fall back to the standard
+	// OLLAMA_API_KEY name that Ollama's own CLI/Python/JS libraries use, so
+	// a machine already configured for `ollama.web_search` needs no
+	// ola-specific setup at all.
+	apiKey, base := resolveOllamaSearchConfig("")
+	if apiKey != "generic-env-key" {
+		t.Fatalf("expected fallback to $OLLAMA_API_KEY, got %q", apiKey)
+	}
+	if base != defaultOllamaSearchBase {
+		t.Fatalf("expected default base %q when OLA_OLLAMA_SEARCH_API_BASE is unset, got %q", defaultOllamaSearchBase, base)
+	}
+}
+
+func TestSearchConfigSearchEnabledViaOllamaKeyAlone(t *testing.T) {
+	cfg := resolveSearchConfig("", 0, 0, 0, 0, 0, false)
+	cfg.OllamaAPIKey, cfg.OllamaBase = resolveOllamaSearchConfig("some-key")
+	if !cfg.searchEnabled() {
+		t.Fatal("expected searchEnabled() true when only OllamaAPIKey is set (no SearXNG at all)")
+	}
+}
+
+func TestSearchBackendLabel(t *testing.T) {
+	disabled := searchConfig{}
+	if got := disabled.searchBackendLabel(); got != "disabled" {
+		t.Fatalf("expected %q for an all-zero config, got %q", "disabled", got)
+	}
+	ollamaOnly := searchConfig{OllamaAPIKey: "k", OllamaBase: "https://ollama.com"}
+	if got := ollamaOnly.searchBackendLabel(); !strings.Contains(got, "Ollama") {
+		t.Fatalf("expected label to mention Ollama, got %q", got)
+	}
+	both := searchConfig{SearXNGBase: "http://searxng:8080", OllamaAPIKey: "k", OllamaBase: "https://ollama.com"}
+	if got := both.searchBackendLabel(); !strings.Contains(got, "SearXNG") {
+		t.Fatalf("expected SearXNG to win the label when both backends are configured, got %q", got)
+	}
+}
+
+// TestToolWebSearchOllamaBackendRunsQueriesInParallel mirrors
+// TestToolWebSearchRunsQueriesInParallel but against a mock shaped like
+// Ollama's hosted Web Search API (POST /api/web_search, Bearer auth,
+// {"results":[{"title","url","content"}]}) instead of SearXNG - confirming
+// the new backend is wired into toolWebSearch's concurrent fan-out
+// identically to the original one.
+func TestToolWebSearchOllamaBackendRunsQueriesInParallel(t *testing.T) {
+	var hits int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/web_search", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-ollama-key" {
+			t.Errorf("expected Bearer auth with the configured key, got %q", got)
+		}
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		time.Sleep(150 * time.Millisecond)
+		resp := ollamaSearchResponse{Results: []ollamaSearchResult{
+			{Title: "result for " + body["query"], URL: "https://example.com/" + body["query"], Content: "some content about " + body["query"]},
+		}}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// No SearXNG configured at all - only the Ollama backend.
+	cfg := resolveSearchConfig("", 0, 4, 0, 5, 0, false)
+	cfg.OllamaAPIKey = "test-ollama-key"
+	cfg.OllamaBase = srv.URL
+
+	args := map[string]interface{}{
+		"queries": []interface{}{"golang", "ollama", "searxng", "ripgrep"},
+	}
+
+	start := time.Now()
+	result, err := toolWebSearch(args, cfg)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("toolWebSearch returned error: %v", err)
+	}
+	if atomic.LoadInt32(&hits) != 4 {
+		t.Fatalf("expected 4 upstream hits, got %d", hits)
+	}
+	if elapsed > 400*time.Millisecond {
+		t.Fatalf("expected concurrent fan-out (~150ms), took %s - looks serial", elapsed)
+	}
+	for _, q := range []string{"golang", "ollama", "searxng", "ripgrep"} {
+		if !strings.Contains(result, q) {
+			t.Fatalf("expected result to mention query %q, got: %s", q, result)
+		}
+	}
+}
+
+// TestToolWebSearchOllamaBackendRejectsBadKey confirms an HTTP
+// 401/403 from Ollama's Web Search API (bad/missing key) surfaces as a
+// clear, actionable error mentioning the relevant env vars/flag, not a
+// generic JSON-parse failure.
+func TestToolWebSearchOllamaBackendRejectsBadKey(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/web_search", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"invalid api key"}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := resolveSearchConfig("", 0, 0, 0, 5, 0, false)
+	cfg.OllamaAPIKey = "bad-key"
+	cfg.OllamaBase = srv.URL
+
+	result, err := toolWebSearch(map[string]interface{}{"queries": []interface{}{"x"}}, cfg)
+	if err != nil {
+		t.Fatalf("expected the batch call itself to succeed with an ERROR slot, got err: %v", err)
+	}
+	if !strings.Contains(result, "ERROR") || !strings.Contains(result, "API key") {
+		t.Fatalf("expected a clear API-key error mentioning 'API key', got: %s", result)
+	}
+}
+
+// TestToolWebSearchSearXNGWinsWhenBothBackendsConfigured confirms the
+// documented precedence rule: if a session has both OLA_SEARXNG_API_BASE
+// and an Ollama Web Search API key configured, SearXNG is the one actually
+// used (only its mock server receives hits) - preserving prior behavior
+// for anyone who already had SearXNG configured before this backend
+// existed.
+func TestToolWebSearchSearXNGWinsWhenBothBackendsConfigured(t *testing.T) {
+	var searxngHits, ollamaHits int32
+	searxngMux := http.NewServeMux()
+	searxngMux.HandleFunc("/search", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&searxngHits, 1)
+		resp := searxngResponse{Results: []searxngResult{{Title: "from searxng", URL: "https://searxng.example.com", Content: "c"}}}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	searxngSrv := httptest.NewServer(searxngMux)
+	defer searxngSrv.Close()
+
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/web_search", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&ollamaHits, 1)
+		resp := ollamaSearchResponse{Results: []ollamaSearchResult{{Title: "from ollama", URL: "https://ollama.example.com", Content: "c"}}}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	cfg := resolveSearchConfig(searxngSrv.URL, 0, 0, 0, 5, 0, false)
+	cfg.OllamaAPIKey = "some-key"
+	cfg.OllamaBase = ollamaSrv.URL
+
+	result, err := toolWebSearch(map[string]interface{}{"queries": []interface{}{"x"}}, cfg)
+	if err != nil {
+		t.Fatalf("toolWebSearch returned error: %v", err)
+	}
+	if atomic.LoadInt32(&searxngHits) != 1 {
+		t.Fatalf("expected SearXNG to be hit exactly once, got %d", searxngHits)
+	}
+	if atomic.LoadInt32(&ollamaHits) != 0 {
+		t.Fatalf("expected Ollama Web Search API to NOT be hit when SearXNG is also configured, got %d hits", ollamaHits)
+	}
+	if !strings.Contains(result, "from searxng") || strings.Contains(result, "from ollama") {
+		t.Fatalf("expected result to come from SearXNG only, got: %s", result)
+	}
+}
+
+// TestToolWebSearchPublishesStructuredItemsForTerminalSummary confirms
+// toolWebSearch stashes the same title/url data (per query, including
+// per-query errors) that dispatchToolCall's terminal/log summary reads via
+// popLastWebSearchItems - and that popping clears it, so a session that
+// runs web_search twice never shows stale results from the first call.
+func TestToolWebSearchPublishesStructuredItemsForTerminalSummary(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/search", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("q")
+		if q == "bad" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		resp := searxngResponse{Results: []searxngResult{
+			{Title: "Title for " + q, URL: "https://example.com/" + q, Content: "content"},
+		}}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := resolveSearchConfig(srv.URL, 0, 2, 0, 5, 0, false)
+
+	if _, err := toolWebSearch(map[string]interface{}{"queries": []interface{}{"good", "bad"}}, cfg); err != nil {
+		t.Fatalf("toolWebSearch returned error: %v", err)
+	}
+
+	items := popLastWebSearchItems()
+	if len(items) != 2 {
+		t.Fatalf("expected 2 published query-item groups, got %d", len(items))
+	}
+	var sawGood, sawBad bool
+	for _, qi := range items {
+		switch qi.Query {
+		case "good":
+			sawGood = true
+			if qi.Err != nil {
+				t.Fatalf("expected no error for 'good' query, got: %v", qi.Err)
+			}
+			if len(qi.Items) != 1 || qi.Items[0].Title != "Title for good" || qi.Items[0].URL != "https://example.com/good" {
+				t.Fatalf("unexpected items for 'good' query: %+v", qi.Items)
+			}
+		case "bad":
+			sawBad = true
+			if qi.Err == nil {
+				t.Fatal("expected an error to be published for the 'bad' query")
+			}
+		}
+	}
+	if !sawGood || !sawBad {
+		t.Fatalf("expected both 'good' and 'bad' queries to be represented, got: %+v", items)
+	}
+
+	// Popping clears the side-channel.
+	if again := popLastWebSearchItems(); again != nil {
+		t.Fatalf("expected popLastWebSearchItems to clear after popping once, got: %+v", again)
+	}
+}
+
+// TestDispatchToolCallWebSearchLogsSummary drives web_search through the
+// real dispatchToolCall path (the same one "ask" and "coding" both use) and
+// confirms the -o log file gets a "[web_search_summary]" line reporting the
+// total result count across all queries, plus every single result's
+// title+link grouped by query - independent of, and un-truncated compared
+// to, the generic 300-char [tool_result] preview dispatchToolCall already
+// logs for every tool.
+func TestDispatchToolCallWebSearchLogsSummary(t *testing.T) {
+	dir := t.TempDir()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/search", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("q")
+		resp := searxngResponse{Results: []searxngResult{
+			{Title: "Result A for " + q, URL: "https://a.example.com/" + q, Content: strings.Repeat("x", 500)},
+			{Title: "Result B for " + q, URL: "https://b.example.com/" + q, Content: strings.Repeat("y", 500)},
+		}}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := resolveSearchConfig(srv.URL, 0, 0, 0, 5, 0, false)
+
+	outFile, err := os.CreateTemp(dir, "log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+
+	argsJSON, _ := json.Marshal(map[string]interface{}{"queries": []string{"golang"}})
+	tc := toolCall{Function: toolCallFunction{Name: "web_search", Arguments: argsJSON}}
+	extra := func(name string, args map[string]interface{}) (string, error, bool) {
+		if name == "web_search" {
+			r, e := toolWebSearch(args, cfg)
+			return r, e, true
+		}
+		return "", nil, false
+	}
+
+	result := dispatchToolCall(tc, "", "", "", outFile, extra)
+	if strings.HasPrefix(result, "ERROR:") {
+		t.Fatalf("expected web_search to succeed, got: %s", result)
+	}
+
+	logged, err := os.ReadFile(outFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	logStr := string(logged)
+	if !strings.Contains(logStr, "[web_search_summary] 2 ผลลัพธ์ทั้งหมด จาก 1 คำค้น") {
+		t.Fatalf("expected a summary line with the total result count (2) and query count (1), got:\n%s", logStr)
+	}
+	if !strings.Contains(logStr, "Result A for golang") || !strings.Contains(logStr, "https://a.example.com/golang") {
+		t.Fatalf("expected the first result's title+link to appear in full, got:\n%s", logStr)
+	}
+	if !strings.Contains(logStr, "Result B for golang") || !strings.Contains(logStr, "https://b.example.com/golang") {
+		t.Fatalf("expected the second result's title+link to appear in full, got:\n%s", logStr)
+	}
+}

@@ -27,13 +27,20 @@
 // Beyond those six, several more tools are added conditionally, only when
 // the feature they belong to is actually configured for the session (see
 // "ola ask -h" for the exact conditions of each): run_command (a detected
-// build/test toolchain), web_search/web_fetch (network access), and
-// read_skill (see skills.go) - present whenever a skills directory was
-// configured via --skills-dir/OLA_SKILLS_DIR and at least one skill was
-// found in it, letting the model pull in task-specific best-practice
-// instructions (SKILL.md files, same shape Claude's own skill system
-// uses) on demand instead of everything being crammed into the base
-// system prompt up front.
+// build/test toolchain), web_search/web_fetch (network access), read_skill
+// (see skills.go) - present whenever a skills directory was configured via
+// --skills-dir/OLA_SKILLS_DIR and at least one skill was found in it,
+// letting the model pull in task-specific best-practice instructions
+// (SKILL.md files, same shape Claude's own skill system uses) on demand
+// instead of everything being crammed into the base system prompt up
+// front - and scp_copy (see scp.go), present whenever at least one remote
+// host was configured via --scp-hosts/OLA_SCP_HOSTS. scp_copy moves a
+// single file to/from a pre-approved remote host over SSH (via the system
+// scp binary); the model can only pick a "remote_alias" from that
+// operator-configured list - it never supplies a user/host/port/remote
+// path itself - and both the local and remote sides are sandboxed to the
+// directories configured for them, the same way read_file/write_file are
+// sandboxed to the current directory.
 //
 // "coding" (see coding.go) is a longer-running, requirements-file-driven
 // loop meant to run unattended: instead of a prompt, it reads a
@@ -80,6 +87,9 @@
 //	OLA_SKILLS_DIR          Comma-separated skill directories (override with --skills-dir);
 //	                        each subdirectory containing a SKILL.md becomes an available
 //	                        skill via the read_skill tool. Opt-in (default: unset/disabled).
+//	OLA_SCP_HOSTS           Comma-separated "alias=user@host[:port]=/remote/root" entries
+//	                        (override with --scp-hosts); enables the scp_copy tool, opt-in
+//	                        (default: unset/disabled). See scp.go.
 package main
 
 import (
@@ -158,10 +168,11 @@ the normal case and only reach for it when it actually applies.
   entirely - there is nothing to run, and you should not claim otherwise.
   When it is present, only allowlisted binaries relevant to this project's
   toolchain may run; arbitrary shell commands are rejected.
-- web_search(queries, max_results?): ONLY present when ola has a local
-  SearXNG search backend configured for this session (opt-in). Accepts a
-  list, not just one item - if you need to search several things, put them
-  all in a single call; independent queries run in parallel automatically.
+- web_search(queries, max_results?): ONLY present when ola has a web
+  search backend configured for this session (opt-in) - either Ollama's
+  hosted Web Search API or a local SearXNG instance. Accepts a list, not
+  just one item - if you need to search several things, put them all in a
+  single call; independent queries run in parallel automatically.
 - web_fetch(urls): present in every session by default (no configuration
   needed) unless this session was explicitly started with --no-web-search.
   Accepts a list of URLs, run in parallel automatically. It always does a
@@ -602,7 +613,7 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("เรียก Ollama ผ่าน HTTP API (/api/chat) พร้อม streaming + thinking + timing")
 		fmt.Println("และ built-in tool calling ที่เปิดใช้งานเสมอ (ไม่มี flag ปิด/เปิด):")
 		fmt.Println("  read_file, search_files, write_file, edit_file, ask_user, get_current_time")
-		fmt.Println("  รวมถึง web_fetch (เปิดอัตโนมัติเสมอ) และ run_command / web_search แบบมีเงื่อนไข (ดูหัวข้อ Verify และ Web search ด้านล่าง)")
+		fmt.Println("  รวมถึง web_fetch (เปิดอัตโนมัติเสมอ) และ run_command / web_search / scp_copy แบบมีเงื่อนไข (ดูหัวข้อ Verify, Web search, scp_copy ด้านล่าง)")
 		fmt.Println()
 		fmt.Println("ทุก path ที่ tool ใช้อ้างอิงจาก current directory ที่รัน ola อยู่เสมอ")
 		fmt.Println("(ไม่มี --workdir ให้ตั้งค่า) และไม่สามารถหลุดออกไปนอก directory นี้ได้")
@@ -620,9 +631,12 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  เว้นแต่ระบุ --build-cmd/--test-cmd เอง ซึ่งถือว่าตั้งใจ override แล้ว")
 		fmt.Println()
 		fmt.Println("Web search / fetch:")
-		fmt.Println("  web_search ปิดโดย default จนกว่าจะตั้งค่า: ตั้ง OLA_SEARXNG_API_BASE (หรือ --searxng-url)")
-		fmt.Println("  เพื่อเปิด tool 'web_search' - เรียก local SearXNG instance ผ่าน JSON API (ต้องเปิด")
-		fmt.Println("  'formats: json' ใน settings.yml ของ SearXNG เองก่อน)")
+		fmt.Println("  web_search ปิดโดย default จนกว่าจะตั้งค่าหนึ่งในสอง backend ต่อไปนี้ (ถ้าตั้งทั้งคู่ SearXNG จะถูกใช้ก่อน):")
+		fmt.Println("    1. OLA_OLLAMA_SEARCH_API_KEY หรือ OLLAMA_API_KEY (หรือ --ollama-search-key) - เรียก")
+		fmt.Println("       Ollama's hosted Web Search API (https://ollama.com/api/web_search) ไม่ต้องรัน")
+		fmt.Println("       service เพิ่มเอง แค่มี API key จากบัญชี Ollama (ollama.com/settings/keys)")
+		fmt.Println("    2. OLA_SEARXNG_API_BASE (หรือ --searxng-url) - เรียก local SearXNG instance ผ่าน")
+		fmt.Println("       JSON API (ต้องเปิด 'formats: json' ใน settings.yml ของ SearXNG เองก่อน)")
 		fmt.Println("  web_fetch เปิดอัตโนมัติเสมอ ไม่ต้องตั้งค่าอะไรเลย - ola fetch ด้วย HTTP GET ธรรมดา")
 		fmt.Println("  (plain net/http ในตัวเอง ไม่มี Playwright/เบราว์เซอร์/service เสริมใดๆ) แล้วตัด HTML")
 		fmt.Println("  เหลือแต่ข้อความส่งกลับ ไม่รัน JavaScript ไม่ว่ากรณีใด หน้าที่ render ด้วย JS ล้วนๆ (เช่น")
@@ -646,6 +660,24 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  directory เป็นชื่อ skill และบรรทัดข้อความแรกในไฟล์เป็นคำอธิบาย")
 		fmt.Println("  ถ้าไม่ระบุ --skills-dir/OLA_SKILLS_DIR เลย จะไม่มี tool 'read_skill' และไม่มีผลกระทบใดๆ ต่อ session")
 		fmt.Println()
+		fmt.Println("scp_copy - คัดลอกไฟล์ระหว่างเครื่องนี้กับ remote host ผ่าน SSH (เปิดเมื่อระบุ --scp-hosts หรือ OLA_SCP_HOSTS เท่านั้น):")
+		fmt.Println("  ใช้ scp binary ของระบบเรียกตรงผ่าน argv (ไม่ผ่าน sh -c) ไม่มี tool call ไหนที่ยอมให้โมเดลระบุ")
+		fmt.Println("  user/host/port/remote-root เองได้เลย - ต้องตั้งค่าไว้ล่วงหน้าเท่านั้นผ่าน OLA_SCP_HOSTS โดยโมเดล")
+		fmt.Println("  เลือกได้แค่ \"remote_alias\" จากรายชื่อที่ตั้งไว้ (เหมือนหลักการ allowlist ของ run_command - เดา/พิมพ์")
+		fmt.Println("  host เองไม่ได้) รูปแบบ: \"alias=user@host[:port]=/remote/root\" คั่นหลาย host ด้วย comma เช่น")
+		fmt.Println("    OLA_SCP_HOSTS=\"backup=moo@10.0.0.5:22=/srv/backup,nas=moo@nas.local=/mnt/data\"")
+		fmt.Println("  ทั้งฝั่ง local (--scp-local-dir, default: current directory) และฝั่ง remote (root ต่อ alias ด้านบน)")
+		fmt.Println("  ถูก sandbox แบบเดียวกับ read_file/write_file - path ที่จะออกนอกขอบเขตที่กำหนดไว้จะถูกปฏิเสธเสมอ")
+		fmt.Println("  Auth: ใช้ SSH key ที่ config ไว้แล้วในเครื่องเท่านั้น (ssh-agent/~/.ssh/config หรือ --scp-key/OLA_SCP_KEY")
+		fmt.Println("  ระบุ identity file เพิ่มเติมได้) ไม่รองรับ/ไม่รับ password ใดๆ ทั้งสิ้น รันด้วย BatchMode=yes +")
+		fmt.Println("  StrictHostKeyChecking=yes เสมอ (ไม่ prompt ไม่ bypass host-key verification)")
+		fmt.Println("  ไม่มีการถาม ask_user ก่อนรัน - เรียกแล้วทำทันที (เหมือน write_file/edit_file) ความปลอดภัยอยู่ที่")
+		fmt.Println("  ขอบเขตที่อนุญาต (allowlist/sandbox ด้านบน) ไม่ใช่การขอ confirm ทุกครั้ง")
+		fmt.Println("  จำกัดขนาดไฟล์ต่อครั้งด้วย --scp-max-bytes/OLA_SCP_MAX_BYTES (default: 100MB) และ timeout ด้วย")
+		fmt.Println("  --scp-timeout/OLA_SCP_TIMEOUT_SEC (default: 120s) ทุกครั้งที่โอนไฟล์สำเร็จจะถูกบันทึกเข้า")
+		fmt.Println("  session change log และส่ง ntfy.sh notification ทันที (ถ้าตั้ง -x/OLA_TOPIC ไว้) เหมือน write_file/edit_file")
+		fmt.Println("  ถ้าไม่ระบุ --scp-hosts/OLA_SCP_HOSTS เลย จะไม่มี tool 'scp_copy' และไม่มีผลกระทบใดๆ ต่อ session")
+		fmt.Println()
 		fmt.Println("System prompt เป็นค่า built-in ตายตัวในไบนารี ไม่มี flag สำหรับเปลี่ยนจากภายนอกอีกต่อไป (ยกเว้นหัวข้อ")
 		fmt.Println("AVAILABLE SKILLS ด้านบน ซึ่งเป็นการ \"เติมต่อ\" ไม่ใช่การ override - เปิดก็ต่อเมื่อตั้งค่า skills เท่านั้น)")
 		fmt.Println()
@@ -659,7 +691,11 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  OLA_OLLAMA_CONTEXT_SIZE   num_ctx เริ่มต้น (override ด้วย -c, default: 16384)")
 		fmt.Println("  OLA_OUTPUT_FILE           ไฟล์ output เริ่มต้น (override ด้วย -o, default: output.txt)")
 		fmt.Println("  OLA_TOPIC                 topic สำหรับส่ง notification ไป ntfy.sh (override ด้วย -x)")
+		fmt.Println("  OLA_OLLAMA_SEARCH_API_KEY API key ของ Ollama Web Search API (override ด้วย --ollama-search-key)")
+		fmt.Println("                            เปิด web_search - fallback ไปอ่าน $OLLAMA_API_KEY มาตรฐานถ้าไม่ได้ตั้งตัวนี้")
+		fmt.Println("  OLA_OLLAMA_SEARCH_API_BASE  Base URL ของ Ollama Web Search API (default: https://ollama.com)")
 		fmt.Println("  OLA_SEARXNG_API_BASE      Host ของ SearXNG instance (override ด้วย --searxng-url) เปิด web_search")
+		fmt.Println("                            (ถ้าตั้งคู่กับ Ollama key ด้านบน SearXNG จะถูกใช้ก่อนเสมอ)")
 		fmt.Println("                            (web_fetch ไม่ต้องตั้งค่าใดๆ - เปิดอัตโนมัติเสมอ ดูหัวข้อ Web search ด้านบน)")
 		fmt.Println("  OLA_SEARCH_MAX_RESULTS    ผลลัพธ์สูงสุดต่อคำค้น (default: 5)")
 		fmt.Println("  OLA_SEARCH_CONCURRENCY    จำนวนคำค้นที่ยิงพร้อมกันสูงสุด (default: 3)")
@@ -668,6 +704,13 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  OLA_FETCH_TIMEOUT_SEC     timeout ต่อ URL หนึ่งครั้ง วินาที (default: 30)")
 		fmt.Println("  OLA_SKILLS_DIR            Directory (หรือหลาย directory คั่นด้วย comma) ที่เก็บ skill ต่างๆ")
 		fmt.Println("                            (override ด้วย --skills-dir) เปิด tool 'read_skill' - ดูหัวข้อ Skills ด้านบน")
+		fmt.Println("  OLA_SCP_HOSTS             รายชื่อ remote host ที่อนุญาตให้ scp_copy ใช้ได้ (override ด้วย --scp-hosts)")
+		fmt.Println("                            รูปแบบ \"alias=user@host[:port]=/remote/root\" คั่นหลายตัวด้วย comma")
+		fmt.Println("                            เปิด tool 'scp_copy' - ดูหัวข้อ scp_copy ด้านบน")
+		fmt.Println("  OLA_SCP_LOCAL_DIR         Local sandbox root ของ scp_copy (override ด้วย --scp-local-dir, default: current directory)")
+		fmt.Println("  OLA_SCP_KEY               SSH identity file (-i) สำหรับ scp_copy (override ด้วย --scp-key, default: ใช้ ssh-agent/~/.ssh/config)")
+		fmt.Println("  OLA_SCP_TIMEOUT_SEC       timeout ต่อการโอนไฟล์หนึ่งครั้ง วินาที (override ด้วย --scp-timeout, default: 120)")
+		fmt.Println("  OLA_SCP_MAX_BYTES         ขนาดไฟล์สูงสุดต่อการโอนหนึ่งครั้ง bytes (override ด้วย --scp-max-bytes, default: 104857600 = 100MB)")
 		fmt.Println()
 		fmt.Println("Options: (ต้องระบุก่อน <prompt> เสมอ ทั้งหมดรองรับทั้งรูปแบบสั้น -x และยาว --xxx)")
 		fmt.Println("  -m, --model <n>      โมเดลที่ใช้ [จำเป็น ถ้าไม่ตั้ง $OLA_OLLAMA_MODEL]")
@@ -687,7 +730,8 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("      --test-cmd <s>   override คำสั่ง test ที่ auto-detect ได้")
 		fmt.Println("      --allow <list>   binary เพิ่มเติมที่อนุญาตให้ run_command เรียกได้ คั่นด้วย comma เช่น \"golangci-lint,staticcheck\"")
 		fmt.Println("      --cmd-timeout <sec>  timeout ต่อการเรียก run_command/verify หนึ่งครั้ง (default: 60)")
-		fmt.Println("      --searxng-url <u>    override OLA_SEARXNG_API_BASE (เปิด web_search)")
+		fmt.Println("      --ollama-search-key <k>  override OLA_OLLAMA_SEARCH_API_KEY/$OLLAMA_API_KEY (เปิด web_search)")
+		fmt.Println("      --searxng-url <u>    override OLA_SEARXNG_API_BASE (เปิด web_search - ชนะ Ollama key ถ้าตั้งทั้งคู่)")
 		fmt.Println("      --no-web-search      ปิดทั้ง web_search และ web_fetch (web_fetch เปิดอัตโนมัติเสมอ - นี่คือทางเดียวที่ปิดได้)")
 		fmt.Println("      --search-max-results <n>  override OLA_SEARCH_MAX_RESULTS")
 		fmt.Println("      --search-concurrency <n>  override OLA_SEARCH_CONCURRENCY")
@@ -696,6 +740,11 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("      --fetch-timeout <sec>     override OLA_FETCH_TIMEOUT_SEC")
 		fmt.Println("      --skills-dir <list>  override OLA_SKILLS_DIR - directory (หรือหลาย directory คั่นด้วย comma)")
 		fmt.Println("                       ที่เก็บ skill ต่างๆ เปิด tool 'read_skill' (ดูหัวข้อ Skills ด้านบน)")
+		fmt.Println("      --scp-hosts <list>   override OLA_SCP_HOSTS - เปิด tool 'scp_copy' (ดูหัวข้อ scp_copy ด้านบน)")
+		fmt.Println("      --scp-local-dir <d>  override OLA_SCP_LOCAL_DIR")
+		fmt.Println("      --scp-key <path>     override OLA_SCP_KEY (SSH identity file)")
+		fmt.Println("      --scp-timeout <sec>  override OLA_SCP_TIMEOUT_SEC")
+		fmt.Println("      --scp-max-bytes <n>  override OLA_SCP_MAX_BYTES")
 		fmt.Println("  -h, --help           แสดงข้อความนี้")
 		fmt.Println()
 		fmt.Println("ไฟล์แนบ ([files...]):")
@@ -736,6 +785,7 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  export OLA_TOPIC=mytopic")
 		fmt.Println("  ola ask 'deploy to production'  # ใช้ค่า OLA_TOPIC จาก environment")
 		fmt.Println("  ola ask --skills-dir /mnt/skills/public,/mnt/skills/private 'สร้างสไลด์สรุปบทที่ 5'")
+		fmt.Println("  ola ask --scp-hosts 'backup=moo@10.0.0.5=/srv/backup' 'สำรอง report.txt ไปที่ backup หน่อย'")
 	}
 }
 
@@ -749,9 +799,13 @@ func cmdAsk(args []string) int {
 	var buildCmd, testCmd, allowList string
 	var cmdTimeoutSec int
 	var searxngURL string
+	var ollamaSearchKey string
 	var flagNoWebSearch bool
 	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
 	var skillsDir string
+	var scpHosts, scpLocalDir, scpKey string
+	var scpTimeoutSec int
+	var scpMaxBytes int64
 
 	fs.StringVar(&model, "m", "", "")
 	fs.StringVar(&model, "model", "", "")
@@ -780,6 +834,7 @@ func cmdAsk(args []string) int {
 	fs.StringVar(&promptFile, "f", "", "")
 	fs.StringVar(&promptFile, "prompt-file", "", "")
 	fs.StringVar(&searxngURL, "searxng-url", "", "")
+	fs.StringVar(&ollamaSearchKey, "ollama-search-key", "", "")
 	fs.BoolVar(&flagNoWebSearch, "no-web-search", false, "")
 	fs.IntVar(&searchMaxResults, "search-max-results", 0, "")
 	fs.IntVar(&searchConcurrency, "search-concurrency", 0, "")
@@ -787,6 +842,11 @@ func cmdAsk(args []string) int {
 	fs.IntVar(&searchTimeoutSec, "search-timeout", 0, "")
 	fs.IntVar(&fetchTimeoutSec, "fetch-timeout", 0, "")
 	fs.StringVar(&skillsDir, "skills-dir", "", "")
+	fs.StringVar(&scpHosts, "scp-hosts", "", "")
+	fs.StringVar(&scpLocalDir, "scp-local-dir", "", "")
+	fs.StringVar(&scpKey, "scp-key", "", "")
+	fs.IntVar(&scpTimeoutSec, "scp-timeout", 0, "")
+	fs.Int64Var(&scpMaxBytes, "scp-max-bytes", 0, "")
 	fs.BoolVar(&flagHelp, "h", false, "")
 	fs.BoolVar(&flagHelp, "help", false, "")
 
@@ -1029,6 +1089,9 @@ func cmdAsk(args []string) int {
 	// single zero-config direct-HTTP mode that's on by default - so it's
 	// always added unless --no-web-search turned everything off.
 	searchCfg := resolveSearchConfig(searxngURL, searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec, flagNoWebSearch)
+	if !flagNoWebSearch {
+		searchCfg.OllamaAPIKey, searchCfg.OllamaBase = resolveOllamaSearchConfig(ollamaSearchKey)
+	}
 
 	// Skills stay opt-in, same principle as web_search: loadSkills is a
 	// no-op (empty config, nothing added to the tool list or prompt) unless
@@ -1037,6 +1100,17 @@ func cmdAsk(args []string) int {
 	// the session still runs, just without the affected skill(s).
 	skillsCfg := loadSkills(resolveSkillsDirs(skillsDir))
 	for _, w := range skillsCfg.Warnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
+
+	// scp_copy stays opt-in, same principle as web_search/skills: unless
+	// OLA_SCP_HOSTS/--scp-hosts is actually configured, resolveSCPConfig
+	// returns an empty (disabled) config, nothing is added to the tool
+	// list, and this feature has zero effect on the session. A bad
+	// individual host entry is a warning (that alias is skipped), not
+	// fatal - same shape as skills' own warning handling above.
+	scpCfg, scpWarnings := resolveSCPConfig(scpHosts, scpLocalDir, scpKey, scpTimeoutSec, scpMaxBytes)
+	for _, w := range scpWarnings {
 		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
 	}
 
@@ -1054,6 +1128,9 @@ func cmdAsk(args []string) int {
 	}
 	if searchCfg.fetchEnabled() {
 		tools = append(tools, webFetchTool)
+	}
+	if scpCfg.enabled() {
+		tools = append(tools, scpCopyTool)
 	}
 	if skillsCfg.enabled() {
 		tools = append(tools, readSkillTool)
@@ -1115,10 +1192,10 @@ func cmdAsk(args []string) int {
 			fmt.Println("── Verify: disabled (no known build/test toolchain detected) ──")
 		}
 		if searchCfg.searchEnabled() {
-			fmt.Printf("── web_search: enabled (SearXNG: %s, max-results %d, concurrency %d) ──\n",
-				searchCfg.SearXNGBase, searchCfg.MaxResults, searchCfg.SearchConcurrency)
+			fmt.Printf("── web_search: enabled (backend: %s, max-results %d, concurrency %d) ──\n",
+				searchCfg.searchBackendLabel(), searchCfg.MaxResults, searchCfg.SearchConcurrency)
 		} else {
-			fmt.Println("── web_search: disabled (OLA_SEARXNG_API_BASE/--searxng-url not set, or --no-web-search) ──")
+			fmt.Println("── web_search: disabled (set OLA_OLLAMA_SEARCH_API_KEY/--ollama-search-key or OLA_SEARXNG_API_BASE/--searxng-url, or --no-web-search was set) ──")
 		}
 		if searchCfg.fetchEnabled() {
 			fmt.Printf("── web_fetch: enabled (direct mode - plain HTTP, no external service, no JavaScript; concurrency %d) ──\n", searchCfg.FetchConcurrency)
@@ -1175,8 +1252,8 @@ func cmdAsk(args []string) int {
 		fmt.Fprintf(outFile, "# load_time: %s\n", lt)
 	}
 	if searchCfg.searchEnabled() {
-		fmt.Fprintf(outFile, "# web_search: enabled (SearXNG: %s, max-results %d, concurrency %d)\n",
-			searchCfg.SearXNGBase, searchCfg.MaxResults, searchCfg.SearchConcurrency)
+		fmt.Fprintf(outFile, "# web_search: enabled (backend: %s, max-results %d, concurrency %d)\n",
+			searchCfg.searchBackendLabel(), searchCfg.MaxResults, searchCfg.SearchConcurrency)
 	} else {
 		fmt.Fprintln(outFile, "# web_search: disabled")
 	}
@@ -1194,6 +1271,12 @@ func cmdAsk(args []string) int {
 			len(skillsCfg.Skills), strings.Join(skillsCfg.Dirs, ","), strings.Join(names, ", "))
 	} else {
 		fmt.Fprintln(outFile, "# skills: disabled")
+	}
+	if scpCfg.enabled() {
+		fmt.Fprintf(outFile, "# scp_copy: enabled (hosts: %s, local-root: %s, timeout: %s, max-bytes: %d)\n",
+			scpCfg.aliasList(), scpCfg.LocalRoot, scpCfg.Timeout, scpCfg.MaxBytes)
+	} else {
+		fmt.Fprintln(outFile, "# scp_copy: disabled")
 	}
 	if flagNoThink {
 		fmt.Fprintln(outFile, "# thinking: disabled")
@@ -1228,13 +1311,21 @@ func cmdAsk(args []string) int {
 	// could use them too. Tool calls print in red so they're visually
 	// distinct from thinking (cyan) and the final answer (bold/default).
 
-	// extraTools handles run_command, web_search, and web_fetch - each only
-	// when actually enabled/advertised - and dispatchToolCall falls back to
-	// it for any tool name it doesn't recognize among the base five. A tool
-	// name reaching here that isn't actually enabled means it was never
-	// advertised to the model in the first place (see the tools slice
-	// above), so it falls through to "unknown tool" instead of silently
-	// running something the user opted out of.
+	// sessionChanges is declared here (rather than down by sessionStart/
+	// iteration below, where the rest of the per-session loop state lives)
+	// specifically so extraTools' scp_copy case can capture it and record a
+	// successful transfer directly - the same way dispatchToolCall's own
+	// write_file/edit_file cases call recordChange inline, rather than
+	// leaving it to a caller to notice afterwards which tool just ran.
+	var sessionChanges []string // recorded write_file/edit_file/scp_copy entries this session, for buildWorkSummary
+
+	// extraTools handles run_command, web_search, web_fetch, and scp_copy -
+	// each only when actually enabled/advertised - and dispatchToolCall
+	// falls back to it for any tool name it doesn't recognize among the
+	// base five. A tool name reaching here that isn't actually enabled
+	// means it was never advertised to the model in the first place (see
+	// the tools slice above), so it falls through to "unknown tool" instead
+	// of silently running something the user opted out of.
 	extraTools := func(name string, args map[string]interface{}) (string, error, bool) {
 		switch name {
 		case "run_command":
@@ -1261,6 +1352,24 @@ func cmdAsk(args []string) int {
 			}
 			r, e := toolReadSkill(args, skillsCfg.Skills)
 			return r, e, true
+		case "scp_copy":
+			if !scpCfg.enabled() {
+				return "", nil, false
+			}
+			r, e := toolSCPCopy(args, scpCfg)
+			if e == nil {
+				direction, _ := args["direction"].(string)
+				alias, _ := args["remote_alias"].(string)
+				localPath, _ := args["local_path"].(string)
+				remotePath, _ := args["remote_path"].(string)
+				reason, _ := args["reason"].(string)
+				note := formatSCPNotification(direction, alias, localPath, remotePath, reason)
+				recordChange([]*[]string{&sessionChanges}, note)
+				if ntfyTopic != "" {
+					sendNotification(ntfyTopic, note)
+				}
+			}
+			return r, e, true
 		default:
 			return "", nil, false
 		}
@@ -1272,8 +1381,7 @@ func cmdAsk(args []string) int {
 	iteration := 0
 	filesChanged := false // true once write_file/edit_file has succeeded at least once this session
 	verifyRounds := 0
-	var lastAnswer string       // most recent assistant content, used as the "work finished" notification summary
-	var sessionChanges []string // recorded write_file/edit_file entries this session, for buildWorkSummary
+	var lastAnswer string // most recent assistant content, used as the "work finished" notification summary
 
 	for {
 		iteration++
@@ -1912,6 +2020,18 @@ func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.Fil
 	}
 	fmt.Fprintf(outFile, "[tool_result] %s\n", result)
 
+	// web_search gets an extra, un-truncated summary beyond the generic
+	// 300-char preview above: how many results were found in total, and
+	// every single one's title+link - grouped by query. This reads the
+	// structured items toolWebSearch just stashed via setLastWebSearchItems
+	// rather than re-parsing the (content-truncated) string above, so the
+	// list shown here is never mangled by that truncation.
+	if tc.Function.Name == "web_search" && err == nil {
+		if queryItems := popLastWebSearchItems(); len(queryItems) > 0 {
+			printWebSearchSummary(queryItems, red, reset, outFile)
+		}
+	}
+
 	// Surface how long this call spent loading data - local files
 	// (read_file/search_files) or external network data (web_search/
 	// web_fetch) - so a slow session can be told apart as "waiting on the
@@ -1924,6 +2044,38 @@ func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.Fil
 		fmt.Fprintf(outFile, "[tool_load_time] %s (%s): %s\n", tc.Function.Name, loadLabel, loadStr)
 	}
 	return result
+}
+
+// printWebSearchSummary prints, right after a successful web_search call,
+// a clean count of how many results were found plus every result's
+// title+link, grouped by query - both to the terminal and to the -o log
+// file. This is intentionally separate from (and un-truncated compared to)
+// dispatchToolCall's generic 300-char result preview: that preview shows a
+// snippet of the model-facing, per-item-content-truncated string, which is
+// the wrong shape for "how many sites did it find, and which ones" at a
+// glance.
+func printWebSearchSummary(queryItems []webSearchQueryItems, red, reset string, outFile *os.File) {
+	total := 0
+	for _, q := range queryItems {
+		total += len(q.Items)
+	}
+	fmt.Printf("%s   🔎 พบผลลัพธ์ทั้งหมด %d รายการ จาก %d คำค้น%s\n", red, total, len(queryItems), reset)
+	fmt.Fprintf(outFile, "[web_search_summary] %d ผลลัพธ์ทั้งหมด จาก %d คำค้น\n", total, len(queryItems))
+
+	for _, q := range queryItems {
+		if q.Err != nil {
+			fmt.Printf("%s      ✗ [%s] ERROR: %v%s\n", red, q.Query, q.Err, reset)
+			fmt.Fprintf(outFile, "  [%s] ERROR: %v\n", q.Query, q.Err)
+			continue
+		}
+		fmt.Printf("%s      [%s] %d ผลลัพธ์%s\n", red, q.Query, len(q.Items), reset)
+		fmt.Fprintf(outFile, "  [%s] %d ผลลัพธ์\n", q.Query, len(q.Items))
+		for i, it := range q.Items {
+			fmt.Printf("%s        %d. %s%s\n", red, i+1, it.Title, reset)
+			fmt.Printf("%s           %s%s\n", red, it.URL, reset)
+			fmt.Fprintf(outFile, "    %d. %s\n       %s\n", i+1, it.Title, it.URL)
+		}
+	}
 }
 
 // toolLoadTimingLabel classifies a tool name for the "how long did loading
@@ -1940,6 +2092,8 @@ func toolLoadTimingLabel(name string) (icon, label string) {
 		return "📖", "โหลด skill (local)"
 	case "web_search", "web_fetch":
 		return "🌐", "โหลดข้อมูลภายนอก (network)"
+	case "scp_copy":
+		return "🌐", "โอนไฟล์ (scp/network)"
 	default:
 		return "", ""
 	}

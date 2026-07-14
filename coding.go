@@ -1002,7 +1002,8 @@ func codingUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  --max-iterations <n>    เพดานจำนวนรอบของ tool-calling loop (default: 300)")
 		fmt.Println("  --max-duration <dur>    เพดานเวลารวมของ session เช่น \"2h\", \"45m\" (default: 3h)")
 		fmt.Println("  --cmd-timeout <sec>     timeout ต่อการเรียก run_command/verify หนึ่งครั้ง (default: 120)")
-		fmt.Println("  --searxng-url <u>       override OLA_SEARXNG_API_BASE (เปิด web_search)")
+		fmt.Println("  --ollama-search-key <k> override OLA_OLLAMA_SEARCH_API_KEY/$OLLAMA_API_KEY (เปิด web_search)")
+		fmt.Println("  --searxng-url <u>       override OLA_SEARXNG_API_BASE (เปิด web_search - ชนะ Ollama key ถ้าตั้งทั้งคู่)")
 		fmt.Println("  --no-web-search         ปิดทั้ง web_search และ web_fetch (web_fetch เปิดอัตโนมัติเสมอ - นี่คือทางเดียวที่ปิดได้)")
 		fmt.Println("  --search-max-results <n>   override OLA_SEARCH_MAX_RESULTS")
 		fmt.Println("  --search-concurrency <n>   override OLA_SEARCH_CONCURRENCY")
@@ -1035,6 +1036,7 @@ func cmdCoding(args []string) int {
 	var flagKey, flagNoThink, flagDryRun, flagHelp, flagReplan bool
 	var maxIterations, cmdTimeoutSec int
 	var searxngURL string
+	var ollamaSearchKey string
 	var flagNoWebSearch bool
 	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
 	var skillsDir string
@@ -1063,6 +1065,7 @@ func cmdCoding(args []string) int {
 	fs.StringVar(&maxDurStr, "max-duration", defaultMaxCodingDuration.String(), "")
 	fs.IntVar(&cmdTimeoutSec, "cmd-timeout", defaultCmdTimeoutSec, "")
 	fs.StringVar(&searxngURL, "searxng-url", "", "")
+	fs.StringVar(&ollamaSearchKey, "ollama-search-key", "", "")
 	fs.BoolVar(&flagNoWebSearch, "no-web-search", false, "")
 	fs.IntVar(&searchMaxResults, "search-max-results", 0, "")
 	fs.IntVar(&searchConcurrency, "search-concurrency", 0, "")
@@ -1178,6 +1181,9 @@ func cmdCoding(args []string) int {
 	}
 
 	searchCfg := resolveSearchConfig(searxngURL, searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec, flagNoWebSearch)
+	if !flagNoWebSearch {
+		searchCfg.OllamaAPIKey, searchCfg.OllamaBase = resolveOllamaSearchConfig(ollamaSearchKey)
+	}
 
 	// Skills stay opt-in, same principle as web_search - see the longer
 	// explanation in cmdAsk (main.go) and the skills.go package doc
@@ -1261,10 +1267,10 @@ func cmdCoding(args []string) int {
 			fmt.Printf("── Load time - %s ──\n", lt)
 		}
 		if searchCfg.searchEnabled() {
-			fmt.Printf("── web_search: enabled (SearXNG: %s, max-results %d, concurrency %d) ──\n",
-				searchCfg.SearXNGBase, searchCfg.MaxResults, searchCfg.SearchConcurrency)
+			fmt.Printf("── web_search: enabled (backend: %s, max-results %d, concurrency %d) ──\n",
+				searchCfg.searchBackendLabel(), searchCfg.MaxResults, searchCfg.SearchConcurrency)
 		} else {
-			fmt.Println("── web_search: disabled (OLA_SEARXNG_API_BASE/--searxng-url not set, or --no-web-search) ──")
+			fmt.Println("── web_search: disabled (set OLA_OLLAMA_SEARCH_API_KEY/--ollama-search-key or OLA_SEARXNG_API_BASE/--searxng-url, or --no-web-search was set) ──")
 		}
 		if searchCfg.fetchEnabled() {
 			fmt.Printf("── web_fetch: enabled (direct mode - plain HTTP, no external service, no JavaScript; concurrency %d) ──\n", searchCfg.FetchConcurrency)
@@ -1307,8 +1313,8 @@ func cmdCoding(args []string) int {
 		fmt.Fprintf(outFile, "# load_time: %s\n", lt)
 	}
 	if searchCfg.searchEnabled() {
-		fmt.Fprintf(outFile, "# web_search: enabled (SearXNG: %s, max-results %d, concurrency %d)\n",
-			searchCfg.SearXNGBase, searchCfg.MaxResults, searchCfg.SearchConcurrency)
+		fmt.Fprintf(outFile, "# web_search: enabled (backend: %s, max-results %d, concurrency %d)\n",
+			searchCfg.searchBackendLabel(), searchCfg.MaxResults, searchCfg.SearchConcurrency)
 	} else {
 		fmt.Fprintln(outFile, "# web_search: disabled")
 	}

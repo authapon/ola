@@ -1,7 +1,20 @@
 // search.go - optional web_search / web_fetch tools backed by:
 //
-//   - a local SearXNG instance for web_search (its native JSON API), which
-//     stays opt-in: set OLA_SEARXNG_API_BASE / --searxng-url to enable it.
+//   - web_search has TWO interchangeable backends, either of which is
+//     enough to turn the tool on - no self-hosted service is required
+//     anymore:
+//
+//     1. Ollama's own hosted Web Search API (https://ollama.com/api/web_search) -
+//     just an API key, set via OLA_OLLAMA_SEARCH_API_KEY/OLLAMA_API_KEY
+//     or --ollama-search-key. No container, no separate service to run
+//     or maintain - this is the recommended default for anyone who
+//     doesn't already run a SearXNG instance.
+//     2. a local SearXNG instance (its native JSON API) for anyone who
+//     already self-hosts one and prefers that: set
+//     OLA_SEARXNG_API_BASE / --searxng-url to enable it.
+//
+//     If both are configured, SearXNG wins (preserves prior behavior for
+//     existing self-hosted setups) - see searchConfig.searchBackendLabel.
 //
 //   - a single, dependency-free "direct" mode for web_fetch: plain
 //     http.Get + HTML-to-text extraction, done entirely within ola itself.
@@ -13,10 +26,10 @@
 //     will come back as an explicit "no text found" error rather than
 //     silently returning nothing useful.
 //
-// Design note: ola talks to SearXNG and to fetch targets over plain
-// net/http only - no embedded browser, no external scrape service, no
-// Node.js driver process. ola remains a single native Go binary with no
-// runtime dependency beyond an HTTP client.
+// Design note: ola talks to SearXNG, to Ollama's Web Search API, and to
+// fetch targets over plain net/http only - no embedded browser, no
+// external scrape service, no Node.js driver process. ola remains a single
+// native Go binary with no runtime dependency beyond an HTTP client.
 //
 // Both web_search and web_fetch accept a *list* of queries/URLs and fan
 // them out concurrently (bounded by OLA_SEARCH_CONCURRENCY /
@@ -25,6 +38,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -76,11 +90,15 @@ const (
 // build/test toolchain was actually detected: a tool that can only ever
 // error out just confuses a local model into calling it anyway.
 //
-// web_search stays opt-in (SearXNGBase must be configured), but web_fetch
-// needs no external service, so FetchEnabled defaults to true and is only
-// ever false when the whole feature was explicitly disabled (--no-web-search).
+// web_search stays opt-in (either SearXNGBase or OllamaAPIKey must be
+// configured), but web_fetch needs no external service, so FetchEnabled
+// defaults to true and is only ever false when the whole feature was
+// explicitly disabled (--no-web-search).
 type searchConfig struct {
-	SearXNGBase       string
+	SearXNGBase  string
+	OllamaAPIKey string // Ollama Web Search API (https://ollama.com/api/web_search) - needs no self-hosted service, just an API key
+	OllamaBase   string // base URL for the Ollama Web Search API, default defaultOllamaSearchBase (overridable for testing/self-hosted mirrors)
+
 	FetchEnabled      bool // web_fetch (direct mode, plain HTTP): on by default
 	MaxResults        int
 	SearchConcurrency int
@@ -89,8 +107,25 @@ type searchConfig struct {
 	FetchTimeout      time.Duration
 }
 
-func (c searchConfig) searchEnabled() bool { return c.SearXNGBase != "" }
+func (c searchConfig) searchEnabled() bool { return c.SearXNGBase != "" || c.OllamaAPIKey != "" }
 func (c searchConfig) fetchEnabled() bool  { return c.FetchEnabled }
+
+// searchBackendLabel describes, for status lines (dry-run/-o log
+// header/help text) and error messages, which backend web_search will
+// actually use this session. When both SearXNG and an Ollama Web Search
+// API key are configured, SearXNG wins - this keeps prior behavior
+// unchanged for anyone who already had OLA_SEARXNG_API_BASE set before
+// this backend existed.
+func (c searchConfig) searchBackendLabel() string {
+	switch {
+	case c.SearXNGBase != "":
+		return fmt.Sprintf("SearXNG (%s)", c.SearXNGBase)
+	case c.OllamaAPIKey != "":
+		return fmt.Sprintf("Ollama Web Search API (%s)", c.OllamaBase)
+	default:
+		return "disabled"
+	}
+}
 
 // resolveSearchConfig applies flag > env > default precedence for
 // web_search's SearXNG backend and both tools' shared timeout/concurrency
@@ -132,6 +167,41 @@ func resolveSearchConfig(searxngURL string, maxResults, searchConcurrency, fetch
 	}
 }
 
+// defaultOllamaSearchBase is Ollama's hosted Web Search API host. Kept
+// overridable (OLA_OLLAMA_SEARCH_API_BASE) purely for testing against a
+// mock server - there is no supported self-hosted mirror of this endpoint.
+const defaultOllamaSearchBase = "https://ollama.com"
+
+// resolveOllamaSearchConfig applies flag > env > default precedence for the
+// Ollama Web Search API backend, kept as a separate small function (rather
+// than folded into resolveSearchConfig's existing 7-arg signature) so every
+// existing call site of resolveSearchConfig - main.go, coding.go, and the
+// whole existing search_test.go suite - keeps compiling untouched. Callers
+// apply this on top of resolveSearchConfig's result, e.g.:
+//
+//	cfg := resolveSearchConfig(searxngURL, ...)
+//	cfg.OllamaAPIKey, cfg.OllamaBase = resolveOllamaSearchConfig(ollamaSearchKeyFlag)
+//
+// The API key falls back to the plain OLLAMA_API_KEY env var (the name
+// Ollama's own CLI/Python/JS libraries already use) so a machine that's
+// already set up for `ollama.web_search`/the official examples needs no
+// ola-specific configuration at all - OLA_OLLAMA_SEARCH_API_KEY only exists
+// for the rare case of wanting a *different* key for ola specifically.
+func resolveOllamaSearchConfig(apiKeyFlag string) (apiKey, base string) {
+	apiKey = strings.TrimSpace(apiKeyFlag)
+	if apiKey == "" {
+		apiKey = strings.TrimSpace(os.Getenv("OLA_OLLAMA_SEARCH_API_KEY"))
+	}
+	if apiKey == "" {
+		apiKey = strings.TrimSpace(os.Getenv("OLLAMA_API_KEY"))
+	}
+	base = strings.TrimRight(os.Getenv("OLA_OLLAMA_SEARCH_API_BASE"), "/")
+	if base == "" {
+		base = defaultOllamaSearchBase
+	}
+	return apiKey, base
+}
+
 func envInt(key string, def int) int {
 	v := os.Getenv(key)
 	if v == "" {
@@ -152,7 +222,8 @@ var webSearchTool = ollamaTool{
 	Type: "function",
 	Function: ollamaToolFunction{
 		Name: "web_search",
-		Description: "ค้นหาเว็บผ่าน local SearXNG instance รองรับหลายคำค้นพร้อมกันในเรียกเดียว " +
+		Description: "ค้นหาเว็บ (ผ่าน Ollama Web Search API หรือ local SearXNG instance แล้วแต่ค่าที่ตั้งไว้สำหรับเซสชันนี้) " +
+			"รองรับหลายคำค้นพร้อมกันในเรียกเดียว " +
 			"(รันแบบขนานให้อัตโนมัติ ไม่ต้องเรียกทีละคำ) ผลลัพธ์แต่ละคำค้นจะถูก truncate ถ้ายาวเกินไป - " +
 			"เรียก tool นี้ทันทีเมื่อคำถามต้องการข้อมูลที่เปลี่ยนแปลงตามเวลาหรืออาจใหม่กว่าความรู้ที่โมเดลมี " +
 			"เช่น ข่าวล่าสุด, สถานการณ์/ราคาตลาด ณ ปัจจุบัน, เวอร์ชันล่าสุดของซอฟต์แวร์ - โดยไม่ต้องรอให้ผู้ใช้ " +
@@ -201,10 +272,93 @@ var webFetchTool = ollamaTool{
 }
 
 // ─────────────────────────────────────────────────────────────────
-// web_search: SearXNG's native JSON API (GET /search?q=...&format=json).
-// Requires "formats: [html, json]" enabled under search: in the instance's
-// settings.yml, or the request comes back 403.
+// web_search: two interchangeable backends behind one shared shape.
+//
+//   - SearXNG's native JSON API (GET /search?q=...&format=json). Requires
+//     "formats: [html, json]" enabled under search: in the instance's
+//     settings.yml, or the request comes back 403.
+//   - Ollama's hosted Web Search API (POST /api/web_search, Bearer auth).
+//     No self-hosted service required - see resolveOllamaSearchConfig.
+//
+// Both backends are normalized into []webSearchItem so the rest of this
+// file (formatting for the model, and dispatchToolCall's terminal summary
+// in main.go) doesn't need to know or care which one actually ran.
 // ─────────────────────────────────────────────────────────────────
+
+// webSearchItem is the backend-agnostic shape one search result is
+// normalized into, regardless of whether it came from SearXNG or Ollama's
+// Web Search API - both happen to return the same title/url/content
+// fields, just under different transports.
+type webSearchItem struct {
+	Title   string
+	URL     string
+	Content string
+}
+
+// webSearchQueryItems pairs one query with its structured results (or the
+// error that query hit). This exists purely so dispatchToolCall (main.go)
+// can print an honest "found N results, here's every title+link" summary
+// on the terminal without re-parsing toolWebSearch's already-formatted,
+// per-result-truncated, model-facing string - see lastWebSearchItems below.
+type webSearchQueryItems struct {
+	Query string
+	Items []webSearchItem
+	Err   error
+}
+
+// lastWebSearchItems is a small side-channel: toolWebSearch stashes the
+// structured results of the query batch it just ran here, and
+// dispatchToolCall (main.go) pops them right after the call returns to
+// print the terminal summary. This is deliberately NOT threaded through
+// toolWebSearch's return value / the extraTools(name, args) (string,
+// error, bool) callback shape, since that shape is shared across
+// run_command/web_search/web_fetch/read_skill and changing it would ripple
+// into every caller for the benefit of exactly one of the four tools.
+// Guarded by a mutex since toolWebSearch's per-query goroutines all
+// contribute to the same batch before it's published in one shot.
+var (
+	lastWebSearchMu    sync.Mutex
+	lastWebSearchItems []webSearchQueryItems
+)
+
+func setLastWebSearchItems(items []webSearchQueryItems) {
+	lastWebSearchMu.Lock()
+	lastWebSearchItems = items
+	lastWebSearchMu.Unlock()
+}
+
+// popLastWebSearchItems returns and clears the most recently completed
+// toolWebSearch call's structured results. Safe to call even when
+// web_search was never invoked this session (returns nil then).
+func popLastWebSearchItems() []webSearchQueryItems {
+	lastWebSearchMu.Lock()
+	defer lastWebSearchMu.Unlock()
+	items := lastWebSearchItems
+	lastWebSearchItems = nil
+	return items
+}
+
+// formatSearchResults renders normalized items into the same numbered
+// "title/url/truncated-content" block both backends used to build inline
+// before this refactor - kept byte-for-byte equivalent so the model-facing
+// contract (and every existing test asserting on that shape) is unchanged
+// regardless of which backend actually produced the items.
+func formatSearchResults(items []webSearchItem, maxResults int) string {
+	if len(items) == 0 {
+		return "(ไม่พบผลลัพธ์)"
+	}
+	if maxResults <= 0 {
+		maxResults = defaultSearchMaxResults
+	}
+	var b strings.Builder
+	for i, r := range items {
+		if i >= maxResults {
+			break
+		}
+		fmt.Fprintf(&b, "%d. %s\n   %s\n   %s\n\n", i+1, r.Title, r.URL, truncateText(r.Content, 300))
+	}
+	return truncateText(b.String(), maxWebResultOutput)
+}
 
 type searxngResult struct {
 	Title   string `json:"title"`
@@ -216,49 +370,97 @@ type searxngResponse struct {
 	Results []searxngResult `json:"results"`
 }
 
-func searchOne(client *http.Client, base, query string, maxResults int) (string, error) {
+func searchOne(client *http.Client, base, query string, maxResults int) ([]webSearchItem, error) {
 	u := base + "/search?q=" + url.QueryEscape(query) + "&format=json"
 	req, err := http.NewRequest(http.MethodGet, u, nil)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("เรียก SearXNG ไม่สำเร็จ: %w", err)
+		return nil, fmt.Errorf("เรียก SearXNG ไม่สำเร็จ: %w", err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20)) // 2MB safety cap
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("SearXNG ตอบ HTTP %d (ตรวจสอบว่าเปิด 'formats: json' ใน settings.yml แล้วหรือยัง): %s",
+		return nil, fmt.Errorf("SearXNG ตอบ HTTP %d (ตรวจสอบว่าเปิด 'formats: json' ใน settings.yml แล้วหรือยัง): %s",
 			resp.StatusCode, truncateText(string(body), 300))
 	}
 	var parsed searxngResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", fmt.Errorf("แปลง JSON จาก SearXNG ไม่ได้: %w", err)
+		return nil, fmt.Errorf("แปลง JSON จาก SearXNG ไม่ได้: %w", err)
 	}
-	if len(parsed.Results) == 0 {
-		return "(ไม่พบผลลัพธ์)", nil
-	}
-	if maxResults <= 0 {
-		maxResults = defaultSearchMaxResults
-	}
-	var b strings.Builder
+	items := make([]webSearchItem, len(parsed.Results))
 	for i, r := range parsed.Results {
-		if i >= maxResults {
-			break
-		}
-		fmt.Fprintf(&b, "%d. %s\n   %s\n   %s\n\n", i+1, r.Title, r.URL, truncateText(r.Content, 300))
+		items[i] = webSearchItem{Title: r.Title, URL: r.URL, Content: r.Content}
 	}
-	return truncateText(b.String(), maxWebResultOutput), nil
+	return items, nil
+}
+
+// ollamaSearchResult/ollamaSearchResponse mirror the JSON shape documented
+// at https://docs.ollama.com/capabilities/web-search:
+// {"results":[{"title":...,"url":...,"content":...}]} - notice this is the
+// same three fields as searxngResult, just reached over a different
+// transport (POST + Bearer auth vs. a plain GET).
+type ollamaSearchResult struct {
+	Title   string `json:"title"`
+	URL     string `json:"url"`
+	Content string `json:"content"`
+}
+
+type ollamaSearchResponse struct {
+	Results []ollamaSearchResult `json:"results"`
+}
+
+// searchOneOllama calls Ollama's hosted Web Search API for a single query.
+// The API itself has no max_results parameter (it returns a fixed set, up
+// to 10 by default per Ollama's docs) - trimming to the caller's requested
+// maxResults happens client-side in formatSearchResults, same as SearXNG.
+func searchOneOllama(client *http.Client, base, apiKey, query string, maxResults int) ([]webSearchItem, error) {
+	reqBody, err := json.Marshal(map[string]string{"query": query})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodPost, base+"/api/web_search", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("เรียก Ollama Web Search API ไม่สำเร็จ: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20)) // 2MB safety cap
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("Ollama Web Search API ปฏิเสธ API key (HTTP %d) - ตรวจสอบ OLA_OLLAMA_SEARCH_API_KEY/OLLAMA_API_KEY/--ollama-search-key: %s",
+			resp.StatusCode, truncateText(string(body), 200))
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Ollama Web Search API ตอบ HTTP %d: %s", resp.StatusCode, truncateText(string(body), 300))
+	}
+	var parsed ollamaSearchResponse
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("แปลง JSON จาก Ollama Web Search API ไม่ได้: %w", err)
+	}
+	items := make([]webSearchItem, len(parsed.Results))
+	for i, r := range parsed.Results {
+		items[i] = webSearchItem{Title: r.Title, URL: r.URL, Content: r.Content}
+	}
+	return items, nil
 }
 
 func toolWebSearch(args map[string]interface{}, cfg searchConfig) (string, error) {
 	if !cfg.searchEnabled() {
-		return "", fmt.Errorf("web_search ไม่ได้ถูกตั้งค่า (ต้องตั้ง OLA_SEARXNG_API_BASE หรือ --searxng-url)")
+		return "", fmt.Errorf("web_search ไม่ได้ถูกตั้งค่า (ต้องตั้ง OLA_OLLAMA_SEARCH_API_KEY/--ollama-search-key หรือ OLA_SEARXNG_API_BASE/--searxng-url)")
 	}
 	queries := stringsFromArg(args["queries"])
 	if len(queries) == 0 {
@@ -275,6 +477,7 @@ func toolWebSearch(args map[string]interface{}, cfg searchConfig) (string, error
 		concurrency = 1
 	}
 	results := make([]string, len(queries))
+	queryItems := make([]webSearchQueryItems, len(queries))
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	for i, q := range queries {
@@ -283,15 +486,28 @@ func toolWebSearch(args map[string]interface{}, cfg searchConfig) (string, error
 		go func(idx int, query string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			r, err := searchOne(client, cfg.SearXNGBase, query, maxResults)
+
+			// SearXNG wins when both are configured (see
+			// searchConfig.searchBackendLabel) - preserves prior behavior
+			// for anyone who already had OLA_SEARXNG_API_BASE set.
+			var items []webSearchItem
+			var err error
+			if cfg.SearXNGBase != "" {
+				items, err = searchOne(client, cfg.SearXNGBase, query, maxResults)
+			} else {
+				items, err = searchOneOllama(client, cfg.OllamaBase, cfg.OllamaAPIKey, query, maxResults)
+			}
+
+			queryItems[idx] = webSearchQueryItems{Query: query, Items: items, Err: err}
 			if err != nil {
 				results[idx] = fmt.Sprintf("=== query: %q ===\nERROR: %v", query, err)
 				return
 			}
-			results[idx] = fmt.Sprintf("=== query: %q ===\n%s", query, r)
+			results[idx] = fmt.Sprintf("=== query: %q ===\n%s", query, formatSearchResults(items, maxResults))
 		}(i, q)
 	}
 	wg.Wait()
+	setLastWebSearchItems(queryItems)
 	return strings.Join(results, "\n\n"), nil
 }
 
