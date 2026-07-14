@@ -15,6 +15,11 @@
 //     - mark_task_done  check off a task as it's completed
 //     - run_command     build/test/lint the project (allowlisted)
 //     - report_complete claim the work is done
+//     Same as "ask", read_skill (see skills.go) is also added whenever a
+//     skills directory is configured - useful here in particular since an
+//     unattended run has no human around to point it at task-specific
+//     best practices, so letting the model discover and pull them in
+//     itself matters more than in a supervised "ask" session.
 //  3. report_complete does NOT end the loop by itself. ola independently
 //     re-runs the project's build/test command (auto-detected from the
 //     repo, or overridden with --build-cmd/--test-cmd) and only accepts
@@ -285,8 +290,8 @@ var codingExtraTools = []ollamaTool{
 	},
 }
 
-func codingToolset(searchCfg searchConfig) []ollamaTool {
-	all := make([]ollamaTool, 0, len(builtinTools)+len(codingExtraTools)+2)
+func codingToolset(searchCfg searchConfig, skillsCfg skillsConfig) []ollamaTool {
+	all := make([]ollamaTool, 0, len(builtinTools)+len(codingExtraTools)+3)
 	all = append(all, builtinTools...)
 	all = append(all, codingExtraTools...)
 	if searchCfg.searchEnabled() {
@@ -294,6 +299,9 @@ func codingToolset(searchCfg searchConfig) []ollamaTool {
 	}
 	if searchCfg.fetchEnabled() {
 		all = append(all, webFetchTool)
+	}
+	if skillsCfg.enabled() {
+		all = append(all, readSkillTool)
 	}
 	return all
 }
@@ -836,6 +844,7 @@ type codingRunContext struct {
 	cmdTO     time.Duration
 	cmds      projectCommands // needed by mark_task_done's build-only light gate
 	searchCfg searchConfig    // web_search/web_fetch config, may be all-zero (disabled)
+	skillsCfg skillsConfig    // read_skill config, may be all-zero (disabled)
 	changes   []string        // recorded write/edit/task-done entries this session, for buildWorkSummary
 }
 
@@ -886,6 +895,12 @@ func dispatchCodingToolCall(tc toolCall, rc *codingRunContext) (result string, i
 			}
 			r, e := toolWebFetch(args, rc.searchCfg)
 			return r, e, true
+		case "read_skill":
+			if !rc.skillsCfg.enabled() {
+				return "", nil, false
+			}
+			r, e := toolReadSkill(args, rc.skillsCfg.Skills)
+			return r, e, true
 		default:
 			return "", nil, false
 		}
@@ -922,7 +937,8 @@ func codingUsage(fs *flag.FlagSet) func() {
 		fmt.Println()
 		fmt.Println("Tool ที่เปิดใช้เสมอ (นอกเหนือจาก 6 ตัวของ ask): add_tasks, mark_task_done,")
 		fmt.Println("run_command (allowlisted ตาม toolchain ที่ตรวจพบ), report_complete")
-		fmt.Println("รวมถึง web_fetch (เปิดอัตโนมัติเสมอ) และ web_search แบบมีเงื่อนไข (ดูหัวข้อ Web search ด้านล่าง)")
+		fmt.Println("รวมถึง web_fetch (เปิดอัตโนมัติเสมอ), web_search และ read_skill แบบมีเงื่อนไข")
+		fmt.Println("(ดูหัวข้อ Web search และ Skills ด้านล่าง)")
 		fmt.Println()
 		fmt.Println("mark_task_done มี build-only light gate ในตัว: ถ้าโปรเจกต์ build ไม่ผ่าน ola จะปฏิเสธ")
 		fmt.Println("ไม่ให้ปิด task นั้น (ป้อนผล build กลับให้โมเดลแก้ก่อน) เพื่อจับบั๊กตั้งแต่ task ที่ทำให้เกิด")
@@ -937,6 +953,13 @@ func codingUsage(fs *flag.FlagSet) func() {
 		fmt.Printf("  %-22s task checklist แบบ JSON (สำหรับ resume ข้ามการรัน)\n", codingStateFile)
 		fmt.Printf("  %-22s task checklist แบบอ่านง่าย อัปเดตทุกครั้งที่ task เปลี่ยนสถานะ\n", codingProgressFile)
 		fmt.Printf("  %-22s log ของทุกครั้งที่ ask_user ถูกเรียก (คำถาม + คำตอบ/assumption)\n", codingAssumptionsFile)
+		fmt.Println()
+		fmt.Println("Skills (เปิดเมื่อระบุ --skills-dir หรือ OLA_SKILLS_DIR เท่านั้น - รายละเอียดเต็มดู 'ola ask -h'")
+		fmt.Println("หัวข้อ Skills, กลไกเดียวกันทุกประการ): แต่ละ subdirectory ที่มีไฟล์ SKILL.md จะถูกโหลดเป็น")
+		fmt.Println("skill หนึ่งตัว ชื่อ+คำอธิบายจะถูกแปะเข้า system prompt อัตโนมัติ ส่วนเนื้อหาเต็มโมเดลต้อง")
+		fmt.Println("เรียก tool 'read_skill' เองเมื่อเห็นว่าเกี่ยวข้องกับงานที่กำลังทำ - มีประโยชน์มากสำหรับ")
+		fmt.Println("session ที่รันแบบไม่มีคนเฝ้า เพราะโมเดลสามารถดึง best-practice ของงานเฉพาะทางมาใช้เองได้")
+		fmt.Println("โดยไม่ต้องมีคนป้อนให้ทีละครั้ง")
 		fmt.Println()
 		fmt.Println("Environment variables: เหมือนกับ ola ask ทั้งหมด (ดู 'ola ask -h')")
 		fmt.Println()
@@ -962,6 +985,8 @@ func codingUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  --fetch-concurrency <n>    override OLA_FETCH_CONCURRENCY")
 		fmt.Println("  --search-timeout <sec>     override OLA_SEARCH_TIMEOUT_SEC")
 		fmt.Println("  --fetch-timeout <sec>      override OLA_FETCH_TIMEOUT_SEC")
+		fmt.Println("  --skills-dir <list>     override OLA_SKILLS_DIR - directory (หรือหลาย directory คั่นด้วย comma)")
+		fmt.Println("                          ที่เก็บ skill ต่างๆ เปิด tool 'read_skill' (ดูหัวข้อ Skills ด้านบน)")
 		fmt.Println("  -n, --dry-run           แสดง JSON payload ของ request รอบแรกโดยไม่เรียก API จริง")
 		fmt.Println("  -h, --help              แสดงข้อความนี้")
 		fmt.Println()
@@ -970,6 +995,7 @@ func codingUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  ola coding")
 		fmt.Println("  ola coding -f docs/requirements.md -x mytopic --max-duration 6h")
 		fmt.Println("  ola coding --build-cmd 'go build ./...' --test-cmd 'go test ./...' --allow golangci-lint")
+		fmt.Println("  ola coding --skills-dir /mnt/skills/public,/mnt/skills/private")
 	}
 }
 
@@ -987,6 +1013,7 @@ func cmdCoding(args []string) int {
 	var searxngURL string
 	var flagNoWebSearch bool
 	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
+	var skillsDir string
 
 	fs.StringVar(&model, "m", "", "")
 	fs.StringVar(&model, "model", "", "")
@@ -1018,6 +1045,7 @@ func cmdCoding(args []string) int {
 	fs.IntVar(&fetchConcurrency, "fetch-concurrency", 0, "")
 	fs.IntVar(&searchTimeoutSec, "search-timeout", 0, "")
 	fs.IntVar(&fetchTimeoutSec, "fetch-timeout", 0, "")
+	fs.StringVar(&skillsDir, "skills-dir", "", "")
 	fs.BoolVar(&flagHelp, "h", false, "")
 	fs.BoolVar(&flagHelp, "help", false, "")
 
@@ -1127,6 +1155,14 @@ func cmdCoding(args []string) int {
 
 	searchCfg := resolveSearchConfig(searxngURL, searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec, flagNoWebSearch)
 
+	// Skills stay opt-in, same principle as web_search - see the longer
+	// explanation in cmdAsk (main.go) and the skills.go package doc
+	// comment. Loading problems are warnings, not fatal.
+	skillsCfg := loadSkills(resolveSkillsDirs(skillsDir))
+	for _, w := range skillsCfg.Warnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
+
 	// Load or reset task state.
 	var state *codingState
 	if flagReplan {
@@ -1159,8 +1195,16 @@ func cmdCoding(args []string) int {
 	}
 	content += fmt.Sprintf("\n\n===== ตรวจพบ project toolchain: %s (build: %q, test: %q) =====\n", cmds.Label, cmds.BuildCmd, cmds.TestCmd)
 
+	// Same purely-additive exception as "ask" (see main.go's package doc
+	// comment): the coding system prompt is fixed/built-in except for this
+	// appended AVAILABLE SKILLS list, present only when skills were loaded.
+	systemPrompt := builtinCodingSystemPrompt
+	if skillsCfg.enabled() {
+		systemPrompt += buildSkillsPromptSection(skillsCfg.Skills)
+	}
+
 	messages := []ollamaMessage{
-		{Role: "system", Content: builtinCodingSystemPrompt},
+		{Role: "system", Content: systemPrompt},
 		{Role: "user", Content: content},
 	}
 
@@ -1168,7 +1212,7 @@ func cmdCoding(args []string) int {
 		Model:   model,
 		Options: ollamaOptions{NumCtx: ctx},
 		Stream:  true,
-		Tools:   codingToolset(searchCfg),
+		Tools:   codingToolset(searchCfg, skillsCfg),
 	}
 	if flagNoThink {
 		f := false
@@ -1183,8 +1227,8 @@ func cmdCoding(args []string) int {
 			return 1
 		}
 		fmt.Printf("── POST %s/api/chat ──\n", host)
-		fmt.Println("── System prompt (coding mode, built-in, fixed) ──")
-		fmt.Println(builtinCodingSystemPrompt)
+		fmt.Println("── System prompt (coding mode, built-in, fixed - plus AVAILABLE SKILLS below if any skills were loaded) ──")
+		fmt.Println(systemPrompt)
 		fmt.Println("── End system prompt ──")
 		fmt.Printf("── Requirements file: %s ──\n", reqFile)
 		fmt.Printf("── Detected toolchain: %s (build: %q test: %q) ──\n", cmds.Label, cmds.BuildCmd, cmds.TestCmd)
@@ -1202,6 +1246,18 @@ func cmdCoding(args []string) int {
 			fmt.Printf("── web_fetch: enabled (direct mode - plain HTTP, no external service, no JavaScript; concurrency %d) ──\n", searchCfg.FetchConcurrency)
 		} else {
 			fmt.Println("── web_fetch: disabled (--no-web-search was set) ──")
+		}
+		if skillsCfg.enabled() {
+			names := make([]string, len(skillsCfg.Skills))
+			for i, s := range skillsCfg.Skills {
+				names[i] = s.Name
+			}
+			fmt.Printf("── skills: enabled (%d found in %s: %s) ──\n",
+				len(skillsCfg.Skills), strings.Join(skillsCfg.Dirs, ","), strings.Join(names, ", "))
+		} else if len(skillsCfg.Dirs) > 0 {
+			fmt.Printf("── skills: disabled (--skills-dir/OLA_SKILLS_DIR was set to %s but no skills were found) ──\n", strings.Join(skillsCfg.Dirs, ","))
+		} else {
+			fmt.Println("── skills: disabled (--skills-dir/OLA_SKILLS_DIR not set) ──")
 		}
 		var pretty map[string]interface{}
 		_ = json.Unmarshal(payload, &pretty)
@@ -1237,6 +1293,16 @@ func cmdCoding(args []string) int {
 	} else {
 		fmt.Fprintln(outFile, "# web_fetch: disabled")
 	}
+	if skillsCfg.enabled() {
+		names := make([]string, len(skillsCfg.Skills))
+		for i, s := range skillsCfg.Skills {
+			names[i] = s.Name
+		}
+		fmt.Fprintf(outFile, "# skills: enabled (%d found in %s: %s)\n",
+			len(skillsCfg.Skills), strings.Join(skillsCfg.Dirs, ","), strings.Join(names, ", "))
+	} else {
+		fmt.Fprintln(outFile, "# skills: disabled")
+	}
 	fmt.Fprintf(outFile, "# max-iterations: %d  max-duration: %s  cmd-timeout: %ds\n", maxIterations, maxDuration, cmdTimeoutSec)
 	fmt.Fprintln(outFile, "---")
 	fmt.Fprintln(outFile)
@@ -1249,7 +1315,7 @@ func cmdCoding(args []string) int {
 	rc := &codingRunContext{
 		ntfyTopic: ntfyTopic, red: cRed, reset: cReset, outFile: outFile,
 		state: state, allowed: cmds.AllowBins, cmdTO: time.Duration(cmdTimeoutSec) * time.Second,
-		cmds: cmds, searchCfg: searchCfg,
+		cmds: cmds, searchCfg: searchCfg, skillsCfg: skillsCfg,
 	}
 
 	client := newHTTPClient()

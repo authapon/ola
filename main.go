@@ -24,6 +24,17 @@
 //	get_current_time - real system date/time, optionally in a given IANA
 //	                 timezone (models have no reliable notion of "now")
 //
+// Beyond those six, several more tools are added conditionally, only when
+// the feature they belong to is actually configured for the session (see
+// "ola ask -h" for the exact conditions of each): run_command (a detected
+// build/test toolchain), web_search/web_fetch (network access), and
+// read_skill (see skills.go) - present whenever a skills directory was
+// configured via --skills-dir/OLA_SKILLS_DIR and at least one skill was
+// found in it, letting the model pull in task-specific best-practice
+// instructions (SKILL.md files, same shape Claude's own skill system
+// uses) on demand instead of everything being crammed into the base
+// system prompt up front.
+//
 // "coding" (see coding.go) is a longer-running, requirements-file-driven
 // loop meant to run unattended: instead of a prompt, it reads a
 // requirements.md-style file and works through an implement/verify/fix
@@ -48,6 +59,11 @@
 // (available tools, sandboxing rules, when to ask the user) is load-bearing
 // enough that letting it be silently swapped out from the command line was
 // judged not worth the risk of an inconsistent/broken prompt at runtime.
+// The one exception is purely additive, not a swap: when a skills
+// directory is configured, an "AVAILABLE SKILLS" section (name +
+// description per skill) is appended to the fixed prompt above - see
+// skills.go. Nothing about the base contract changes; skills only ever add
+// a list of things the model may optionally go read via read_skill.
 //
 // When the model requests a tool call, ola prints it to the terminal in red
 // so it's visually distinct from thinking (cyan) and the final answer
@@ -61,6 +77,9 @@
 //	OLA_OLLAMA_CONTEXT_SIZE Default num_ctx (override with -c, default: 16384)
 //	OLA_OUTPUT_FILE         Default output file (override with -o, default: output.txt)
 //	OLA_TOPIC               ntfy.sh topic for notifications (override with -x)
+//	OLA_SKILLS_DIR          Comma-separated skill directories (override with --skills-dir);
+//	                        each subdirectory containing a SKILL.md becomes an available
+//	                        skill via the read_skill tool. Opt-in (default: unset/disabled).
 package main
 
 import (
@@ -573,7 +592,23 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  ทั้งสอง tool รับ list ของ query/url ได้ในเรียกเดียว แล้วจะยิงแบบขนาน (bounded concurrency)")
 		fmt.Println("  โดยอัตโนมัติ ไม่ต้องเรียกทีละรายการ")
 		fmt.Println()
-		fmt.Println("System prompt เป็นค่า built-in ตายตัวในไบนารี ไม่มี flag สำหรับเปลี่ยนจากภายนอกอีกต่อไป")
+		fmt.Println("Skills (เปิดเมื่อระบุ --skills-dir หรือ OLA_SKILLS_DIR เท่านั้น):")
+		fmt.Println("  subdirectory ใน path ที่ระบุ ถ้ามีไฟล์ SKILL.md อยู่ข้างใน จะถูกโหลดเป็น \"skill\" หนึ่งตัว -")
+		fmt.Println("  รองรับทั้งแบบตรง (<dir>/<skill>/SKILL.md) และแบบแบ่งหมวดหมู่หนึ่งชั้น (<dir>/<category>/<skill>/")
+		fmt.Println("  SKILL.md เช่น /mnt/skills/public/pptx - โครงสร้างเดียวกับ skill ของ Claude เอง) ผสมกันได้ในไดเรกทอรี")
+		fmt.Println("  เดียวกัน และตามลิงก์ (symlink) ของทั้ง skill directory และ category directory ด้วย - มีแค่ชื่อ + คำอธิบายสั้นๆ")
+		fmt.Println("  ของแต่ละ skill เท่านั้นที่ถูกแปะเข้า system prompt อัตโนมัติ (หัวข้อ AVAILABLE SKILLS) เนื้อหา")
+		fmt.Println("  เต็มจะไม่ถูกโหลดเข้า context ทันที โมเดลต้องเรียก tool 'read_skill' เองเมื่อเห็นว่า skill นั้น")
+		fmt.Println("  เกี่ยวข้องกับงานที่กำลังทำ (เหมือนหลักการ read_file ก่อน edit_file - อ่านก่อนใช้ ไม่เดาเอา)")
+		fmt.Println("  ระบุได้หลาย directory พร้อมกันด้วย comma คั่น เช่น \"/mnt/skills/public,/mnt/skills/private\"")
+		fmt.Println("  สแกนตามลำดับที่ระบุ ถ้าชื่อ skill ซ้ำกัน directory แรกที่เจอจะชนะ ตัวที่ซ้ำจะถูกข้ามพร้อม warning")
+		fmt.Println("  SKILL.md format: เริ่มไฟล์ด้วย frontmatter บรรทัด key: value ระหว่าง \"---\" สองบรรทัดได้")
+		fmt.Println("  (name:, description: - ไม่ใช่ YAML เต็มรูปแบบ) ถ้าไม่มี frontmatter จะ fallback ไปใช้ชื่อ")
+		fmt.Println("  directory เป็นชื่อ skill และบรรทัดข้อความแรกในไฟล์เป็นคำอธิบาย")
+		fmt.Println("  ถ้าไม่ระบุ --skills-dir/OLA_SKILLS_DIR เลย จะไม่มี tool 'read_skill' และไม่มีผลกระทบใดๆ ต่อ session")
+		fmt.Println()
+		fmt.Println("System prompt เป็นค่า built-in ตายตัวในไบนารี ไม่มี flag สำหรับเปลี่ยนจากภายนอกอีกต่อไป (ยกเว้นหัวข้อ")
+		fmt.Println("AVAILABLE SKILLS ด้านบน ซึ่งเป็นการ \"เติมต่อ\" ไม่ใช่การ override - เปิดก็ต่อเมื่อตั้งค่า skills เท่านั้น)")
 		fmt.Println()
 		fmt.Println("เมื่อโมเดลเรียก tool ใดๆ จะแสดงผลบนจอเป็นสีแดง แยกจาก thinking (สีฟ้า) และ")
 		fmt.Println("answer (ตัวหนา/ปกติ) ชัดเจน")
@@ -592,6 +627,8 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  OLA_FETCH_CONCURRENCY     จำนวน URL ที่ fetch พร้อมกันสูงสุด (default: 4)")
 		fmt.Println("  OLA_SEARCH_TIMEOUT_SEC    timeout ต่อคำค้นหนึ่งครั้ง วินาที (default: 20)")
 		fmt.Println("  OLA_FETCH_TIMEOUT_SEC     timeout ต่อ URL หนึ่งครั้ง วินาที (default: 30)")
+		fmt.Println("  OLA_SKILLS_DIR            Directory (หรือหลาย directory คั่นด้วย comma) ที่เก็บ skill ต่างๆ")
+		fmt.Println("                            (override ด้วย --skills-dir) เปิด tool 'read_skill' - ดูหัวข้อ Skills ด้านบน")
 		fmt.Println()
 		fmt.Println("Options: (ต้องระบุก่อน <prompt> เสมอ ทั้งหมดรองรับทั้งรูปแบบสั้น -x และยาว --xxx)")
 		fmt.Println("  -m, --model <n>      โมเดลที่ใช้ [จำเป็น ถ้าไม่ตั้ง $OLA_OLLAMA_MODEL]")
@@ -618,6 +655,8 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("      --fetch-concurrency <n>   override OLA_FETCH_CONCURRENCY")
 		fmt.Println("      --search-timeout <sec>    override OLA_SEARCH_TIMEOUT_SEC")
 		fmt.Println("      --fetch-timeout <sec>     override OLA_FETCH_TIMEOUT_SEC")
+		fmt.Println("      --skills-dir <list>  override OLA_SKILLS_DIR - directory (หรือหลาย directory คั่นด้วย comma)")
+		fmt.Println("                       ที่เก็บ skill ต่างๆ เปิด tool 'read_skill' (ดูหัวข้อ Skills ด้านบน)")
 		fmt.Println("  -h, --help           แสดงข้อความนี้")
 		fmt.Println()
 		fmt.Println("ไฟล์แนบ ([files...]):")
@@ -657,6 +696,7 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  ola ask -f prompt.txt src/*.go   # prompt มาจากไฟล์ src/*.go ทั้งหมดกลายเป็นไฟล์แนบ")
 		fmt.Println("  export OLA_TOPIC=mytopic")
 		fmt.Println("  ola ask 'deploy to production'  # ใช้ค่า OLA_TOPIC จาก environment")
+		fmt.Println("  ola ask --skills-dir /mnt/skills/public,/mnt/skills/private 'สร้างสไลด์สรุปบทที่ 5'")
 	}
 }
 
@@ -672,6 +712,7 @@ func cmdAsk(args []string) int {
 	var searxngURL string
 	var flagNoWebSearch bool
 	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
+	var skillsDir string
 
 	fs.StringVar(&model, "m", "", "")
 	fs.StringVar(&model, "model", "", "")
@@ -706,6 +747,7 @@ func cmdAsk(args []string) int {
 	fs.IntVar(&fetchConcurrency, "fetch-concurrency", 0, "")
 	fs.IntVar(&searchTimeoutSec, "search-timeout", 0, "")
 	fs.IntVar(&fetchTimeoutSec, "fetch-timeout", 0, "")
+	fs.StringVar(&skillsDir, "skills-dir", "", "")
 	fs.BoolVar(&flagHelp, "h", false, "")
 	fs.BoolVar(&flagHelp, "help", false, "")
 
@@ -940,11 +982,6 @@ func cmdAsk(args []string) int {
 		logLoad(fmt.Sprintf("attached image files (%d)", len(imageFiles)), time.Since(imageLoadStart))
 	}
 
-	messages := []ollamaMessage{
-		{Role: "system", Content: builtinSystemPrompt},
-		userMsg,
-	}
-
 	// web_search stays opt-in, following the same "only offer what can
 	// actually work" principle as run_command above: it's only added to the
 	// tool list when OLA_SEARXNG_API_BASE / --searxng-url is actually
@@ -953,6 +990,16 @@ func cmdAsk(args []string) int {
 	// single zero-config direct-HTTP mode that's on by default - so it's
 	// always added unless --no-web-search turned everything off.
 	searchCfg := resolveSearchConfig(searxngURL, searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec, flagNoWebSearch)
+
+	// Skills stay opt-in, same principle as web_search: loadSkills is a
+	// no-op (empty config, nothing added to the tool list or prompt) unless
+	// --skills-dir/OLA_SKILLS_DIR was actually set. Problems while loading
+	// (a bad directory, a duplicate skill name) are warnings, not fatal -
+	// the session still runs, just without the affected skill(s).
+	skillsCfg := loadSkills(resolveSkillsDirs(skillsDir))
+	for _, w := range skillsCfg.Warnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
 
 	// Only add run_command to the tool list when there's a detected
 	// toolchain and the user hasn't disabled verification - a session with
@@ -968,6 +1015,24 @@ func cmdAsk(args []string) int {
 	}
 	if searchCfg.fetchEnabled() {
 		tools = append(tools, webFetchTool)
+	}
+	if skillsCfg.enabled() {
+		tools = append(tools, readSkillTool)
+	}
+
+	// The system prompt is fixed/built-in (see the package doc comment at
+	// the top of this file) except for this one purely additive exception:
+	// when skills were loaded, their name+description list is appended as
+	// an AVAILABLE SKILLS section so the model knows what it can pull in
+	// via read_skill - nothing about the base contract above is replaced.
+	systemPrompt := builtinSystemPrompt
+	if skillsCfg.enabled() {
+		systemPrompt += buildSkillsPromptSection(skillsCfg.Skills)
+	}
+
+	messages := []ollamaMessage{
+		{Role: "system", Content: systemPrompt},
+		userMsg,
 	}
 
 	req := ollamaRequest{
@@ -993,8 +1058,8 @@ func cmdAsk(args []string) int {
 		if flagKey {
 			fmt.Printf("── Header: Authorization: Bearer %s ──\n", maskKey(apiKey))
 		}
-		fmt.Println("── System prompt (built-in, fixed) ──")
-		fmt.Println(builtinSystemPrompt)
+		fmt.Println("── System prompt (built-in, fixed - plus AVAILABLE SKILLS below if any skills were loaded) ──")
+		fmt.Println(systemPrompt)
 		fmt.Println("── End system prompt ──")
 		fmt.Printf("── Output file: %s ──\n", outputFile)
 		fmt.Printf("── Sandbox root (current directory): %s ──\n", cwd)
@@ -1020,6 +1085,18 @@ func cmdAsk(args []string) int {
 			fmt.Printf("── web_fetch: enabled (direct mode - plain HTTP, no external service, no JavaScript; concurrency %d) ──\n", searchCfg.FetchConcurrency)
 		} else {
 			fmt.Println("── web_fetch: disabled (--no-web-search was set) ──")
+		}
+		if skillsCfg.enabled() {
+			names := make([]string, len(skillsCfg.Skills))
+			for i, s := range skillsCfg.Skills {
+				names[i] = s.Name
+			}
+			fmt.Printf("── skills: enabled (%d found in %s: %s) ──\n",
+				len(skillsCfg.Skills), strings.Join(skillsCfg.Dirs, ","), strings.Join(names, ", "))
+		} else if len(skillsCfg.Dirs) > 0 {
+			fmt.Printf("── skills: disabled (--skills-dir/OLA_SKILLS_DIR was set to %s but no skills were found) ──\n", strings.Join(skillsCfg.Dirs, ","))
+		} else {
+			fmt.Println("── skills: disabled (--skills-dir/OLA_SKILLS_DIR not set) ──")
 		}
 		var pretty map[string]interface{}
 		_ = json.Unmarshal(payload, &pretty)
@@ -1068,6 +1145,16 @@ func cmdAsk(args []string) int {
 		fmt.Fprintf(outFile, "# web_fetch: enabled (direct mode - plain HTTP, no external service, no JavaScript; concurrency %d)\n", searchCfg.FetchConcurrency)
 	} else {
 		fmt.Fprintln(outFile, "# web_fetch: disabled")
+	}
+	if skillsCfg.enabled() {
+		names := make([]string, len(skillsCfg.Skills))
+		for i, s := range skillsCfg.Skills {
+			names[i] = s.Name
+		}
+		fmt.Fprintf(outFile, "# skills: enabled (%d found in %s: %s)\n",
+			len(skillsCfg.Skills), strings.Join(skillsCfg.Dirs, ","), strings.Join(names, ", "))
+	} else {
+		fmt.Fprintln(outFile, "# skills: disabled")
 	}
 	if flagNoThink {
 		fmt.Fprintln(outFile, "# thinking: disabled")
@@ -1128,6 +1215,12 @@ func cmdAsk(args []string) int {
 				return "", nil, false
 			}
 			r, e := toolWebFetch(args, searchCfg)
+			return r, e, true
+		case "read_skill":
+			if !skillsCfg.enabled() {
+				return "", nil, false
+			}
+			r, e := toolReadSkill(args, skillsCfg.Skills)
 			return r, e, true
 		default:
 			return "", nil, false
@@ -1288,17 +1381,29 @@ func cmdAsk(args []string) int {
 // is no configurable root - the sandbox is always the directory ola is
 // running in.
 func sandboxedPath(rel string) (string, error) {
-	if rel == "" {
-		return "", fmt.Errorf("path ว่างเปล่า")
-	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		return "", fmt.Errorf("อ่าน current directory ไม่ได้: %v", err)
 	}
-	cwdClean := filepath.Clean(cwd)
-	joined := filepath.Clean(filepath.Join(cwdClean, rel))
-	if joined != cwdClean && !strings.HasPrefix(joined, cwdClean+string(os.PathSeparator)) {
-		return "", fmt.Errorf("path นอกขอบเขต current directory: %s", rel)
+	return sandboxedPathIn(cwd, rel)
+}
+
+// sandboxedPathIn is the general form sandboxedPath wraps: it resolves rel
+// against root and rejects anything (via absolute paths or "..") that
+// would escape root, whatever root happens to be. sandboxedPath itself
+// always roots at the current working directory (the "ask"/"coding" tool
+// sandbox); read_skill's optional "file" argument (see skills.go) reuses
+// this same check but rooted at one specific skill's own folder instead,
+// so a skill's companion files can be read without also opening up the
+// rest of the filesystem.
+func sandboxedPathIn(root, rel string) (string, error) {
+	if rel == "" {
+		return "", fmt.Errorf("path ว่างเปล่า")
+	}
+	rootClean := filepath.Clean(root)
+	joined := filepath.Clean(filepath.Join(rootClean, rel))
+	if joined != rootClean && !strings.HasPrefix(joined, rootClean+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path นอกขอบเขตที่อนุญาต: %s", rel)
 	}
 	return joined, nil
 }
@@ -1792,6 +1897,8 @@ func toolLoadTimingLabel(name string) (icon, label string) {
 	switch name {
 	case "read_file", "search_files":
 		return "📂", "โหลดไฟล์ (local)"
+	case "read_skill":
+		return "📖", "โหลด skill (local)"
 	case "web_search", "web_fetch":
 		return "🌐", "โหลดข้อมูลภายนอก (network)"
 	default:
