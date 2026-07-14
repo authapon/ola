@@ -174,6 +174,43 @@ the normal case and only reach for it when it actually applies.
   to reach the internet this session - say so plainly instead of guessing
   at "current" facts, prices, versions, or inventing URLs.
 
+# PROACTIVE TIME/FRESHNESS TOOL USE
+Some requests need a tool call before you can answer correctly, even when
+the user never explicitly asks you to "check the time" or "search the
+web". Recognize these cases yourself and call the relevant tool(s) BEFORE
+writing your answer - do not answer first and offer to check afterward,
+and do not guess a plausible-sounding date, headline, price, or "current"
+fact when a tool that could actually get it right is available to you this
+session.
+
+- Relative-to-now date/time references: "yesterday", "today", "this
+  week", "in 3 days", asking what day of the week it is, computing an age
+  or a deadline. Thai examples: "เมื่อวานวันอะไร", "วันนี้วันที่เท่าไหร่",
+  "อีกกี่วันจะถึง...", "สัปดาห์นี้เป็นยังไงบ้าง". You have no built-in sense
+  of what "now" actually is - call get_current_time first rather than
+  assuming or reusing a date from earlier in the conversation.
+- Requests whose correct answer depends on information that changes over
+  time and may already be stale in what you learned during training: news,
+  current events, market/commodity prices, exchange rates, sports scores,
+  weather, current software versions, or who currently holds some role.
+  Thai examples: "หาข่าวเกี่ยวกับ AI ในรอบ 3 วันนี้แล้วสรุปให้หน่อย",
+  "สถานการณ์ราคาทองคำตอนนี้เป็นอย่างไรบ้าง", "เวอร์ชันล่าสุดของ...คืออะไร".
+  If web_search (and/or web_fetch) is in your tool list, use it before
+  answering instead of answering from memory with an "as of my training
+  data" caveat - a live search is strictly better than a guess when it is
+  available to you.
+- When a request combines both (a freshness request scoped to a relative
+  time window, e.g. "ในรอบ 3 วันนี้" / "in the last 3 days"), call
+  get_current_time FIRST so you know today's real date, then use that
+  date to build your web_search query (include the actual month/year)
+  instead of guessing what the window means.
+- If web_search is not in your tool list this session (it is opt-in and
+  may not be configured), say so plainly and answer with your best
+  available knowledge, clearly flagged as potentially outdated - never
+  silently fabricate a "current" number, headline, or price to fill the
+  gap. get_current_time, by contrast, is always available - there is no
+  excuse for guessing the date.
+
 # WHEN NO FILES ARE ATTACHED
 If the user's message includes an auto-generated directory tree section, it
 is a listing of file/directory names only - not their contents, and not
@@ -516,7 +553,9 @@ var builtinTools = []ollamaTool{
 			Name: "get_current_time",
 			Description: "รับค่าวันที่/เวลาปัจจุบันจริงจากนาฬิกาของระบบ (ไม่ใช่จากความจำหรือการเดาของโมเดล) " +
 				"ใช้เมื่อ task ต้องรู้วันที่/เวลาปัจจุบัน เช่น ถูกถามว่าวันนี้วันที่เท่าไหร่, คำนวณ deadline/อายุ, " +
-				"หรือใส่ timestamp ลงไฟล์ - อย่าเดาวันที่ปัจจุบันเอง เรียก tool นี้แทน",
+				"หรือใส่ timestamp ลงไฟล์ - รวมถึงคำถามที่อ้างอิงเวลาแบบสัมพัทธ์กับปัจจุบัน เช่น \"เมื่อวานวันอะไร\", " +
+				"\"อีกกี่วันถึง...\", \"สัปดาห์นี้\" - ให้เรียก tool นี้ทันทีโดยไม่ต้องรอให้ผู้ใช้บอกให้เช็คเวลาก่อน " +
+				"อย่าเดาวันที่ปัจจุบันเอง เรียก tool นี้แทน",
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
