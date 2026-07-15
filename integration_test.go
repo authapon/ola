@@ -611,6 +611,121 @@ func TestCmdAskSCPCopyNotOfferedWithoutConfig(t *testing.T) {
 	}
 }
 
+// TestCmdAskAPIRequestEndToEnd drives cmdAsk against a mocked Ollama
+// /api/chat endpoint whose first round calls api_request against a second,
+// separate httptest.Server standing in for the "real" external API (the
+// endpoint alias points at this second server, not at Ollama itself) -
+// mirroring TestCmdAskSCPCopyEndToEnd's two-server shape (one mock model,
+// one mock "remote side").
+func TestCmdAskAPIRequestEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	var gotPath, gotQuery string
+	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.Query().Get("q")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"models":["qwen3.6:27b"]}`)
+	}))
+	defer apiSrv.Close()
+
+	var round int32
+	var gotBody string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&round, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if n == 1 {
+			b, _ := io.ReadAll(r.Body)
+			gotBody = string(b)
+			argsJSON := `{"endpoint":"ollama","path":"/api/tags","query":{"q":"list"}}`
+			fmt.Fprint(w, streamLine("", "api_request", argsJSON, true))
+			return
+		}
+		fmt.Fprint(w, streamLine("มีโมเดล qwen3.6:27b ครับ", "", "", true))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdAsk([]string{
+		"-m", "mock-model", "-o", "ask-api.log",
+		"--api-endpoints", "ollama=" + apiSrv.URL,
+		"เช็คว่ามีโมเดลอะไรบ้างใน ollama ตอนนี้",
+	})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdAsk to exit 0, got %d", exitCode)
+	}
+	if got := atomic.LoadInt32(&round); got != 2 {
+		t.Fatalf("expected exactly 2 rounds (api_request call, then final answer), got %d", got)
+	}
+	if !strings.Contains(gotBody, `"api_request"`) {
+		t.Fatalf("expected api_request to be advertised as a tool once --api-endpoints is set, got request body: %s", gotBody)
+	}
+	if gotPath != "/api/tags" {
+		t.Fatalf("expected the external API to actually receive /api/tags, got %q", gotPath)
+	}
+	if gotQuery != "list" {
+		t.Fatalf("expected the query param to reach the external API, got %q", gotQuery)
+	}
+
+	log, err := os.ReadFile("ask-api.log")
+	if err != nil {
+		t.Fatalf("expected output log to exist: %v", err)
+	}
+	if !strings.Contains(string(log), "# api_request: enabled") {
+		t.Fatalf("expected the log header to report api_request as enabled, got:\n%s", log)
+	}
+	if !strings.Contains(string(log), "[tool_call] api_request") {
+		t.Fatalf("expected an api_request tool_call entry in the log, got:\n%s", log)
+	}
+	if !strings.Contains(string(log), `"models":["qwen3.6:27b"]`) {
+		t.Fatalf("expected the external API's actual response body in the tool_result, got:\n%s", log)
+	}
+}
+
+// TestCmdAskAPIRequestNotOfferedWithoutConfig mirrors
+// TestCmdAskSCPCopyNotOfferedWithoutConfig: a plain session (no
+// --api-endpoints/OLA_API_ENDPOINTS, no --api-allow-direct-url) never even
+// sees api_request in its tool list.
+func TestCmdAskAPIRequestNotOfferedWithoutConfig(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	var gotBody string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("รับทราบครับ", "", "", true))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdAsk([]string{"-m", "mock-model", "-o", "ask-noapi.log", "สวัสดี"})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdAsk to exit 0, got %d", exitCode)
+	}
+	if strings.Contains(gotBody, `"api_request"`) {
+		t.Fatalf("expected api_request NOT to be offered without --api-endpoints/OLA_API_ENDPOINTS or --api-allow-direct-url configured, got: %s", gotBody)
+	}
+}
+
 // ======================================================================
 // freshness_test.go
 // ======================================================================

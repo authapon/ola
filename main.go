@@ -54,7 +54,15 @@
 // operator-configured list - it never supplies a user/host/port/remote
 // path itself - and both the local and remote sides are sandboxed to the
 // directories configured for them, the same way read_file/write_file are
-// sandboxed to the current directory.
+// sandboxed to the current directory. api_request (see api_request.go),
+// present whenever at least one endpoint was configured via
+// --api-endpoints/OLA_API_ENDPOINTS or --api-allow-direct-url was turned
+// on, lets the model call an HTTP API: any method/query/header/body shape,
+// but the destination is either a pre-approved "endpoint" alias (same
+// allowlist shape as scp_copy's remote_alias - the only way to reach a
+// private/internal host, with any credentials injected by ola itself and
+// never visible to the model) or, opt-in only, a direct URL run through
+// the same public-web-only SSRF guard web_fetch uses.
 //
 // "coding" (see coding.go) is a longer-running, requirements-file-driven
 // loop meant to run unattended: instead of a prompt, it reads a
@@ -104,6 +112,13 @@
 //	OLA_SCP_HOSTS           Comma-separated "alias=user@host[:port]/remote/root" entries
 //	                        (override with --scp-hosts); enables the scp_copy tool, opt-in
 //	                        (default: unset/disabled). See integrations.go.
+//	OLA_API_ENDPOINTS       Comma-separated "alias=https://base.url" entries (override with
+//	                        --api-endpoints); enables the api_request tool, opt-in (default:
+//	                        unset/disabled). See api_request.go.
+//	OLA_API_ALLOW_DIRECT_URL  Let api_request take a raw URL, not just a configured endpoint
+//	                        alias (override with --api-allow-direct-url, default: off).
+//	OLA_API_ALLOW_MUTATING  Let api_request send POST/PUT/PATCH/DELETE, not just GET/HEAD/
+//	                        OPTIONS (override with --api-allow-mutating, default: off).
 
 package main
 
@@ -754,6 +769,27 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  session change log และส่ง ntfy.sh notification ทันที (ถ้าตั้ง -x/OLA_TOPIC ไว้) เหมือน write_file/edit_file")
 		fmt.Println("  ถ้าไม่ระบุ --scp-hosts/OLA_SCP_HOSTS เลย จะไม่มี tool 'scp_copy' และไม่มีผลกระทบใดๆ ต่อ session")
 		fmt.Println()
+		fmt.Println("api_request - ยิง HTTP request ไปยัง API (เปิดเมื่อระบุ --api-endpoints/OLA_API_ENDPOINTS หรือ")
+		fmt.Println("  --api-allow-direct-url เท่านั้น) สองวิธีเลือกปลายทาง:")
+		fmt.Println("    1. endpoint - โมเดลเลือก \"endpoint\" เป็นชื่อ alias ที่ตั้งไว้ล่วงหน้าเท่านั้น (เหมือนหลักการ")
+		fmt.Println("       allowlist ของ scp_copy/run_command - เดา/พิมพ์ host เองไม่ได้) รูปแบบ: \"alias=https://base.url\"")
+		fmt.Println("       คั่นหลาย endpoint ด้วย comma เช่น")
+		fmt.Println("         OLA_API_ENDPOINTS=\"ollama=http://localhost:11434,openwebui=http://localhost:8080\"")
+		fmt.Println("       endpoint เท่านั้นที่เข้าถึง host ภายใน/private ได้ ถ้า endpoint ต้องใช้ credential ตั้งค่าแยกผ่าน")
+		fmt.Println("       OLA_API_ENDPOINT_<ALIAS>_AUTH_HEADER / _AUTH_VALUE (เช่น _AUTH_HEADER=Authorization) ola จะแนบ")
+		fmt.Println("       header นี้ให้เองทุกครั้ง โดยที่โมเดลไม่เห็นค่าจริงเลย ไม่ว่าใน tool call หรือ log ไฟล์ -o")
+		fmt.Println("    2. url - ระบุ URL ตรงเหมือน web_fetch (เฉพาะเมื่อเปิด --api-allow-direct-url) ผ่าน SSRF guard")
+		fmt.Println("       เดียวกับ web_fetch เสมอ (ปฏิเสธ private/reserved IP และ localhost)")
+		fmt.Println("  method GET/HEAD/OPTIONS ใช้ได้เสมอเมื่อเปิด tool นี้ ส่วน POST/PUT/PATCH/DELETE ต้องเปิด")
+		fmt.Println("  --api-allow-mutating เพิ่มอีกชั้นหนึ่ง (default: ปิด กันเรียก API ที่มีผลข้างเคียงโดยไม่ตั้งใจ)")
+		fmt.Println("  รองรับ query/headers เพิ่มเติม (header ที่สงวนไว้ เช่น Authorization/Host จะถูกข้ามเสมอ - ถ้าต้องใช้")
+		fmt.Println("  auth ให้ตั้งที่ endpoint แทน) body รองรับ json/form/multipart/text/binary/none ผ่าน body_type")
+		fmt.Println("  response ที่ไม่ใช่ 2xx ไม่ถือเป็น error - จะคืน status code และเนื้อหากลับมาให้โมเดลตัดสินใจเอง")
+		fmt.Println("  ทุกครั้งที่เรียกด้วย method ที่ mutating (POST/PUT/PATCH/DELETE) สำเร็จ จะถูกบันทึกเข้า session")
+		fmt.Println("  change log และส่ง ntfy.sh notification ทันที (ถ้าตั้ง -x/OLA_TOPIC ไว้) เหมือน write_file/edit_file")
+		fmt.Println("  ถ้าไม่ตั้งค่าใดๆ เลย (ไม่มี --api-endpoints และไม่เปิด --api-allow-direct-url) จะไม่มี tool")
+		fmt.Println("  'api_request' และไม่มีผลกระทบใดๆ ต่อ session")
+		fmt.Println()
 		fmt.Println("System prompt เป็นค่า built-in ตายตัวในไบนารี ไม่มี flag สำหรับเปลี่ยนจากภายนอกอีกต่อไป (ยกเว้นหัวข้อ")
 		fmt.Println("AVAILABLE SKILLS ด้านบน ซึ่งเป็นการ \"เติมต่อ\" ไม่ใช่การ override - เปิดก็ต่อเมื่อตั้งค่า skills เท่านั้น)")
 		fmt.Println()
@@ -787,6 +823,13 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  OLA_SCP_KEY               SSH identity file (-i) สำหรับ scp_copy (override ด้วย --scp-key, default: ใช้ ssh-agent/~/.ssh/config)")
 		fmt.Println("  OLA_SCP_TIMEOUT_SEC       timeout ต่อการโอนไฟล์หนึ่งครั้ง วินาที (override ด้วย --scp-timeout, default: 120)")
 		fmt.Println("  OLA_SCP_MAX_BYTES         ขนาดไฟล์สูงสุดต่อการโอนหนึ่งครั้ง bytes (override ด้วย --scp-max-bytes, default: 104857600 = 100MB)")
+		fmt.Println("  OLA_API_ENDPOINTS         รายชื่อ API endpoint ที่อนุญาตให้ api_request ใช้ได้ (override ด้วย --api-endpoints)")
+		fmt.Println("                            รูปแบบ \"alias=https://base.url\" คั่นหลายตัวด้วย comma - เปิด tool 'api_request'")
+		fmt.Println("  OLA_API_ENDPOINT_<ALIAS>_AUTH_HEADER / _AUTH_VALUE  credential ที่ ola แนบให้ endpoint นั้นเองอัตโนมัติ")
+		fmt.Println("                            (ชื่อ header + ค่า - ไม่ผ่านโมเดลเลย เช่น OLA_API_ENDPOINT_GHAPI_AUTH_HEADER=Authorization)")
+		fmt.Println("  OLA_API_ALLOW_DIRECT_URL  เปิดโหมดระบุ URL ตรง (override ด้วย --api-allow-direct-url, default: ปิด)")
+		fmt.Println("  OLA_API_ALLOW_MUTATING    อนุญาต method POST/PUT/PATCH/DELETE (override ด้วย --api-allow-mutating, default: ปิด)")
+		fmt.Println("  OLA_API_REQUEST_TIMEOUT_SEC  timeout ต่อการเรียก API หนึ่งครั้ง วินาที (override ด้วย --api-timeout, default: 30)")
 		fmt.Println()
 		fmt.Println("Options: (ต้องระบุก่อน <prompt> เสมอ ทั้งหมดรองรับทั้งรูปแบบสั้น -x และยาว --xxx)")
 		fmt.Println("  -m, --model <n>      โมเดลที่ใช้ [จำเป็น ถ้าไม่ตั้ง $OLA_OLLAMA_MODEL]")
@@ -821,6 +864,10 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("      --scp-key <path>     override OLA_SCP_KEY (SSH identity file)")
 		fmt.Println("      --scp-timeout <sec>  override OLA_SCP_TIMEOUT_SEC")
 		fmt.Println("      --scp-max-bytes <n>  override OLA_SCP_MAX_BYTES")
+		fmt.Println("      --api-endpoints <list>  override OLA_API_ENDPOINTS - เปิด tool 'api_request' (ดูหัวข้อ api_request ด้านบน)")
+		fmt.Println("      --api-allow-direct-url  override OLA_API_ALLOW_DIRECT_URL - เปิดโหมดระบุ URL ตรงใน api_request")
+		fmt.Println("      --api-allow-mutating    override OLA_API_ALLOW_MUTATING - อนุญาต POST/PUT/PATCH/DELETE ใน api_request")
+		fmt.Println("      --api-timeout <sec>     override OLA_API_REQUEST_TIMEOUT_SEC")
 		fmt.Println("  -h, --help           แสดงข้อความนี้")
 		fmt.Println()
 		fmt.Println("ไฟล์แนบ ([files...]):")
@@ -862,6 +909,7 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  ola ask 'deploy to production'  # ใช้ค่า OLA_TOPIC จาก environment")
 		fmt.Println("  ola ask --skills-dir /mnt/skills/public,/mnt/skills/private 'สร้างสไลด์สรุปบทที่ 5'")
 		fmt.Println("  ola ask --scp-hosts 'backup=moo@10.0.0.5/srv/backup' 'สำรอง report.txt ไปที่ backup หน่อย'")
+		fmt.Println("  ola ask --api-endpoints 'ollama=http://localhost:11434' 'เช็คว่ามีโมเดลอะไรบ้างใน ollama ตอนนี้'")
 	}
 }
 
@@ -880,6 +928,9 @@ func cmdAsk(args []string) int {
 	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
 	var skillsDir string
 	var scpHosts, scpLocalDir, scpKey string
+	var apiEndpoints string
+	var flagAPIAllowDirectURL, flagAPIAllowMutating bool
+	var apiTimeoutSec int
 	var scpTimeoutSec int
 	var scpMaxBytes int64
 
@@ -923,6 +974,10 @@ func cmdAsk(args []string) int {
 	fs.StringVar(&scpKey, "scp-key", "", "")
 	fs.IntVar(&scpTimeoutSec, "scp-timeout", 0, "")
 	fs.Int64Var(&scpMaxBytes, "scp-max-bytes", 0, "")
+	fs.StringVar(&apiEndpoints, "api-endpoints", "", "")
+	fs.BoolVar(&flagAPIAllowDirectURL, "api-allow-direct-url", false, "")
+	fs.BoolVar(&flagAPIAllowMutating, "api-allow-mutating", false, "")
+	fs.IntVar(&apiTimeoutSec, "api-timeout", 0, "")
 	fs.BoolVar(&flagHelp, "h", false, "")
 	fs.BoolVar(&flagHelp, "help", false, "")
 
@@ -1190,6 +1245,17 @@ func cmdAsk(args []string) int {
 		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
 	}
 
+	// api_request stays opt-in, same principle as scp_copy/web_search
+	// above: unless OLA_API_ENDPOINTS/--api-endpoints is set or
+	// --api-allow-direct-url was explicitly turned on, resolveAPIRequestConfig
+	// returns a disabled config and this feature has zero effect on the
+	// session. A bad individual endpoint entry is a warning (that alias is
+	// skipped), not fatal - same shape as scp_copy's own warning handling.
+	apiCfg, apiWarnings := resolveAPIRequestConfig(apiEndpoints, flagAPIAllowDirectURL, flagAPIAllowMutating, apiTimeoutSec, 0, 0)
+	for _, w := range apiWarnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
+
 	// Only add run_command to the tool list when there's a detected
 	// toolchain and the user hasn't disabled verification - a session with
 	// nothing to build/test, or one run with --no-verify, never even shows
@@ -1207,6 +1273,9 @@ func cmdAsk(args []string) int {
 	}
 	if scpCfg.enabled() {
 		tools = append(tools, scpCopyTool)
+	}
+	if apiCfg.enabled() {
+		tools = append(tools, apiRequestTool)
 	}
 	if skillsCfg.enabled() {
 		tools = append(tools, readSkillTool)
@@ -1354,6 +1423,12 @@ func cmdAsk(args []string) int {
 	} else {
 		fmt.Fprintln(outFile, "# scp_copy: disabled")
 	}
+	if apiCfg.enabled() {
+		fmt.Fprintf(outFile, "# api_request: enabled (endpoints: %s, direct-url: %t, mutating: %t, timeout: %s)\n",
+			apiCfg.endpointList(), apiCfg.AllowDirectURL, apiCfg.AllowMutating, apiCfg.Timeout)
+	} else {
+		fmt.Fprintln(outFile, "# api_request: disabled")
+	}
 	if flagNoThink {
 		fmt.Fprintln(outFile, "# thinking: disabled")
 	} else {
@@ -1443,6 +1518,29 @@ func cmdAsk(args []string) int {
 				recordChange([]*[]string{&sessionChanges}, note)
 				if ntfyTopic != "" {
 					sendNotification(ntfyTopic, note)
+				}
+			}
+			return r, e, true
+		case "api_request":
+			if !apiCfg.enabled() {
+				return "", nil, false
+			}
+			r, e := toolAPIRequest(args, apiCfg)
+			// A mutating call (POST/PUT/PATCH/DELETE) is a side-effecting
+			// action like write_file/edit_file/scp_copy above, not a plain
+			// read - record it in the session change log and notify, the
+			// same way those tools do, so an end-of-session summary/ntfy
+			// push actually mentions "this session called an external API
+			// with a mutating method" rather than only ever mentioning
+			// local file changes.
+			if e == nil {
+				method, _ := args["method"].(string)
+				if isMutatingMethod(strings.ToUpper(strings.TrimSpace(method))) {
+					note := formatAPIRequestNotification(args)
+					recordChange([]*[]string{&sessionChanges}, note)
+					if ntfyTopic != "" {
+						sendNotification(ntfyTopic, note)
+					}
 				}
 			}
 			return r, e, true
@@ -2299,6 +2397,8 @@ func toolLoadTimingLabel(name string) (icon, label string) {
 		return "🌐", "โหลดข้อมูลภายนอก (network)"
 	case "scp_copy":
 		return "🌐", "โอนไฟล์ (scp/network)"
+	case "api_request":
+		return "🌐", "เรียก API (network)"
 	case "delay":
 		return "⏳", "หน่วงเวลาตามที่ขอ (delay)"
 	default:
@@ -4661,8 +4761,8 @@ var codingExtraTools = []ollamaTool{
 	},
 }
 
-func codingToolset(searchCfg searchConfig, skillsCfg skillsConfig) []ollamaTool {
-	all := make([]ollamaTool, 0, len(builtinTools)+len(codingExtraTools)+3)
+func codingToolset(searchCfg searchConfig, skillsCfg skillsConfig, apiCfg apiRequestConfig) []ollamaTool {
+	all := make([]ollamaTool, 0, len(builtinTools)+len(codingExtraTools)+4)
 	all = append(all, builtinTools...)
 	all = append(all, codingExtraTools...)
 	if searchCfg.searchEnabled() {
@@ -4670,6 +4770,9 @@ func codingToolset(searchCfg searchConfig, skillsCfg skillsConfig) []ollamaTool 
 	}
 	if searchCfg.fetchEnabled() {
 		all = append(all, webFetchTool)
+	}
+	if apiCfg.enabled() {
+		all = append(all, apiRequestTool)
 	}
 	if skillsCfg.enabled() {
 		all = append(all, readSkillTool)
@@ -5216,7 +5319,8 @@ type codingRunContext struct {
 	cmds      projectCommands // needed by mark_task_done's build-only light gate
 	searchCfg searchConfig    // web_search/web_fetch config, may be all-zero (disabled)
 	skillsCfg skillsConfig    // read_skill config, may be all-zero (disabled)
-	changes   []string        // recorded write/edit/task-done entries this session, for buildWorkSummary
+	apiCfg    apiRequestConfig // api_request config, may be all-zero (disabled)
+	changes   []string        // recorded write/edit/task-done/api-mutating entries this session, for buildWorkSummary
 }
 
 func dispatchCodingToolCall(tc toolCall, rc *codingRunContext) (result string, isReportComplete bool) {
@@ -5272,6 +5376,22 @@ func dispatchCodingToolCall(tc toolCall, rc *codingRunContext) (result string, i
 			}
 			r, e := toolReadSkill(args, rc.skillsCfg.Skills)
 			return r, e, true
+		case "api_request":
+			if !rc.apiCfg.enabled() {
+				return "", nil, false
+			}
+			r, e := toolAPIRequest(args, rc.apiCfg)
+			if e == nil {
+				method, _ := args["method"].(string)
+				if isMutatingMethod(strings.ToUpper(strings.TrimSpace(method))) {
+					note := formatAPIRequestNotification(args)
+					rc.changes = append(rc.changes, note)
+					if rc.ntfyTopic != "" {
+						sendNotification(rc.ntfyTopic, note)
+					}
+				}
+			}
+			return r, e, true
 		default:
 			return "", nil, false
 		}
@@ -5308,8 +5428,8 @@ func codingUsage(fs *flag.FlagSet) func() {
 		fmt.Println()
 		fmt.Println("Tool ที่เปิดใช้เสมอ (นอกเหนือจาก 8 ตัวของ ask): add_tasks, mark_task_done,")
 		fmt.Println("run_command (allowlisted ตาม toolchain ที่ตรวจพบ), report_complete")
-		fmt.Println("รวมถึง web_fetch (เปิดอัตโนมัติเสมอ), web_search และ read_skill แบบมีเงื่อนไข")
-		fmt.Println("(ดูหัวข้อ Web search และ Skills ด้านล่าง)")
+		fmt.Println("รวมถึง web_fetch (เปิดอัตโนมัติเสมอ), web_search, api_request และ read_skill แบบมีเงื่อนไข")
+		fmt.Println("(ดูหัวข้อ Web search, api_request และ Skills ใน 'ola ask -h' - กลไกเดียวกันทุกประการ)")
 		fmt.Println()
 		fmt.Println("mark_task_done มี build-only light gate ในตัว: ถ้าโปรเจกต์ build ไม่ผ่าน ola จะปฏิเสธ")
 		fmt.Println("ไม่ให้ปิด task นั้น (ป้อนผล build กลับให้โมเดลแก้ก่อน) เพื่อจับบั๊กตั้งแต่ task ที่ทำให้เกิด")
@@ -5358,7 +5478,11 @@ func codingUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  --search-timeout <sec>     override OLA_SEARCH_TIMEOUT_SEC")
 		fmt.Println("  --fetch-timeout <sec>      override OLA_FETCH_TIMEOUT_SEC")
 		fmt.Println("  --skills-dir <list>     override OLA_SKILLS_DIR - directory (หรือหลาย directory คั่นด้วย comma)")
-		fmt.Println("                          ที่เก็บ skill ต่างๆ เปิด tool 'read_skill' (ดูหัวข้อ Skills ด้านบน)")
+		fmt.Println("                          ที่เก็บ skill ต่างๆ เปิด tool 'read_skill' (ดูหัวข้อ Skills ใน 'ola ask -h')")
+		fmt.Println("  --api-endpoints <list>  override OLA_API_ENDPOINTS - เปิด tool 'api_request' (ดูหัวข้อ api_request ใน 'ola ask -h')")
+		fmt.Println("  --api-allow-direct-url  override OLA_API_ALLOW_DIRECT_URL - เปิดโหมดระบุ URL ตรงใน api_request")
+		fmt.Println("  --api-allow-mutating    override OLA_API_ALLOW_MUTATING - อนุญาต POST/PUT/PATCH/DELETE ใน api_request")
+		fmt.Println("  --api-timeout <sec>     override OLA_API_REQUEST_TIMEOUT_SEC")
 		fmt.Println("  -n, --dry-run           แสดง JSON payload ของ request รอบแรกโดยไม่เรียก API จริง")
 		fmt.Println("  -h, --help              แสดงข้อความนี้")
 		fmt.Println()
@@ -5368,6 +5492,7 @@ func codingUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  ola coding -f docs/requirements.md -x mytopic --max-duration 6h")
 		fmt.Println("  ola coding --build-cmd 'go build ./...' --test-cmd 'go test ./...' --allow golangci-lint")
 		fmt.Println("  ola coding --skills-dir /mnt/skills/public,/mnt/skills/private")
+		fmt.Println("  ola coding --api-endpoints 'ollama=http://localhost:11434'")
 	}
 }
 
@@ -5387,6 +5512,9 @@ func cmdCoding(args []string) int {
 	var flagNoWebSearch bool
 	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
 	var skillsDir string
+	var apiEndpoints string
+	var flagAPIAllowDirectURL, flagAPIAllowMutating bool
+	var apiTimeoutSec int
 
 	fs.StringVar(&model, "m", "", "")
 	fs.StringVar(&model, "model", "", "")
@@ -5420,6 +5548,10 @@ func cmdCoding(args []string) int {
 	fs.IntVar(&searchTimeoutSec, "search-timeout", 0, "")
 	fs.IntVar(&fetchTimeoutSec, "fetch-timeout", 0, "")
 	fs.StringVar(&skillsDir, "skills-dir", "", "")
+	fs.StringVar(&apiEndpoints, "api-endpoints", "", "")
+	fs.BoolVar(&flagAPIAllowDirectURL, "api-allow-direct-url", false, "")
+	fs.BoolVar(&flagAPIAllowMutating, "api-allow-mutating", false, "")
+	fs.IntVar(&apiTimeoutSec, "api-timeout", 0, "")
 	fs.BoolVar(&flagHelp, "h", false, "")
 	fs.BoolVar(&flagHelp, "help", false, "")
 
@@ -5540,6 +5672,15 @@ func cmdCoding(args []string) int {
 		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
 	}
 
+	// api_request stays opt-in, same principle as web_search/skills above -
+	// see the longer explanation in cmdAsk (main.go) and api_request.go's
+	// package doc comment. A bad individual endpoint entry is a warning,
+	// not fatal.
+	apiCfg, apiWarnings := resolveAPIRequestConfig(apiEndpoints, flagAPIAllowDirectURL, flagAPIAllowMutating, apiTimeoutSec, 0, 0)
+	for _, w := range apiWarnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
+
 	// Load or reset task state.
 	var state *codingState
 	if flagReplan {
@@ -5589,7 +5730,7 @@ func cmdCoding(args []string) int {
 		Model:   model,
 		Options: ollamaOptions{NumCtx: ctx},
 		Stream:  true,
-		Tools:   codingToolset(searchCfg, skillsCfg),
+		Tools:   codingToolset(searchCfg, skillsCfg, apiCfg),
 	}
 	if flagNoThink {
 		f := false
@@ -5623,6 +5764,12 @@ func cmdCoding(args []string) int {
 			fmt.Printf("── web_fetch: enabled (direct mode - plain HTTP, no external service, no JavaScript; concurrency %d) ──\n", searchCfg.FetchConcurrency)
 		} else {
 			fmt.Println("── web_fetch: disabled (--no-web-search was set) ──")
+		}
+		if apiCfg.enabled() {
+			fmt.Printf("── api_request: enabled (endpoints: %s, direct-url: %t, mutating: %t, timeout: %s) ──\n",
+				apiCfg.endpointList(), apiCfg.AllowDirectURL, apiCfg.AllowMutating, apiCfg.Timeout)
+		} else {
+			fmt.Println("── api_request: disabled (set OLA_API_ENDPOINTS/--api-endpoints or --api-allow-direct-url) ──")
 		}
 		if skillsCfg.enabled() {
 			names := make([]string, len(skillsCfg.Skills))
@@ -5670,6 +5817,12 @@ func cmdCoding(args []string) int {
 	} else {
 		fmt.Fprintln(outFile, "# web_fetch: disabled")
 	}
+	if apiCfg.enabled() {
+		fmt.Fprintf(outFile, "# api_request: enabled (endpoints: %s, direct-url: %t, mutating: %t, timeout: %s)\n",
+			apiCfg.endpointList(), apiCfg.AllowDirectURL, apiCfg.AllowMutating, apiCfg.Timeout)
+	} else {
+		fmt.Fprintln(outFile, "# api_request: disabled")
+	}
 	if skillsCfg.enabled() {
 		names := make([]string, len(skillsCfg.Skills))
 		for i, s := range skillsCfg.Skills {
@@ -5692,7 +5845,7 @@ func cmdCoding(args []string) int {
 	rc := &codingRunContext{
 		ntfyTopic: ntfyTopic, red: cRed, reset: cReset, outFile: outFile,
 		state: state, allowed: cmds.AllowBins, cmdTO: time.Duration(cmdTimeoutSec) * time.Second,
-		cmds: cmds, searchCfg: searchCfg, skillsCfg: skillsCfg,
+		cmds: cmds, searchCfg: searchCfg, skillsCfg: skillsCfg, apiCfg: apiCfg,
 	}
 
 	client := newHTTPClient()
