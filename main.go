@@ -79,6 +79,16 @@
 // looping back with the failure output otherwise. Task-checklist state is
 // persisted to disk so a killed/interrupted run can resume.
 //
+// Both subcommands can talk to either of two backends (see the
+// "OpenAI-compatible chat completions provider" section near the end of
+// this file for the full design rationale): Ollama's native /api/chat (the
+// default, unchanged from how ola has always worked) or any server that
+// speaks the OpenAI chat-completions wire format instead, selected with
+// -P/--provider openai or $OLA_PROVIDER=openai - everything above (tools,
+// system prompts, sandboxing, verify, quiet mode, notifications) behaves
+// identically either way; only the request/response shape on the wire
+// changes.
+//
 // There used to be a second subcommand ("extract") plus a text-marker
 // convention (<<<ooo FILENAME ooo>>> ... <<<xxx FILENAME xxx>>>) that let a
 // model "write files" by emitting specially tagged text that a human (or
@@ -130,6 +140,15 @@
 //	OLA_OLLAMA_API_KEY      Bearer token (enabled with -k)
 //	OLA_OLLAMA_MODEL        Model to use (override with -m) [required unless -m is set]
 //	OLA_OLLAMA_CONTEXT_SIZE Default num_ctx (override with -c, default: 16384)
+//	OLA_PROVIDER            "ollama" (default) or "openai" (override with -P/--provider) -
+//	                        see the "OpenAI-compatible chat completions provider" section
+//	                        near the end of this file. The three OLA_OLLAMA_* vars above
+//	                        only apply when provider is "ollama"; when it's "openai" the
+//	                        equivalent settings are OLA_OPENAI_API_BASE (default:
+//	                        http://localhost:11434/v1 - Ollama's own OpenAI-compatible
+//	                        endpoint), OLA_OPENAI_API_KEY, and OLA_OPENAI_MODEL instead.
+//	                        --api-base overrides whichever of the two *_API_BASE vars
+//	                        applies to the active provider.
 //	OLA_OUTPUT_FILE         Default output file (override with -o, default: output.txt)
 //	OLA_TOPIC               ntfy.sh topic for notifications (override with -x)
 //	OLA_SKILLS_DIR          Comma-separated skill directories (override with --skills-dir);
@@ -493,6 +512,17 @@ type toolCallFunction struct {
 }
 
 type toolCall struct {
+	// ID identifies one specific call within a turn that made several -
+	// Ollama's native wire format has never required this (its tool
+	// messages are matched back up by Name alone), but an OpenAI-compatible
+	// backend does require it (see the "OpenAI-compatible provider" section
+	// near the end of this file): a turn with two tool_calls to the same
+	// tool needs something more specific than the tool's name to say which
+	// result answers which call. Left empty and never sent for Ollama;
+	// populated from the stream (or synthesized as "call_<n>" if a
+	// non-conformant server omits it) when running against an
+	// OpenAI-compatible endpoint.
+	ID       string           `json:"id,omitempty"`
 	Function toolCallFunction `json:"function"`
 }
 
@@ -503,6 +533,13 @@ type ollamaMessage struct {
 	Images    []string   `json:"images,omitempty"`
 	ToolCalls []toolCall `json:"tool_calls,omitempty"`
 	Name      string     `json:"name,omitempty"` // set on role:"tool" messages to the tool's name
+	// ToolCallID is the OpenAI-compatible counterpart to Name above, set on
+	// role:"tool" messages so an OpenAI-compatible backend can match the
+	// result back up to the specific tool_calls[i] it answers (see the ID
+	// field on toolCall). json:"-" because this is never part of Ollama's
+	// own wire format - it only exists to be read back out by
+	// toOpenAIMessage when the active provider is "openai".
+	ToolCallID string `json:"-"`
 }
 
 type ollamaOptions struct {
@@ -911,10 +948,17 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("answer (ตัวหนา/ปกติ) ชัดเจน")
 		fmt.Println()
 		fmt.Println("Environment variables:")
-		fmt.Println("  OLA_OLLAMA_API_BASE       Host (default: http://localhost:11434)")
-		fmt.Println("  OLA_OLLAMA_API_KEY        Bearer token (เปิดใช้ด้วย -k)")
-		fmt.Println("  OLA_OLLAMA_MODEL          โมเดลที่จะใช้ (override ด้วย -m) [จำเป็น ถ้าไม่ใช้ -m]")
-		fmt.Println("  OLA_OLLAMA_CONTEXT_SIZE   num_ctx เริ่มต้น (override ด้วย -c, default: 16384)")
+		fmt.Println("  OLA_PROVIDER              \"ollama\" (default) หรือ \"openai\" (override ด้วย -P/--provider) - เลือก backend ที่จะคุยด้วย")
+		fmt.Println("                            ดูหัวข้อ Provider ด้านล่างสำหรับรายละเอียดเต็ม")
+		fmt.Println("  OLA_OLLAMA_API_BASE       Host (default: http://localhost:11434) - ใช้เมื่อ provider เป็น \"ollama\" เท่านั้น")
+		fmt.Println("  OLA_OLLAMA_API_KEY        Bearer token (เปิดใช้ด้วย -k) - ใช้เมื่อ provider เป็น \"ollama\" เท่านั้น")
+		fmt.Println("  OLA_OLLAMA_MODEL          โมเดลที่จะใช้ (override ด้วย -m) [จำเป็น ถ้าไม่ใช้ -m] - ใช้เมื่อ provider เป็น \"ollama\" เท่านั้น")
+		fmt.Println("  OLA_OPENAI_API_BASE       Host (default: http://localhost:11434/v1 - endpoint OpenAI-compatible ของ Ollama เอง)")
+		fmt.Println("                            ใช้เมื่อ provider เป็น \"openai\" เท่านั้น (override ด้วย --api-base เหมือน OLA_OLLAMA_API_BASE)")
+		fmt.Println("  OLA_OPENAI_API_KEY        Bearer token (เปิดใช้ด้วย -k) - ใช้เมื่อ provider เป็น \"openai\" เท่านั้น")
+		fmt.Println("  OLA_OPENAI_MODEL          โมเดลที่จะใช้ (override ด้วย -m) - ใช้เมื่อ provider เป็น \"openai\" เท่านั้น")
+		fmt.Println("  OLA_OLLAMA_CONTEXT_SIZE   num_ctx เริ่มต้น (override ด้วย -c, default: 16384) - เฉพาะ provider \"ollama\"")
+		fmt.Println("                            (ไม่มี field เทียบเท่าใน OpenAI-compatible API เลย - provider \"openai\" จะไม่ส่ง field นี้ไปเลย)")
 		fmt.Println("  OLA_OUTPUT_FILE           ไฟล์ output เริ่มต้น (override ด้วย -o, default: output.txt)")
 		fmt.Println("  OLA_TOPIC                 topic สำหรับส่ง notification ไป ntfy.sh (override ด้วย -x)")
 		fmt.Println("  OLA_QUIET                 เปิด quiet mode (override ด้วย -q/--quiet, default: ปิด) - ดูหัวข้อ Quiet mode ด้านบน")
@@ -946,10 +990,28 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  OLA_API_ALLOW_MUTATING    อนุญาต method POST/PUT/PATCH/DELETE (override ด้วย --api-allow-mutating, default: ปิด)")
 		fmt.Println("  OLA_API_REQUEST_TIMEOUT_SEC  timeout ต่อการเรียก API หนึ่งครั้ง วินาที (override ด้วย --api-timeout, default: 30)")
 		fmt.Println()
+		fmt.Println("Provider (เลือก backend ด้วย -P/--provider หรือ $OLA_PROVIDER, default: \"ollama\"):")
+		fmt.Println("  \"ollama\" (default) - พฤติกรรมเดิมของ ola ทุกอย่าง ไม่มีอะไรเปลี่ยน: คุยกับ Ollama's native")
+		fmt.Println("  /api/chat โดยตรง")
+		fmt.Println("  \"openai\" - คุยกับ endpoint ใดก็ได้ที่พูด OpenAI chat-completions wire format แทน (ยิงไปที่")
+		fmt.Println("  <host>/chat/completions) - ใช้ได้ทั้ง OpenAI จริง, llama.cpp server, vLLM, LM Studio,")
+		fmt.Println("  text-generation-webui, หรือ endpoint /v1 ในตัวของ Ollama เอง (default host เมื่อไม่ตั้ง")
+		fmt.Println("  --api-base/OLA_OPENAI_API_BASE คือ http://localhost:11434/v1 - ชี้เข้า Ollama ที่รันอยู่")
+		fmt.Println("  แล้วนั่นเอง จึงลองสลับ provider ได้ทันทีโดยไม่ต้องตั้งค่าอะไรเพิ่ม)")
+		fmt.Println("  tool/system-prompt/sandboxing/verify/quiet-mode/notification ทั้งหมดทำงานเหมือนกันทุก")
+		fmt.Println("  ประการไม่ว่าจะใช้ provider ไหน - เปลี่ยนแค่รูปแบบ request/response บน wire เท่านั้น")
+		fmt.Println("  ข้อจำกัดที่รู้อยู่แล้ว 2 อย่าง: (1) num_ctx ไม่ถูกส่งเลยเมื่อใช้ \"openai\" เพราะไม่มี field")
+		fmt.Println("  มาตรฐานที่เทียบเท่ากันใน OpenAI wire format (การตั้ง context size เป็นเรื่องฝั่ง")
+		fmt.Println("  server/model config ไม่ใช่ per-request), (2) -T/--no-think ไม่มีผลใดๆ เมื่อใช้ \"openai\"")
+		fmt.Println("  เพราะไม่มี field มาตรฐานกลางสำหรับปิด reasoning ใน OpenAI-compatible API (ต่างกันไปตาม")
+		fmt.Println("  backend) - ola จะแสดง warning แทนที่จะทำเนียนว่าปิดได้")
+		fmt.Println()
 		fmt.Println("Options: (ต้องระบุก่อน <prompt> เสมอ ทั้งหมดรองรับทั้งรูปแบบสั้น -x และยาว --xxx)")
-		fmt.Println("  -m, --model <n>      โมเดลที่ใช้ [จำเป็น ถ้าไม่ตั้ง $OLA_OLLAMA_MODEL]")
-		fmt.Println("  -c, --ctx <num>      ตั้ง num_ctx ต่อ request ต้องเป็นจำนวนเต็มไม่ติดลบ (default: $OLA_OLLAMA_CONTEXT_SIZE หรือ 16384)")
-		fmt.Println("  -k, --key            ส่ง Authorization: Bearer $OLA_OLLAMA_API_KEY (error ถ้าตั้ง -k แต่ไม่มีค่าตัวแปรนี้)")
+		fmt.Println("  -m, --model <n>      โมเดลที่ใช้ [จำเป็น ถ้าไม่ตั้ง $OLA_OLLAMA_MODEL หรือ $OLA_OPENAI_MODEL แล้วแต่ provider]")
+		fmt.Println("  -c, --ctx <num>      ตั้ง num_ctx ต่อ request ต้องเป็นจำนวนเต็มไม่ติดลบ (default: $OLA_OLLAMA_CONTEXT_SIZE หรือ 16384; ไม่มีผลเมื่อ provider เป็น openai)")
+		fmt.Println("  -k, --key            ส่ง Authorization: Bearer $OLA_OLLAMA_API_KEY หรือ $OLA_OPENAI_API_KEY แล้วแต่ provider (error ถ้าตั้ง -k แต่ไม่มีค่าตัวแปรนี้)")
+		fmt.Println("  -P, --provider <p>   \"ollama\" (default) หรือ \"openai\" (override $OLA_PROVIDER) - ดูหัวข้อ Provider ด้านบน")
+		fmt.Println("      --api-base <url> override host ของ provider ที่เลือกอยู่ (OLA_OLLAMA_API_BASE หรือ OLA_OPENAI_API_BASE แล้วแต่กรณี)")
 		fmt.Println("  -T, --no-think       ปิด thinking mode โดยส่ง \"think\": false ไปใน request (default: ไม่ส่ง field นี้ ให้ Ollama ตัดสินใจเอง)")
 		fmt.Println("  -x, --topic <topic>  ส่ง notification ไป ntfy.sh ด้วย topic นี้ ทั้งตอนงานเสร็จ และระหว่างทางเมื่อมีการ")
 		fmt.Println("                       เขียน/แก้ไฟล์ หรือเมื่อโมเดลเรียก ask_user (override $OLA_TOPIC)")
@@ -1053,6 +1115,7 @@ func cmdAsk(args []string) int {
 	var apiTimeoutSec int
 	var scpTimeoutSec int
 	var scpMaxBytes int64
+	var providerFlag, apiBaseFlag string
 
 	fs.StringVar(&model, "m", "", "")
 	fs.StringVar(&model, "model", "", "")
@@ -1060,6 +1123,9 @@ func cmdAsk(args []string) int {
 	fs.StringVar(&ctxStr, "ctx", "", "")
 	fs.BoolVar(&flagKey, "k", false, "")
 	fs.BoolVar(&flagKey, "key", false, "")
+	fs.StringVar(&providerFlag, "P", "", "")
+	fs.StringVar(&providerFlag, "provider", "", "")
+	fs.StringVar(&apiBaseFlag, "api-base", "", "")
 	fs.BoolVar(&flagNoThink, "T", false, "")
 	fs.BoolVar(&flagNoThink, "no-think", false, "")
 	fs.BoolVar(&flagRaw, "r", false, "")
@@ -1128,30 +1194,17 @@ func cmdAsk(args []string) int {
 	// before quietMode takes effect.
 	quietMode = flagQuiet || envBool("OLA_QUIET")
 
-	// Host + Auth
-	host := os.Getenv("OLA_OLLAMA_API_BASE")
-	if host == "" {
-		host = "http://localhost:11434"
-	}
-	host = strings.TrimRight(host, "/")
-
-	var apiKey string
-	if flagKey {
-		apiKey = os.Getenv("OLA_OLLAMA_API_KEY")
-		if apiKey == "" {
-			fmt.Fprintln(os.Stderr, "error: -k ระบุไว้ แต่ OLA_OLLAMA_API_KEY ไม่ได้ตั้งหรือว่างเปล่า")
-			return 1
-		}
-	}
-
-	// Model
-	if model == "" {
-		model = os.Getenv("OLA_OLLAMA_MODEL")
-	}
-	if model == "" {
-		fmt.Fprintln(os.Stderr, "error: ต้องระบุโมเดลผ่าน -m/--model หรือตั้งค่าตัวแปร OLA_OLLAMA_MODEL")
+	// Provider + Host + Auth + Model - see resolveProviderConfig ("Section:
+	// OpenAI-compatible chat completions provider" near the end of this
+	// file) for the flag > env > default precedence and per-provider env
+	// var namespace (OLA_OLLAMA_* vs OLA_OPENAI_*).
+	pcfg, err0 := resolveProviderConfig(providerFlag, apiBaseFlag, model, flagKey)
+	if err0 != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err0)
 		return 1
 	}
+	host, apiKey, model := pcfg.Host, pcfg.APIKey, pcfg.Model
+	warnIfNoThinkUnsupported(pcfg.Provider, flagNoThink)
 
 	// Context size
 	if ctxStr == "" {
@@ -1438,12 +1491,12 @@ func cmdAsk(args []string) int {
 	// Dry-run: show only the first-round payload, never calls the API.
 	if flagDryRun {
 		req.Messages = messages
-		payload, err := json.Marshal(req)
+		payload, err := marshalDryRunPayload(pcfg.Provider, req)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: สร้าง JSON payload ไม่ได้: %v\n", err)
 			return 1
 		}
-		fmt.Printf("── POST %s/api/chat ──\n", host)
+		fmt.Printf("── POST %s%s (provider: %s) ──\n", host, chatCompletionsPathHint(pcfg.Provider), pcfg.Provider)
 		if flagKey {
 			fmt.Printf("── Header: Authorization: Bearer %s ──\n", maskKey(apiKey))
 		}
@@ -1515,6 +1568,7 @@ func cmdAsk(args []string) int {
 	defer outFile.Close()
 
 	fmt.Fprintf(outFile, "# ola-ask %s\n", time.Now().Format("2006-01-02T15:04:05Z07:00"))
+	fmt.Fprintf(outFile, "# provider: %s\n", pcfg.Provider)
 	fmt.Fprintf(outFile, "# host: %s\n", host)
 	fmt.Fprintf(outFile, "# model: %s\n", model)
 	fmt.Fprintf(outFile, "# num_ctx: %d\n", ctx)
@@ -1703,43 +1757,18 @@ func cmdAsk(args []string) int {
 		}
 
 		req.Messages = messages
-		payload, err := json.Marshal(req)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: สร้าง JSON payload ไม่ได้: %v\n", err)
+		outcome, statusCode, reqErr := doChatRound(client, pcfg, req, outFile, cCyan, cBold, cDim, cReset)
+		if reqErr != nil {
+			fmt.Fprintf(os.Stderr, "error: เรียก API ไม่สำเร็จ: %v\n", reqErr)
 			if ntfyTopic != "" {
-				sendNotification(ntfyTopic, fmt.Sprintf("Work Failed: %s", err.Error()))
+				sendNotification(ntfyTopic, fmt.Sprintf("Work Failed: %s", reqErr.Error()))
 			}
 			return 1
 		}
-
-		httpReq, err := http.NewRequest(http.MethodPost, host+"/api/chat", strings.NewReader(string(payload)))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: สร้าง HTTP request ไม่ได้: %v\n", err)
-			if ntfyTopic != "" {
-				sendNotification(ntfyTopic, fmt.Sprintf("Work Failed: %s", err.Error()))
-			}
-			return 1
-		}
-		httpReq.Header.Set("Content-Type", "application/json")
-		if flagKey {
-			httpReq.Header.Set("Authorization", "Bearer "+apiKey)
-		}
-
-		resp, err := client.Do(httpReq)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: เรียก API ไม่สำเร็จ: %v\n", err)
-			if ntfyTopic != "" {
-				sendNotification(ntfyTopic, fmt.Sprintf("Work Failed: %s", err.Error()))
-			}
-			return 1
-		}
-
-		outcome := streamResponse(resp.Body, outFile, cCyan, cBold, cDim, cReset)
-		resp.Body.Close()
-		lastStatusCode = resp.StatusCode
+		lastStatusCode = statusCode
 		lastAnswer = outcome.Content
 
-		if resp.StatusCode >= 400 {
+		if statusCode >= 400 {
 			break
 		}
 
@@ -1762,10 +1791,7 @@ func cmdAsk(args []string) int {
 				qprintf("%s✗ verify ไม่ผ่าน (ลองแก้ครั้งที่ %d/%d) - ป้อนผลลัพธ์กลับให้โมเดลแก้ต่อ%s\n", cRed, verifyRounds, maxAskVerifyRounds, cReset)
 				messages = append(messages,
 					ollamaMessage{Role: "assistant", Content: outcome.Content, Thinking: outcome.Thinking},
-					ollamaMessage{
-						Role: "tool", Name: "verify",
-						Content: "VERIFY FAILED - ola ได้รัน build/test ของโปรเจกต์เอง (ไม่เชื่อคำตอบก่อนหน้าเพียงอย่างเดียว) หลังจากที่มีการแก้ไขไฟล์ในเซสชันนี้ แล้วยังไม่ผ่าน:\n" + report,
-					},
+					verifyFeedbackMessage(pcfg.Provider, "VERIFY FAILED - ola ได้รัน build/test ของโปรเจกต์เอง (ไม่เชื่อคำตอบก่อนหน้าเพียงอย่างเดียว) หลังจากที่มีการแก้ไขไฟล์ในเซสชันนี้ แล้วยังไม่ผ่าน:\n"+report),
 				)
 				continue
 			}
@@ -1798,9 +1824,10 @@ func cmdAsk(args []string) int {
 				}
 			}
 			messages = append(messages, ollamaMessage{
-				Role:    "tool",
-				Content: result,
-				Name:    tc.Function.Name,
+				Role:       "tool",
+				Content:    result,
+				Name:       tc.Function.Name,
+				ToolCallID: tc.ID,
 			})
 		}
 	}
@@ -5590,13 +5617,16 @@ func codingUsage(fs *flag.FlagSet) func() {
 		fmt.Println("session ที่รันแบบไม่มีคนเฝ้า เพราะโมเดลสามารถดึง best-practice ของงานเฉพาะทางมาใช้เองได้")
 		fmt.Println("โดยไม่ต้องมีคนป้อนให้ทีละครั้ง")
 		fmt.Println()
-		fmt.Println("Environment variables: เหมือนกับ ola ask ทั้งหมด (ดู 'ola ask -h')")
+		fmt.Println("Environment variables: เหมือนกับ ola ask ทั้งหมด รวมถึง OLA_PROVIDER/OLA_OPENAI_API_BASE/")
+		fmt.Println("OLA_OPENAI_API_KEY/OLA_OPENAI_MODEL สำหรับ --provider openai (ดู 'ola ask -h' หัวข้อ Provider)")
 		fmt.Println()
 		fmt.Println("Options: (ทั้งหมดรองรับทั้งรูปแบบสั้น -x และยาว --xxx)")
-		fmt.Println("  -m, --model <n>         โมเดลที่ใช้ [จำเป็น ถ้าไม่ตั้ง $OLA_OLLAMA_MODEL]")
-		fmt.Println("  -c, --ctx <num>         num_ctx ต่อ request (default: $OLA_OLLAMA_CONTEXT_SIZE หรือ 16384)")
-		fmt.Println("  -k, --key               ส่ง Authorization: Bearer $OLA_OLLAMA_API_KEY")
-		fmt.Println("  -T, --no-think          ปิด thinking mode")
+		fmt.Println("  -m, --model <n>         โมเดลที่ใช้ [จำเป็น ถ้าไม่ตั้ง $OLA_OLLAMA_MODEL หรือ $OLA_OPENAI_MODEL แล้วแต่ provider]")
+		fmt.Println("  -c, --ctx <num>         num_ctx ต่อ request (default: $OLA_OLLAMA_CONTEXT_SIZE หรือ 16384; ไม่มีผลเมื่อ provider เป็น openai)")
+		fmt.Println("  -k, --key               ส่ง Authorization: Bearer $OLA_OLLAMA_API_KEY หรือ $OLA_OPENAI_API_KEY แล้วแต่ provider")
+		fmt.Println("  -P, --provider <p>      \"ollama\" (default) หรือ \"openai\" (override $OLA_PROVIDER) - ดู 'ola ask -h' หัวข้อ Provider")
+		fmt.Println("      --api-base <url>    override host ของ provider ที่เลือกอยู่")
+		fmt.Println("  -T, --no-think          ปิด thinking mode (ไม่มีผลเมื่อ provider เป็น openai - ดู 'ola ask -h' หัวข้อ Provider)")
 		fmt.Println("  -x, --topic <topic>     ส่ง notification ไป ntfy.sh (override $OLA_TOPIC)")
 		fmt.Println("  -o, --output <file>     บันทึก log ลงไฟล์ (default: $OLA_OUTPUT_FILE หรือ output.txt)")
 		fmt.Println("  -q, --quiet             Quiet mode: terminal เหลือแค่ answer/ask_user, notification เหลือแค่")
@@ -5656,6 +5686,7 @@ func cmdCoding(args []string) int {
 	var apiEndpoints string
 	var flagAPIAllowDirectURL, flagAPIAllowMutating bool
 	var apiTimeoutSec int
+	var providerFlag, apiBaseFlag string
 
 	fs.StringVar(&model, "m", "", "")
 	fs.StringVar(&model, "model", "", "")
@@ -5663,6 +5694,9 @@ func cmdCoding(args []string) int {
 	fs.StringVar(&ctxStr, "ctx", "", "")
 	fs.BoolVar(&flagKey, "k", false, "")
 	fs.BoolVar(&flagKey, "key", false, "")
+	fs.StringVar(&providerFlag, "P", "", "")
+	fs.StringVar(&providerFlag, "provider", "", "")
+	fs.StringVar(&apiBaseFlag, "api-base", "", "")
 	fs.BoolVar(&flagNoThink, "T", false, "")
 	fs.BoolVar(&flagNoThink, "no-think", false, "")
 	fs.BoolVar(&flagDryRun, "n", false, "")
@@ -5721,28 +5755,13 @@ func cmdCoding(args []string) int {
 	// requirements-file/directory-tree load-timing lines).
 	quietMode = flagQuiet || envBool("OLA_QUIET")
 
-	host := os.Getenv("OLA_OLLAMA_API_BASE")
-	if host == "" {
-		host = "http://localhost:11434"
-	}
-	host = strings.TrimRight(host, "/")
-
-	var apiKey string
-	if flagKey {
-		apiKey = os.Getenv("OLA_OLLAMA_API_KEY")
-		if apiKey == "" {
-			fmt.Fprintln(os.Stderr, "error: -k ระบุไว้ แต่ OLA_OLLAMA_API_KEY ไม่ได้ตั้งหรือว่างเปล่า")
-			return 1
-		}
-	}
-
-	if model == "" {
-		model = os.Getenv("OLA_OLLAMA_MODEL")
-	}
-	if model == "" {
-		fmt.Fprintln(os.Stderr, "error: ต้องระบุโมเดลผ่าน -m/--model หรือตั้งค่าตัวแปร OLA_OLLAMA_MODEL")
+	pcfg, err0 := resolveProviderConfig(providerFlag, apiBaseFlag, model, flagKey)
+	if err0 != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err0)
 		return 1
 	}
+	host, apiKey, model := pcfg.Host, pcfg.APIKey, pcfg.Model
+	warnIfNoThinkUnsupported(pcfg.Provider, flagNoThink)
 
 	if ctxStr == "" {
 		ctxStr = os.Getenv("OLA_OLLAMA_CONTEXT_SIZE")
@@ -5887,12 +5906,15 @@ func cmdCoding(args []string) int {
 
 	if flagDryRun {
 		req.Messages = messages
-		payload, err := json.Marshal(req)
+		payload, err := marshalDryRunPayload(pcfg.Provider, req)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: สร้าง JSON payload ไม่ได้: %v\n", err)
 			return 1
 		}
-		fmt.Printf("── POST %s/api/chat ──\n", host)
+		fmt.Printf("── POST %s%s (provider: %s) ──\n", host, chatCompletionsPathHint(pcfg.Provider), pcfg.Provider)
+		if flagKey {
+			fmt.Printf("── Header: Authorization: Bearer %s ──\n", maskKey(apiKey))
+		}
 		fmt.Println("── System prompt (coding mode, built-in, fixed - plus AVAILABLE SKILLS below if any skills were loaded) ──")
 		fmt.Println(systemPrompt)
 		fmt.Println("── End system prompt ──")
@@ -5953,6 +5975,7 @@ func cmdCoding(args []string) int {
 	defer outFile.Close()
 
 	fmt.Fprintf(outFile, "# ola-coding %s\n", time.Now().Format("2006-01-02T15:04:05Z07:00"))
+	fmt.Fprintf(outFile, "# provider: %s\n", pcfg.Provider)
 	fmt.Fprintf(outFile, "# host: %s\n# model: %s\n# num_ctx: %d\n", host, model, ctx)
 	fmt.Fprintf(outFile, "# cwd (sandbox root): %s\n# requirements: %s\n", cwd, reqFile)
 	fmt.Fprintf(outFile, "# detected toolchain: %s (build: %q test: %q)\n", cmds.Label, cmds.BuildCmd, cmds.TestCmd)
@@ -6027,7 +6050,7 @@ func cmdCoding(args []string) int {
 		}
 
 		req.Messages = messages
-		resp, reqErr := postChatRequest(client, host, apiKey, flagKey, req)
+		outcome, statusCode, reqErr := doChatRound(client, pcfg, req, outFile, cCyan, cBold, cDim, cReset)
 		if reqErr != nil {
 			fmt.Fprintf(os.Stderr, "error: เรียก API ไม่สำเร็จ: %v\n", reqErr)
 			if ntfyTopic != "" {
@@ -6035,11 +6058,9 @@ func cmdCoding(args []string) int {
 			}
 			return 1
 		}
-		outcome := streamResponse(resp.Body, outFile, cCyan, cBold, cDim, cReset)
-		resp.Body.Close()
-		lastStatusCode = resp.StatusCode
+		lastStatusCode = statusCode
 		lastAnswer = outcome.Content
-		if resp.StatusCode >= 400 {
+		if statusCode >= 400 {
 			break
 		}
 
@@ -6060,7 +6081,7 @@ func cmdCoding(args []string) int {
 		var reportSummary string
 		for _, tc := range outcome.ToolCalls {
 			result, isReport := dispatchCodingToolCall(tc, rc)
-			messages = append(messages, ollamaMessage{Role: "tool", Content: result, Name: tc.Function.Name})
+			messages = append(messages, ollamaMessage{Role: "tool", Content: result, Name: tc.Function.Name, ToolCallID: tc.ID})
 			if isReport {
 				verifyRequested = true
 				var args map[string]interface{}
@@ -6085,10 +6106,8 @@ func cmdCoding(args []string) int {
 				break
 			}
 			qprintf("%s✗ verify ไม่ผ่าน - ป้อนผลลัพธ์กลับให้โมเดลแก้ต่อ%s\n", cRed, cReset)
-			messages = append(messages, ollamaMessage{
-				Role: "tool", Name: "verify",
-				Content: "VERIFY FAILED - report_complete ถูกปฏิเสธเพราะ build/test ของโปรเจกต์ยังไม่ผ่านจริง:\n" + report,
-			})
+			messages = append(messages, verifyFeedbackMessage(pcfg.Provider,
+				"VERIFY FAILED - report_complete ถูกปฏิเสธเพราะ build/test ของโปรเจกต์ยังไม่ผ่านจริง:\n"+report))
 		}
 
 		if iteration%compactEveryNRounds == 0 {
@@ -6889,4 +6908,650 @@ func stringMapArg(v interface{}) map[string]string {
 		}
 	}
 	return out
+}
+
+// ======================================================================
+// Section: OpenAI-compatible chat completions provider
+// ======================================================================
+// ola talked exclusively to Ollama's native /api/chat endpoint (see the
+// package doc comment) until this section was added. This section lets
+// both "ask" and "coding" instead talk to any server that speaks the
+// OpenAI chat-completions wire format - OpenAI itself, but just as much
+// the point: every local/self-hosted option that already speaks that same
+// dialect (llama.cpp's server, vLLM, LM Studio, text-generation-webui,
+// and - most relevantly for a box already running Ollama - Ollama's own
+// built-in /v1 endpoint, so switching --provider openai against a stock
+// local Ollama install needs zero extra configuration beyond the flag
+// itself: see defaultOpenAICompatBase below).
+//
+// Design principles:
+//
+//  1. ollamaRequest/ollamaMessage/toolCall (see near the top of this file)
+//     remain ola's ONE internal representation of a conversation,
+//     regardless of which backend is actually being talked to. Every
+//     other piece of ola - system prompts, tool schemas, the tool-calling
+//     loops in cmdAsk/cmdCoding, dispatchToolCall/dispatchCodingToolCall -
+//     is written against that representation and stays completely
+//     untouched by this section. Only the "send this, then parse whatever
+//     streams back" boundary (doChatRound below) knows two wire formats
+//     exist; nothing upstream of it needs to.
+//  2. Provider selection is opt-in and additive: the default
+//     ("ollama") reproduces ola's original behavior byte-for-byte
+//     (same endpoint path, same request/response shape, same env vars) -
+//     see resolveProviderConfig. Nothing about an existing Ollama-only
+//     setup changes unless --provider/OLA_PROVIDER is actually set to
+//     "openai".
+//  3. Capability gaps are surfaced honestly rather than silently
+//     papered over. Two concrete examples: num_ctx (Ollama's per-request
+//     context-size override) has no standard equivalent in the OpenAI
+//     wire format, so it is simply not sent - context sizing is a
+//     server/model-config concern on that side, not a per-request one -
+//     and --no-think (Ollama's "think": false) has no single standard
+//     equivalent across OpenAI-compatible reasoning backends either (some
+//     accept a "reasoning_effort" field, most don't support disabling
+//     reasoning via the API at all), so ola prints a one-time warning
+//     instead of pretending the flag did something it didn't (see
+//     cmdAsk/cmdCoding's use of warnIfNoThinkUnsupported below).
+//
+// Environment variables (see resolveProviderConfig; override precedence
+// is the same flag > env > default every other ola setting uses):
+//
+//	OLA_PROVIDER          "ollama" (default) or "openai" - override with -P/--provider
+//	OLA_OPENAI_API_BASE   Host, used only when provider is "openai" (default:
+//	                      http://localhost:11434/v1 - Ollama's own OpenAI-
+//	                      compatible endpoint) - override with --api-base
+//	OLA_OPENAI_API_KEY    Bearer token for the "openai" provider, sent only
+//	                      when -k/--key is set (same -k semantics as Ollama's
+//	                      OLA_OLLAMA_API_KEY: error if -k is set but this is empty)
+//	OLA_OPENAI_MODEL      Model name for the "openai" provider - override with -m/--model
+//
+// --api-base, when set, overrides whichever of OLA_OLLAMA_API_BASE/
+// OLA_OPENAI_API_BASE applies to the active provider - it is a single
+// generic flag rather than one per provider since only one provider is
+// ever active in a given run.
+
+// llmProvider is which chat-completions wire format a session speaks.
+type llmProvider string
+
+const (
+	providerOllama llmProvider = "ollama"
+	providerOpenAI llmProvider = "openai"
+)
+
+// defaultOpenAICompatBase deliberately points at Ollama's own OpenAI-
+// compatible endpoint rather than api.openai.com - ola's default target
+// environment has always been a local Ollama install (see the package doc
+// comment/OLA_OLLAMA_API_BASE's own default), so --provider openai with
+// no further configuration should "just work" against the same local
+// server ola already talks to natively, letting someone compare the two
+// code paths against literally the same running model. Pointing at a
+// real hosted OpenAI-compatible service is one --api-base/OLA_OPENAI_API_BASE
+// away.
+const defaultOpenAICompatBase = "http://localhost:11434/v1"
+
+// resolveProvider applies flag > env > default to pick the active
+// provider, rejecting anything other than the two known values outright
+// rather than silently falling back to "ollama" - a typo here should be a
+// loud startup error, not a session that quietly talks to the wrong API.
+func resolveProvider(flagVal string) (llmProvider, error) {
+	v := strings.TrimSpace(flagVal)
+	if v == "" {
+		v = strings.TrimSpace(os.Getenv("OLA_PROVIDER"))
+	}
+	if v == "" {
+		return providerOllama, nil
+	}
+	switch llmProvider(strings.ToLower(v)) {
+	case providerOllama:
+		return providerOllama, nil
+	case providerOpenAI:
+		return providerOpenAI, nil
+	default:
+		return "", fmt.Errorf("-P/--provider หรือ OLA_PROVIDER ไม่รู้จัก: %q (รองรับเฉพาะ \"ollama\" หรือ \"openai\")", v)
+	}
+}
+
+// providerConfig bundles everything cmdAsk/cmdCoding need to know about
+// which backend a session talks to and how - see resolveProviderConfig.
+type providerConfig struct {
+	Provider llmProvider
+	Host     string
+	APIKey   string
+	UseKey   bool
+	Model    string
+}
+
+// resolveProviderConfig replaces what used to be an identical block of
+// host/apiKey/model resolution independently copy-pasted into cmdAsk and
+// cmdCoding (compare against this function's git history if that block
+// still exists elsewhere - it should not once both call sites use this).
+// Each setting still follows the same flag > env > default precedence
+// used throughout ola, just parameterized by provider so "ollama" behaves
+// exactly as it always has and "openai" gets its own env var namespace
+// (OLA_OPENAI_*) instead of silently reusing Ollama's.
+func resolveProviderConfig(providerFlag, hostFlag, modelFlag string, flagKey bool) (providerConfig, error) {
+	provider, err := resolveProvider(providerFlag)
+	if err != nil {
+		return providerConfig{}, err
+	}
+
+	var keyEnv, modelEnv, defaultHost, hostEnv string
+	switch provider {
+	case providerOpenAI:
+		keyEnv, modelEnv, defaultHost, hostEnv = "OLA_OPENAI_API_KEY", "OLA_OPENAI_MODEL", defaultOpenAICompatBase, "OLA_OPENAI_API_BASE"
+	default:
+		keyEnv, modelEnv, defaultHost, hostEnv = "OLA_OLLAMA_API_KEY", "OLA_OLLAMA_MODEL", "http://localhost:11434", "OLA_OLLAMA_API_BASE"
+	}
+
+	host := hostFlag
+	if host == "" {
+		host = os.Getenv(hostEnv)
+	}
+	if host == "" {
+		host = defaultHost
+	}
+	host = strings.TrimRight(host, "/")
+
+	var apiKey string
+	if flagKey {
+		apiKey = os.Getenv(keyEnv)
+		if apiKey == "" {
+			return providerConfig{}, fmt.Errorf("-k ระบุไว้ แต่ %s ไม่ได้ตั้งหรือว่างเปล่า", keyEnv)
+		}
+	}
+
+	model := modelFlag
+	if model == "" {
+		model = os.Getenv(modelEnv)
+	}
+	if model == "" {
+		return providerConfig{}, fmt.Errorf("ต้องระบุโมเดลผ่าน -m/--model หรือตั้งค่าตัวแปร %s", modelEnv)
+	}
+
+	return providerConfig{Provider: provider, Host: host, APIKey: apiKey, UseKey: flagKey, Model: model}, nil
+}
+
+// warnIfNoThinkUnsupported prints a one-time, non-fatal note (design
+// principle 3 above) when --no-think/-T was requested against the
+// "openai" provider: there is no single standard OpenAI-compatible field
+// for disabling reasoning the way Ollama's "think": false does, so the
+// flag is accepted (never a hard error - it would be an unpleasant
+// surprise for switching --provider to suddenly make an existing script
+// fail) but genuinely does nothing on that path. Ollama's own request
+// path is unaffected regardless of this function - see req.Think in
+// cmdAsk/cmdCoding, only ever set when provider is "ollama".
+func warnIfNoThinkUnsupported(provider llmProvider, flagNoThink bool) {
+	if provider == providerOpenAI && flagNoThink {
+		printWarn("⚠ -T/--no-think ไม่มีผลเมื่อใช้ --provider openai: ไม่มี field มาตรฐานกลางสำหรับปิด reasoning ใน OpenAI-compatible API (ต่างกันไปตาม backend) จึงไม่ถูกส่งไปใน request เลย")
+	}
+}
+
+// verifyFeedbackMessage builds the message ola injects to feed a failed
+// auto-verify (cmdAsk) or report_complete verify (cmdCoding) result back
+// to the model. Ollama's own API is permissive enough to accept a
+// role:"tool" message here even though it doesn't answer any real
+// tool_calls the model made (see this function's two call sites - it's
+// ola independently re-running the project's own build/test, not
+// something the model called a tool for), but the OpenAI wire format's
+// "tool" role strictly requires answering a matching tool_calls[].id from
+// the immediately preceding assistant turn - sending role:"tool" here
+// against an OpenAI-compatible backend would very likely get the whole
+// request rejected outright as an invalid role sequence. role:"user"
+// carries the same information without relying on any such contract, at
+// the (harmless) cost of no longer being tagged "verify" in the message
+// history when running against the "openai" provider.
+func verifyFeedbackMessage(provider llmProvider, content string) ollamaMessage {
+	if provider == providerOpenAI {
+		return ollamaMessage{Role: "user", Content: content}
+	}
+	return ollamaMessage{Role: "tool", Name: "verify", Content: content}
+}
+
+type openAIImageURL struct {
+	URL string `json:"url"`
+}
+
+// openAIContentPart is one element of an OpenAI message's "content" array
+// - only used once a message actually carries an image; a plain text
+// message still uses the simpler bare-string "content" every
+// OpenAI-compatible server accepts (see toOpenAIMessage).
+type openAIContentPart struct {
+	Type     string          `json:"type"`
+	Text     string          `json:"text,omitempty"`
+	ImageURL *openAIImageURL `json:"image_url,omitempty"`
+}
+
+type openAIToolCallFunctionOut struct {
+	Name string `json:"name,omitempty"`
+	// Arguments is a JSON-encoded STRING in the OpenAI wire format, unlike
+	// Ollama's tool_calls[].function.arguments which is a raw JSON value -
+	// see toOpenAIMessage's comment on toolCallFunction.Arguments for why
+	// this is always a straight byte re-wrap, never a re-serialization.
+	Arguments string `json:"arguments,omitempty"`
+}
+
+type openAIToolCallOut struct {
+	ID       string                    `json:"id,omitempty"`
+	Type     string                    `json:"type,omitempty"`
+	Function openAIToolCallFunctionOut `json:"function"`
+}
+
+type openAIMessageOut struct {
+	Role string `json:"role"`
+	// Content is either a bare string or a []openAIContentPart - see
+	// toOpenAIMessage. interface{} because Go has no sum type for "one of
+	// these two shapes", and json.Marshal already renders each shape
+	// correctly by real Go type.
+	Content    interface{}         `json:"content,omitempty"`
+	ToolCalls  []openAIToolCallOut `json:"tool_calls,omitempty"`
+	ToolCallID string              `json:"tool_call_id,omitempty"`
+}
+
+type openAIFunctionDef struct {
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
+	Parameters  interface{} `json:"parameters"`
+}
+
+type openAIToolDef struct {
+	Type     string            `json:"type"`
+	Function openAIFunctionDef `json:"function"`
+}
+
+type openAIStreamOptions struct {
+	// IncludeUsage asks the server to emit one final chunk carrying
+	// prompt/completion token counts before the stream ends - without it,
+	// OpenAI-compatible streaming responses don't report usage at all, and
+	// ola's tokens-per-second line (see streamOpenAIResponse) would always
+	// read zero.
+	IncludeUsage bool `json:"include_usage"`
+}
+
+type openAIRequestOut struct {
+	Model         string               `json:"model"`
+	Messages      []openAIMessageOut   `json:"messages"`
+	Stream        bool                 `json:"stream"`
+	Tools         []openAIToolDef      `json:"tools,omitempty"`
+	StreamOptions *openAIStreamOptions `json:"stream_options,omitempty"`
+}
+
+// toOpenAIRequest converts ola's internal request into the OpenAI wire
+// shape. Deliberately does not attempt to carry over req.Options.NumCtx or
+// req.Think - see design principle 3 in this section's header comment.
+func toOpenAIRequest(req ollamaRequest) openAIRequestOut {
+	out := openAIRequestOut{
+		Model:  req.Model,
+		Stream: req.Stream,
+	}
+	if req.Stream {
+		out.StreamOptions = &openAIStreamOptions{IncludeUsage: true}
+	}
+	for _, t := range req.Tools {
+		out.Tools = append(out.Tools, openAIToolDef{
+			Type: t.Type,
+			Function: openAIFunctionDef{
+				Name:        t.Function.Name,
+				Description: t.Function.Description,
+				Parameters:  t.Function.Parameters,
+			},
+		})
+	}
+	for _, m := range req.Messages {
+		out.Messages = append(out.Messages, toOpenAIMessage(m))
+	}
+	return out
+}
+
+// toOpenAIMessage converts a single ollamaMessage into the OpenAI shape.
+// The three cases below (tool result / assistant tool_calls / plain text
+// or image content) are mutually exclusive by construction - see how
+// cmdAsk/cmdCoding build each role's messages - so this is a straight
+// switch rather than a general-purpose merge of all fields at once.
+func toOpenAIMessage(m ollamaMessage) openAIMessageOut {
+	// Tool-result messages: Ollama links a reply back to its call by
+	// "name" alone (ambiguous if a turn made two calls to the same tool);
+	// OpenAI instead requires "tool_call_id" to name the exact call being
+	// answered. ToolCallID is populated by the caller (see doChatRound's
+	// callers in cmdAsk/cmdCoding) from the toolCall.ID that
+	// streamOpenAIResponse captured earlier in the same session.
+	if m.Role == "tool" {
+		id := m.ToolCallID
+		if id == "" {
+			id = m.Name // best-effort only - see comment above
+		}
+		return openAIMessageOut{Role: "tool", Content: m.Content, ToolCallID: id}
+	}
+
+	// Assistant turns that made one or more tool calls.
+	if len(m.ToolCalls) > 0 {
+		om := openAIMessageOut{Role: m.Role}
+		if m.Content != "" {
+			om.Content = m.Content
+		}
+		for i, tc := range m.ToolCalls {
+			id := tc.ID
+			if id == "" {
+				id = fmt.Sprintf("call_%d", i) // synthesize a stable id if the model/server never sent one
+			}
+			// tc.Function.Arguments (json.RawMessage) already holds valid
+			// JSON text either way it got here - freshly parsed from an
+			// OpenAI stream (see streamOpenAIResponse) or round-tripped
+			// from Ollama's own wire format - so string(...) here is a
+			// byte-for-byte re-wrap, never a re-serialization that could
+			// reorder keys or otherwise alter what the model actually
+			// produced.
+			om.ToolCalls = append(om.ToolCalls, openAIToolCallOut{
+				ID:   id,
+				Type: "function",
+				Function: openAIToolCallFunctionOut{
+					Name:      tc.Function.Name,
+					Arguments: string(tc.Function.Arguments),
+				},
+			})
+		}
+		return om
+	}
+
+	// Plain text, optionally with attached images (only ever present on
+	// the first user message - see cmdAsk's imageFiles handling). A bare
+	// content string is enough for every real endpoint; the content-array
+	// form below is only needed once an image is actually attached.
+	if len(m.Images) == 0 {
+		return openAIMessageOut{Role: m.Role, Content: m.Content}
+	}
+
+	var parts []openAIContentPart
+	if m.Content != "" {
+		parts = append(parts, openAIContentPart{Type: "text", Text: m.Content})
+	}
+	for _, img := range m.Images {
+		parts = append(parts, openAIContentPart{
+			Type:     "image_url",
+			ImageURL: &openAIImageURL{URL: imageDataURL(img)},
+		})
+	}
+	return openAIMessageOut{Role: m.Role, Content: parts}
+}
+
+// imageDataURL turns a base64-encoded image (as stored in
+// ollamaMessage.Images - see cmdAsk's use of base64.StdEncoding) into a
+// "data:<mime>;base64,..." URL for OpenAI's image_url content part. The
+// original file extension isn't available by this point (Images is just
+// a flat []string), so the actual image bytes are sniffed instead of
+// guessed - net/http's DetectContentType recognizes every format ola's
+// own imageExts allowlist accepts (jpeg/png/gif/webp) directly from the
+// leading bytes, which is exactly what it's for.
+func imageDataURL(b64 string) string {
+	mime := "image/jpeg" // reasonable fallback if decoding/sniffing somehow fails
+	if raw, err := base64.StdEncoding.DecodeString(b64); err == nil {
+		if sniffed := http.DetectContentType(raw); strings.HasPrefix(sniffed, "image/") {
+			mime = sniffed
+		}
+	}
+	return "data:" + mime + ";base64," + b64
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Sending the request and streaming the response back
+// ─────────────────────────────────────────────────────────────────
+
+// postOpenAIChatRequest is postChatRequest's OpenAI-compatible
+// counterpart: same "caller owns and must Close() the response body"
+// contract, POSTing to host+"/chat/completions" instead of "/api/chat"
+// and marshaling the converted openAIRequestOut instead of req directly.
+func postOpenAIChatRequest(client *http.Client, host, apiKey string, useKey bool, req ollamaRequest) (*http.Response, error) {
+	payload, err := json.Marshal(toOpenAIRequest(req))
+	if err != nil {
+		return nil, fmt.Errorf("สร้าง JSON payload ไม่ได้: %v", err)
+	}
+	httpReq, err := http.NewRequest(http.MethodPost, host+"/chat/completions", bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("สร้าง HTTP request ไม่ได้: %v", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if useKey {
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	return client.Do(httpReq)
+}
+
+// openAIStreamToolCallDelta is one tool_calls[] entry within a single
+// streamed delta. OpenAI's streaming format sends a call's id+function
+// name once, on whichever delta first mentions that Index, and then only
+// argument fragments (Function.Arguments) on every subsequent delta
+// sharing the same Index - see streamOpenAIResponse's accumulation loop.
+type openAIStreamToolCallDelta struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+type openAIStreamChunk struct {
+	Choices []struct {
+		Delta struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+			// ReasoningContent/Reasoning: no single OpenAI-compatible
+			// field name for streamed reasoning/thinking tokens has
+			// become universal - "reasoning_content" and "reasoning" are
+			// both seen in the wild (DeepSeek-style APIs, several
+			// vLLM/llama.cpp reasoning-model setups). Both are checked;
+			// whichever one a given server actually sends is treated the
+			// same way Ollama's own "thinking" field is.
+			ReasoningContent string                      `json:"reasoning_content"`
+			Reasoning        string                      `json:"reasoning"`
+			ToolCalls        []openAIStreamToolCallDelta `json:"tool_calls"`
+		} `json:"delta"`
+		FinishReason *string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	} `json:"usage"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+// openAIToolCallAcc accumulates one streamed tool call's id/name/argument
+// fragments by index - see streamOpenAIResponse.
+type openAIToolCallAcc struct {
+	id, name string
+	args     strings.Builder
+}
+
+// streamOpenAIResponse is streamResponse's (see above) OpenAI-compatible
+// counterpart: reads a server-sent-events body ("data: {...}\n\n" lines,
+// terminated by "data: [DONE]") instead of Ollama's newline-delimited raw
+// JSON, and accumulates streamed tool_calls by index instead of receiving
+// each one whole in a single chunk the way Ollama's API does. Deliberately
+// a standalone function rather than a refactor of streamResponse itself:
+// the two wire formats differ enough (SSE framing, incremental tool-call
+// deltas, no load_duration/prompt_eval_duration concept at all) that
+// sharing code would mean threading provider-specific branches through
+// streamResponse's already-tested innards for little real benefit. The
+// trailing "thinking/round/tokens" stats lines intentionally match
+// streamResponse's wording so terminal/log output looks the same
+// regardless of which provider a session used.
+func streamOpenAIResponse(body io.Reader, outFile *os.File, cyan, bold, dim, reset string) streamOutcome {
+	var out streamOutcome
+	state := ""
+	start := time.Now()
+	var thinkStart time.Time
+
+	toolAcc := map[int]*openAIToolCallAcc{}
+	var toolOrder []int
+
+	reader := bufio.NewReaderSize(body, 1<<20)
+	for {
+		line, err := reader.ReadString('\n')
+		trimmed := strings.TrimRight(line, "\r\n")
+		if payload, ok := strings.CutPrefix(trimmed, "data: "); ok {
+			if payload != "[DONE]" && payload != "" {
+				var chunk openAIStreamChunk
+				if jsonErr := json.Unmarshal([]byte(payload), &chunk); jsonErr == nil {
+					if chunk.Error != nil {
+						msg := "\nERROR: " + chunk.Error.Message + "\n"
+						fmt.Print(msg)
+						fmt.Fprint(outFile, msg)
+					} else {
+						if len(chunk.Choices) > 0 {
+							d := chunk.Choices[0].Delta
+							think := d.ReasoningContent
+							if think == "" {
+								think = d.Reasoning
+							}
+							content := d.Content
+							if think != "" {
+								if state != "T" {
+									thinkStart = time.Now()
+									qprintf("%s <<<--Thinking-->>>\n", cyan)
+									fmt.Fprint(outFile, "<<<--Thinking-->>>\n")
+									state = "T"
+								}
+								qprintf("%s", think)
+								fmt.Fprint(outFile, think)
+								out.Thinking += think
+							}
+							if content != "" {
+								if state == "T" {
+									out.ThinkDuration = time.Since(thinkStart)
+									qprintf("%s\n\n%s <<<--Answer-->>>%s\n", reset, bold, reset)
+									fmt.Fprint(outFile, "\n\n<<<--Answer-->>>\n")
+								}
+								state = "A"
+								fmt.Print(content)
+								fmt.Fprint(outFile, content)
+								out.Content += content
+							}
+							for _, tcd := range d.ToolCalls {
+								acc, ok := toolAcc[tcd.Index]
+								if !ok {
+									acc = &openAIToolCallAcc{}
+									toolAcc[tcd.Index] = acc
+									toolOrder = append(toolOrder, tcd.Index)
+								}
+								if tcd.ID != "" {
+									acc.id = tcd.ID
+								}
+								if tcd.Function.Name != "" {
+									acc.name = tcd.Function.Name
+								}
+								acc.args.WriteString(tcd.Function.Arguments)
+							}
+						}
+						if chunk.Usage != nil {
+							out.PromptTokens = chunk.Usage.PromptTokens
+							out.EvalTokens = chunk.Usage.CompletionTokens
+						}
+					}
+				}
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+
+	for _, idx := range toolOrder {
+		acc := toolAcc[idx]
+		argBytes := []byte(acc.args.String())
+		if !json.Valid(argBytes) {
+			// Defensive only: a truncated/interrupted stream could in
+			// principle leave partial JSON here. Falling back to "{}"
+			// keeps dispatchToolCall's json.Unmarshal from choking later,
+			// at the cost of that one call losing its arguments - better
+			// than the whole session crashing over one bad delta
+			// sequence from a non-conformant server.
+			argBytes = []byte("{}")
+		}
+		out.ToolCalls = append(out.ToolCalls, toolCall{
+			ID: acc.id,
+			Function: toolCallFunction{
+				Name:      acc.name,
+				Arguments: argBytes,
+			},
+		})
+	}
+
+	// Trailer stats: no load_duration/prompt_eval_duration equivalent
+	// exists in the OpenAI wire format (see this function's header
+	// comment), so only the two lines that DO have a real equivalent -
+	// thinking/round time and token counts - are printed, in the same
+	// format streamResponse uses for those two.
+	if state == "T" && out.ThinkDuration == 0 {
+		out.ThinkDuration = time.Since(thinkStart)
+		qprintf("%s", reset)
+	}
+	total := time.Since(start)
+	totalStr := fmtDur(total)
+	if out.ThinkDuration > 0 {
+		thinkStr := fmtDur(out.ThinkDuration)
+		qprintf("\n\n%s⏱  thinking: %s  |  round: %s%s\n", dim, thinkStr, totalStr, reset)
+		fmt.Fprintf(outFile, "\n\n⏱  thinking: %s  |  round: %s\n", thinkStr, totalStr)
+	} else {
+		qprintf("\n\n%s⏱  round: %s%s\n", dim, totalStr, reset)
+		fmt.Fprintf(outFile, "\n\n⏱  round: %s\n", totalStr)
+	}
+
+	totalTokens := out.PromptTokens + out.EvalTokens
+	if totalTokens > 0 {
+		var tps float64
+		if total > 0 {
+			tps = float64(out.EvalTokens) / total.Seconds()
+		}
+		qprintf("%s🔢 tokens: in %d  |  out %d  |  total %d  (~%.1f tok/s)%s\n", dim, out.PromptTokens, out.EvalTokens, totalTokens, tps, reset)
+		fmt.Fprintf(outFile, "🔢 tokens: in %d  |  out %d  |  total %d  (~%.1f tok/s)\n", out.PromptTokens, out.EvalTokens, totalTokens, tps)
+	}
+
+	return out
+}
+
+// doChatRound is the one place that knows two different backends exist:
+// it sends req over whichever wire format cfg.Provider calls for and
+// returns the parsed streamOutcome plus the response's HTTP status code.
+// cmdAsk and cmdCoding's tool-calling loops call this instead of each
+// hard-coding /api/chat directly (the way cmdAsk's loop used to, and
+// cmdCoding's postChatRequest call effectively did) - see design principle
+// 1 in this section's header comment.
+func doChatRound(client *http.Client, cfg providerConfig, req ollamaRequest, outFile *os.File, cCyan, cBold, cDim, cReset string) (streamOutcome, int, error) {
+	if cfg.Provider == providerOpenAI {
+		resp, err := postOpenAIChatRequest(client, cfg.Host, cfg.APIKey, cfg.UseKey, req)
+		if err != nil {
+			return streamOutcome{}, 0, err
+		}
+		defer resp.Body.Close()
+		return streamOpenAIResponse(resp.Body, outFile, cCyan, cBold, cDim, cReset), resp.StatusCode, nil
+	}
+	resp, err := postChatRequest(client, cfg.Host, cfg.APIKey, cfg.UseKey, req)
+	if err != nil {
+		return streamOutcome{}, 0, err
+	}
+	defer resp.Body.Close()
+	return streamResponse(resp.Body, outFile, cCyan, cBold, cDim, cReset), resp.StatusCode, nil
+}
+
+// chatCompletionsPathHint is purely cosmetic - used only by -n/--dry-run's
+// "── POST <url> ──" header line (see cmdAsk/cmdCoding) so the printed URL
+// matches whichever endpoint a real run would actually hit.
+func chatCompletionsPathHint(provider llmProvider) string {
+	if provider == providerOpenAI {
+		return "/chat/completions"
+	}
+	return "/api/chat"
+}
+
+// marshalDryRunPayload renders req in whichever wire format cfg.Provider
+// uses, for -n/--dry-run's payload preview (see cmdAsk/cmdCoding) - the
+// only other place a request ever gets marshaled by hand instead of going
+// through doChatRound/postChatRequest/postOpenAIChatRequest.
+func marshalDryRunPayload(provider llmProvider, req ollamaRequest) ([]byte, error) {
+	if provider == providerOpenAI {
+		return json.Marshal(toOpenAIRequest(req))
+	}
+	return json.Marshal(req)
 }

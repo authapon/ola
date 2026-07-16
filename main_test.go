@@ -4842,3 +4842,517 @@ func TestQuietModeEnvVarMatchesFlag(t *testing.T) {
 		t.Errorf("expected OLA_QUIET=1 to trim timing lines same as -q, got: %q", out)
 	}
 }
+
+// ======================================================================
+// Section: OpenAI-compatible chat completions provider (openai_test.go)
+// ======================================================================
+// Tests for the "Section: OpenAI-compatible chat completions provider" in
+// main.go: provider/host/apiKey/model resolution, ollamaMessage <->
+// OpenAI wire-format conversion, SSE stream parsing (including
+// incrementally-streamed tool_calls deltas, which Ollama's own format
+// never has to deal with since it sends each tool call whole), and one
+// end-to-end test driving cmdAsk against a mocked /chat/completions
+// endpoint to confirm the whole tool-calling loop - including
+// tool_call_id round-tripping - actually works over the wire, not just at
+// the unit level.
+
+// ---- resolveProvider ----
+
+func TestResolveProviderDefaultsToOllamaWhenUnset(t *testing.T) {
+	os.Unsetenv("OLA_PROVIDER")
+	p, err := resolveProvider("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p != providerOllama {
+		t.Fatalf("expected default provider ollama, got %q", p)
+	}
+}
+
+func TestResolveProviderEnvSelectsOpenAI(t *testing.T) {
+	os.Setenv("OLA_PROVIDER", "openai")
+	defer os.Unsetenv("OLA_PROVIDER")
+	p, err := resolveProvider("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p != providerOpenAI {
+		t.Fatalf("expected OLA_PROVIDER=openai to select openai, got %q", p)
+	}
+}
+
+func TestResolveProviderFlagWinsOverEnv(t *testing.T) {
+	os.Setenv("OLA_PROVIDER", "openai")
+	defer os.Unsetenv("OLA_PROVIDER")
+	p, err := resolveProvider("ollama")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p != providerOllama {
+		t.Fatalf("expected -P/--provider flag to win over $OLA_PROVIDER, got %q", p)
+	}
+}
+
+func TestResolveProviderRejectsUnknownValue(t *testing.T) {
+	if _, err := resolveProvider("bogus"); err == nil {
+		t.Fatal("expected an error for an unrecognized --provider value, got nil")
+	}
+}
+
+// ---- resolveProviderConfig ----
+
+func TestResolveProviderConfigOllamaDefaultsUnchanged(t *testing.T) {
+	os.Unsetenv("OLA_PROVIDER")
+	os.Unsetenv("OLA_OLLAMA_API_BASE")
+	os.Unsetenv("OLA_OLLAMA_MODEL")
+
+	cfg, err := resolveProviderConfig("", "", "mock-model", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Provider != providerOllama {
+		t.Errorf("expected provider ollama, got %q", cfg.Provider)
+	}
+	if cfg.Host != "http://localhost:11434" {
+		t.Errorf("expected ola's original default Ollama host, got %q", cfg.Host)
+	}
+	if cfg.Model != "mock-model" {
+		t.Errorf("expected the -m/--model flag value to pass through, got %q", cfg.Model)
+	}
+}
+
+func TestResolveProviderConfigOpenAIDefaultsToOllamaCompatEndpoint(t *testing.T) {
+	os.Unsetenv("OLA_OPENAI_API_BASE")
+	os.Setenv("OLA_OPENAI_MODEL", "gpt-mock")
+	defer os.Unsetenv("OLA_OPENAI_MODEL")
+
+	cfg, err := resolveProviderConfig("openai", "", "", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Host != defaultOpenAICompatBase {
+		t.Errorf("expected default openai-compat host %q (Ollama's own /v1), got %q", defaultOpenAICompatBase, cfg.Host)
+	}
+	if cfg.Model != "gpt-mock" {
+		t.Errorf("expected model from OLA_OPENAI_MODEL, got %q", cfg.Model)
+	}
+}
+
+func TestResolveProviderConfigAPIBaseFlagOverridesEnv(t *testing.T) {
+	os.Setenv("OLA_OPENAI_API_BASE", "http://env-should-lose:1234/v1")
+	defer os.Unsetenv("OLA_OPENAI_API_BASE")
+
+	cfg, err := resolveProviderConfig("openai", "http://flag-wins:9999/v1", "m", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Host != "http://flag-wins:9999/v1" {
+		t.Errorf("expected --api-base flag to win over $OLA_OPENAI_API_BASE, got %q", cfg.Host)
+	}
+}
+
+func TestResolveProviderConfigOllamaAndOpenAIUseSeparateEnvNamespaces(t *testing.T) {
+	os.Setenv("OLA_OLLAMA_API_BASE", "http://ollama-host:11434")
+	os.Setenv("OLA_OPENAI_API_BASE", "http://openai-host:8080/v1")
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+	defer os.Unsetenv("OLA_OPENAI_API_BASE")
+
+	ollamaCfg, err := resolveProviderConfig("ollama", "", "m", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ollamaCfg.Host != "http://ollama-host:11434" {
+		t.Errorf("expected ollama provider to read OLA_OLLAMA_API_BASE, got %q", ollamaCfg.Host)
+	}
+
+	openaiCfg, err := resolveProviderConfig("openai", "", "m", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if openaiCfg.Host != "http://openai-host:8080/v1" {
+		t.Errorf("expected openai provider to read OLA_OPENAI_API_BASE, got %q", openaiCfg.Host)
+	}
+}
+
+func TestResolveProviderConfigMissingAPIKeyReferencesCorrectEnvVar(t *testing.T) {
+	os.Unsetenv("OLA_OPENAI_API_KEY")
+	_, err := resolveProviderConfig("openai", "", "m", true)
+	if err == nil || !strings.Contains(err.Error(), "OLA_OPENAI_API_KEY") {
+		t.Fatalf("expected an error mentioning OLA_OPENAI_API_KEY, got: %v", err)
+	}
+}
+
+func TestResolveProviderConfigMissingModelReferencesCorrectEnvVar(t *testing.T) {
+	os.Unsetenv("OLA_OPENAI_MODEL")
+	_, err := resolveProviderConfig("openai", "", "", false)
+	if err == nil || !strings.Contains(err.Error(), "OLA_OPENAI_MODEL") {
+		t.Fatalf("expected an error mentioning OLA_OPENAI_MODEL, got: %v", err)
+	}
+}
+
+func TestResolveProviderConfigRejectsBadProvider(t *testing.T) {
+	if _, err := resolveProviderConfig("bogus", "", "m", false); err == nil {
+		t.Fatal("expected an error for an unrecognized provider, got nil")
+	}
+}
+
+// ---- toOpenAIMessage / toOpenAIRequest ----
+
+func TestToOpenAIMessagePlainText(t *testing.T) {
+	om := toOpenAIMessage(ollamaMessage{Role: "user", Content: "hello"})
+	if om.Role != "user" || om.Content != "hello" {
+		t.Fatalf("unexpected message: %+v", om)
+	}
+	if len(om.ToolCalls) != 0 || om.ToolCallID != "" {
+		t.Fatalf("expected no tool-call fields on a plain text message, got: %+v", om)
+	}
+}
+
+func TestToOpenAIMessageToolCallArgumentsAreAByteForByteStringCopy(t *testing.T) {
+	raw := json.RawMessage(`{"path":"a.txt","recursive":true}`)
+	om := toOpenAIMessage(ollamaMessage{
+		Role:      "assistant",
+		ToolCalls: []toolCall{{ID: "call_abc", Function: toolCallFunction{Name: "read_file", Arguments: raw}}},
+	})
+	if len(om.ToolCalls) != 1 {
+		t.Fatalf("expected exactly 1 tool call, got %d", len(om.ToolCalls))
+	}
+	tc := om.ToolCalls[0]
+	if tc.ID != "call_abc" || tc.Type != "function" || tc.Function.Name != "read_file" {
+		t.Fatalf("unexpected tool call shape: %+v", tc)
+	}
+	if tc.Function.Arguments != string(raw) {
+		t.Fatalf("expected arguments string to be a byte-for-byte copy of the raw JSON (%s), got %q", raw, tc.Function.Arguments)
+	}
+}
+
+func TestToOpenAIMessageSynthesizesIDWhenSourceCallHasNone(t *testing.T) {
+	om := toOpenAIMessage(ollamaMessage{
+		Role:      "assistant",
+		ToolCalls: []toolCall{{Function: toolCallFunction{Name: "get_current_time", Arguments: json.RawMessage(`{}`)}}},
+	})
+	if om.ToolCalls[0].ID == "" {
+		t.Fatal("expected a synthesized (non-empty) tool_call id when the source toolCall had none")
+	}
+}
+
+func TestToOpenAIMessageToolResultUsesToolCallID(t *testing.T) {
+	om := toOpenAIMessage(ollamaMessage{Role: "tool", Name: "read_file", Content: "file contents", ToolCallID: "call_xyz"})
+	if om.Role != "tool" || om.ToolCallID != "call_xyz" {
+		t.Fatalf("expected role=tool, tool_call_id=call_xyz, got: %+v", om)
+	}
+	if om.Content != "file contents" {
+		t.Fatalf("unexpected content: %v", om.Content)
+	}
+}
+
+func TestToOpenAIMessageToolResultFallsBackToNameWhenIDMissing(t *testing.T) {
+	// Exercises the fallback path used by the synthetic "verify" message
+	// this codebase used to send as role:"tool" - see verifyFeedbackMessage,
+	// which no longer routes through this fallback for the openai provider
+	// (it sends role:"user" instead) but the fallback itself stays as a
+	// defensive best-effort for any other caller that forgets ToolCallID.
+	om := toOpenAIMessage(ollamaMessage{Role: "tool", Name: "verify", Content: "x"})
+	if om.ToolCallID != "verify" {
+		t.Fatalf("expected fallback to Name when ToolCallID is empty, got %q", om.ToolCallID)
+	}
+}
+
+func TestToOpenAIMessageWithImageProducesSniffedDataURL(t *testing.T) {
+	// The 8-byte PNG file signature, padded out - enough for
+	// http.DetectContentType to positively identify it as image/png
+	// without needing a fully valid PNG file.
+	pngHeader := []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0, 0, 0, 0, 0}
+	b64 := base64.StdEncoding.EncodeToString(pngHeader)
+
+	om := toOpenAIMessage(ollamaMessage{Role: "user", Content: "what is this?", Images: []string{b64}})
+	parts, ok := om.Content.([]openAIContentPart)
+	if !ok {
+		t.Fatalf("expected content to be a []openAIContentPart once an image is attached, got %T", om.Content)
+	}
+	if len(parts) != 2 {
+		t.Fatalf("expected 2 content parts (text + image), got %d: %+v", len(parts), parts)
+	}
+	if parts[0].Type != "text" || parts[0].Text != "what is this?" {
+		t.Fatalf("unexpected first content part: %+v", parts[0])
+	}
+	if parts[1].Type != "image_url" || parts[1].ImageURL == nil {
+		t.Fatalf("unexpected second content part: %+v", parts[1])
+	}
+	if !strings.HasPrefix(parts[1].ImageURL.URL, "data:image/png;base64,") {
+		t.Fatalf("expected a sniffed data:image/png URL, got %q", parts[1].ImageURL.URL)
+	}
+	if !strings.HasSuffix(parts[1].ImageURL.URL, b64) {
+		t.Fatalf("expected the original base64 payload to be preserved verbatim in the data URL")
+	}
+}
+
+func TestToOpenAIRequestOmitsNumCtxAndRequestsStreamUsage(t *testing.T) {
+	req := ollamaRequest{
+		Model:   "m",
+		Options: ollamaOptions{NumCtx: 32768},
+		Stream:  true,
+		Messages: []ollamaMessage{
+			{Role: "system", Content: "sys"},
+			{Role: "user", Content: "hi"},
+		},
+		Tools: []ollamaTool{{Type: "function", Function: ollamaToolFunction{
+			Name: "get_current_time", Description: "d", Parameters: map[string]interface{}{"type": "object"},
+		}}},
+	}
+	out := toOpenAIRequest(req)
+	payload, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("unexpected marshal error: %v", err)
+	}
+	if strings.Contains(string(payload), "num_ctx") {
+		t.Fatalf("expected num_ctx to never appear in an OpenAI-compatible request (no standard equivalent), got: %s", payload)
+	}
+	if out.StreamOptions == nil || !out.StreamOptions.IncludeUsage {
+		t.Fatal("expected stream_options.include_usage=true to be requested on a streaming request, so token usage can be reported")
+	}
+	if len(out.Messages) != 2 {
+		t.Fatalf("expected both messages to carry over, got %d", len(out.Messages))
+	}
+	if len(out.Tools) != 1 || out.Tools[0].Function.Name != "get_current_time" {
+		t.Fatalf("expected the tool schema to carry over unchanged, got: %+v", out.Tools)
+	}
+}
+
+func TestToOpenAIRequestNonStreamingOmitsStreamOptions(t *testing.T) {
+	out := toOpenAIRequest(ollamaRequest{Model: "m", Stream: false})
+	if out.StreamOptions != nil {
+		t.Fatalf("expected no stream_options on a non-streaming request, got: %+v", out.StreamOptions)
+	}
+}
+
+// ---- streamOpenAIResponse ----
+
+// openAISSELine renders one SSE "data: {...}\n\n" chunk matching
+// openAIStreamChunk's shape - the OpenAI-compatible counterpart to
+// streamLine (coding_integration_test.go, above) for Ollama's NDJSON.
+func openAISSELine(content, reasoning string, toolCallsJSON string) string {
+	var parts []string
+	if content != "" {
+		parts = append(parts, fmt.Sprintf(`"content":%q`, content))
+	}
+	if reasoning != "" {
+		parts = append(parts, fmt.Sprintf(`"reasoning_content":%q`, reasoning))
+	}
+	if toolCallsJSON != "" {
+		parts = append(parts, fmt.Sprintf(`"tool_calls":%s`, toolCallsJSON))
+	}
+	return fmt.Sprintf(`data: {"choices":[{"delta":{%s}}]}`, strings.Join(parts, ",")) + "\n\n"
+}
+
+func TestStreamOpenAIResponseAccumulatesContentAndUsage(t *testing.T) {
+	body := openAISSELine("Hello, ", "", "") +
+		openAISSELine("world!", "", "") +
+		`data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	outFile, err := os.CreateTemp(t.TempDir(), "openai-stream-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+
+	out := streamOpenAIResponse(strings.NewReader(body), outFile, "", "", "", "")
+	if out.Content != "Hello, world!" {
+		t.Fatalf("expected accumulated content \"Hello, world!\", got %q", out.Content)
+	}
+	if out.PromptTokens != 10 || out.EvalTokens != 5 {
+		t.Fatalf("expected usage tokens prompt=10/eval=5 from the final chunk, got prompt=%d eval=%d", out.PromptTokens, out.EvalTokens)
+	}
+}
+
+func TestStreamOpenAIResponseReasoningContentBecomesThinking(t *testing.T) {
+	body := openAISSELine("", "let me think...", "") +
+		openAISSELine("the answer is 4", "", "") +
+		"data: [DONE]\n\n"
+
+	outFile, err := os.CreateTemp(t.TempDir(), "openai-stream-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+
+	out := streamOpenAIResponse(strings.NewReader(body), outFile, "", "", "", "")
+	if out.Thinking != "let me think..." {
+		t.Fatalf("expected reasoning_content to populate Thinking, got %q", out.Thinking)
+	}
+	if out.Content != "the answer is 4" {
+		t.Fatalf("expected content after the reasoning to populate Content, got %q", out.Content)
+	}
+	if out.ThinkDuration <= 0 {
+		t.Fatal("expected a non-zero ThinkDuration once thinking was followed by a real answer")
+	}
+
+	logged, _ := os.ReadFile(outFile.Name())
+	if !strings.Contains(string(logged), "<<<--Thinking-->>>") || !strings.Contains(string(logged), "<<<--Answer-->>>") {
+		t.Fatalf("expected the log file to contain both the thinking and answer banners, got:\n%s", logged)
+	}
+}
+
+func TestStreamOpenAIResponseAccumulatesToolCallDeltasByIndex(t *testing.T) {
+	// A realistic OpenAI-compatible stream: id+name arrive on the tool
+	// call's first delta, then only argument fragments on subsequent
+	// deltas sharing the same index - split across three chunks here to
+	// actually exercise the accumulation, not just a single whole call.
+	body := openAISSELine("", "", `[{"index":0,"id":"call_1","type":"function","function":{"name":"create_folder","arguments":""}}]`) +
+		openAISSELine("", "", `[{"index":0,"function":{"arguments":"{\"path\":"}}]`) +
+		openAISSELine("", "", `[{"index":0,"function":{"arguments":"\"reports\"}"}}]`) +
+		"data: [DONE]\n\n"
+
+	outFile, err := os.CreateTemp(t.TempDir(), "openai-stream-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+
+	out := streamOpenAIResponse(strings.NewReader(body), outFile, "", "", "", "")
+	if len(out.ToolCalls) != 1 {
+		t.Fatalf("expected exactly 1 accumulated tool call, got %d: %+v", len(out.ToolCalls), out.ToolCalls)
+	}
+	tc := out.ToolCalls[0]
+	if tc.ID != "call_1" || tc.Function.Name != "create_folder" {
+		t.Fatalf("unexpected accumulated tool call id/name: %+v", tc)
+	}
+	var args map[string]interface{}
+	if err := json.Unmarshal(tc.Function.Arguments, &args); err != nil {
+		t.Fatalf("expected accumulated arguments to be valid JSON, got %q (err: %v)", tc.Function.Arguments, err)
+	}
+	if args["path"] != "reports" {
+		t.Fatalf("expected accumulated arguments {\"path\":\"reports\"}, got %v", args)
+	}
+}
+
+func TestStreamOpenAIResponseMultipleToolCallsByDifferentIndex(t *testing.T) {
+	body := openAISSELine("", "", `[{"index":0,"id":"call_a","type":"function","function":{"name":"tool_a","arguments":"{}"}},{"index":1,"id":"call_b","type":"function","function":{"name":"tool_b","arguments":"{}"}}]`) +
+		"data: [DONE]\n\n"
+
+	outFile, err := os.CreateTemp(t.TempDir(), "openai-stream-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+
+	out := streamOpenAIResponse(strings.NewReader(body), outFile, "", "", "", "")
+	if len(out.ToolCalls) != 2 {
+		t.Fatalf("expected 2 distinct tool calls (one per index), got %d: %+v", len(out.ToolCalls), out.ToolCalls)
+	}
+	if out.ToolCalls[0].ID != "call_a" || out.ToolCalls[1].ID != "call_b" {
+		t.Fatalf("expected tool calls to preserve their original index order, got: %+v", out.ToolCalls)
+	}
+}
+
+func TestStreamOpenAIResponseMalformedArgumentsFallBackToEmptyObject(t *testing.T) {
+	// Simulates a stream that got cut off mid-argument (e.g. a dropped
+	// connection) - the accumulated "arguments" text is never valid JSON.
+	body := openAISSELine("", "", `[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\": \"unterminat"}}]`) +
+		"data: [DONE]\n\n"
+
+	outFile, err := os.CreateTemp(t.TempDir(), "openai-stream-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+
+	out := streamOpenAIResponse(strings.NewReader(body), outFile, "", "", "", "")
+	if len(out.ToolCalls) != 1 {
+		t.Fatalf("expected the (malformed) call to still surface as 1 tool call, got %d", len(out.ToolCalls))
+	}
+	if string(out.ToolCalls[0].Function.Arguments) != "{}" {
+		t.Fatalf("expected malformed accumulated arguments to fall back to \"{}\", got %q", out.ToolCalls[0].Function.Arguments)
+	}
+}
+
+func TestStreamOpenAIResponseErrorChunkDoesNotPanic(t *testing.T) {
+	body := `data: {"error":{"message":"something went wrong upstream"}}` + "\n\n" + "data: [DONE]\n\n"
+
+	outFile, err := os.CreateTemp(t.TempDir(), "openai-stream-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+
+	out := streamOpenAIResponse(strings.NewReader(body), outFile, "", "", "", "")
+	if out.Content != "" {
+		t.Fatalf("expected no content from an error-only stream, got %q", out.Content)
+	}
+	logged, _ := os.ReadFile(outFile.Name())
+	if !strings.Contains(string(logged), "something went wrong upstream") {
+		t.Fatalf("expected the error message to be logged, got:\n%s", logged)
+	}
+}
+
+// ---- end-to-end: cmdAsk against a mocked /chat/completions endpoint ----
+
+// TestCmdAskOpenAIProviderEndToEndToolCallRoundTrip drives the real cmdAsk
+// entry point (same style as TestCmdAskCreateFolderAndDelayEndToEnd above,
+// just against a mocked OpenAI-compatible /chat/completions endpoint
+// instead of Ollama's /api/chat) through one tool-calling round trip, to
+// confirm two things end-to-end rather than just at the unit level: (1)
+// the tool_calls delta gets accumulated and dispatched correctly, and (2)
+// the resulting tool-result message threads the correct tool_call_id back
+// into the next round's request - the one piece of this whole feature
+// that a purely-unit-level test of toOpenAIMessage/streamOpenAIResponse in
+// isolation couldn't actually prove wires together correctly.
+func TestCmdAskOpenAIProviderEndToEndToolCallRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	var round int32
+	var secondRoundBody string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&round, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch n {
+		case 1:
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"create_folder","arguments":""}}]}}]}`+"\n\n")
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"reports\"}"}}]}}]}`+"\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+		default:
+			b, _ := io.ReadAll(r.Body)
+			secondRoundBody = string(b)
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"เสร็จเรียบร้อยครับ"}}]}`+"\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	exitCode := cmdAsk([]string{
+		"--provider", "openai", "--api-base", srv.URL,
+		"-m", "mock-model", "-o", "ask-openai.log",
+		"สร้างโฟลเดอร์ reports หน่อย",
+	})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdAsk to exit 0, got %d", exitCode)
+	}
+	if got := atomic.LoadInt32(&round); got != 2 {
+		t.Fatalf("expected exactly 2 rounds (tool call, then final answer), got %d", got)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "reports")); statErr != nil {
+		t.Fatalf("expected the reports/ directory to actually be created: %v", statErr)
+	}
+	if !strings.Contains(secondRoundBody, `"tool_call_id":"call_1"`) {
+		t.Fatalf("expected the second round's tool-result message to carry tool_call_id=call_1, got request body: %s", secondRoundBody)
+	}
+	if !strings.Contains(secondRoundBody, `"role":"tool"`) {
+		t.Fatalf("expected the second round's request to include a role:tool message, got: %s", secondRoundBody)
+	}
+
+	log, err := os.ReadFile("ask-openai.log")
+	if err != nil {
+		t.Fatalf("expected output log to exist: %v", err)
+	}
+	if !strings.Contains(string(log), "provider: openai") {
+		t.Fatalf("expected the log header to record provider: openai, got:\n%s", log)
+	}
+}
