@@ -1,14 +1,17 @@
 // main.go - single consolidated source file for ola: the CLI entry point
 // and shared ask/coding tool-calling machinery (originally ola.go), the
 // opt-in integrations - scp_copy, web_search/fetch, read_skill
-// (originally integrations.go), and the "ola coding" subcommand
-// (originally coding.go). Merged into one file as part of a file-count
+// (originally integrations.go), the "ola coding" subcommand (originally
+// coding.go), and the "api_request" tool (originally api_request.go, the
+// most recent addition, folded in during a later pass of the same
+// file-count cleanup). Merged into one file as part of a file-count
 // cleanup; nothing about the logic changed, only its location. Look for
 // the "Section:" banners below to find where each former file's content
 // begins. Platform-specific terminal/process-group helpers stay split
 // into platform_linux.go / platform_other.go, since their entire purpose
 // is being selected by Go build tag - merging those into this file would
-// defeat that.
+// defeat that. Tests are similarly consolidated into a single main_test.go
+// (see that file's own header for which former test files it absorbed).
 
 // ola - a CLI that talks to Ollama's /api/chat endpoint and can act on the
 // local filesystem itself via built-in tool calls.
@@ -98,6 +101,29 @@
 // so it's visually distinct from thinking (cyan) and the final answer
 // (bold/default) output.
 //
+// Quiet mode (-q/--quiet or $OLA_QUIET, shared by both subcommands): trims
+// the terminal down to just the two things a human actually needs to see
+// live - the model's own final answer text, and an ask_user question/answer
+// exchange, which still has to happen on the terminal since it's the only
+// way to unblock a session that's genuinely stuck. Everything else ola
+// normally echoes to the terminal (each tool_call and its result preview,
+// the thinking banner and streamed thinking tokens, load/verify/round
+// timing lines, the web_search results summary) is dropped from the
+// terminal only - the -o log file still gets the complete, unabridged
+// record regardless of quiet mode, since that file is for later review, not
+// live viewing. A hard stop (hit the iteration/duration cap, exhausted
+// auto-verify retries) still gets surfaced in quiet mode, just on stderr
+// instead of stdout, so it doesn't disappear entirely but also doesn't mix
+// into stdout alongside the answer text. Push notifications are trimmed the
+// same way: only ask_user's own notification and the single end-of-session
+// "Work Finished/Failed/Ended" notification still fire - the in-flight ones
+// for every WRITE/EDIT/MKDIR, scp_copy transfer, mutating api_request call,
+// and mark_task_done (coding only) are suppressed. -q/OLA_QUIET has no
+// effect on the -o log file, on fatal startup errors (already on stderr),
+// or on -n/--dry-run (an explicit request to inspect the request payload,
+// not a real run - it always prints its full detail regardless of quiet
+// mode).
+//
 // Environment variables (shared by both subcommands):
 //
 //	OLA_OLLAMA_API_BASE     Host (default: http://localhost:11434)
@@ -119,6 +145,9 @@
 //	                        alias (override with --api-allow-direct-url, default: off).
 //	OLA_API_ALLOW_MUTATING  Let api_request send POST/PUT/PATCH/DELETE, not just GET/HEAD/
 //	                        OPTIONS (override with --api-allow-mutating, default: off).
+//	OLA_QUIET               Enable quiet mode (override with -q/--quiet, default: off).
+//	                        Accepts "1"/"true"/"yes"/"on" (case-insensitive); see the Quiet
+//	                        mode paragraph above for exactly what it does and doesn't affect.
 
 package main
 
@@ -132,6 +161,7 @@ import (
 	"html"
 	"io"
 	"io/fs"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -382,6 +412,75 @@ func printTopUsage() {
 	fmt.Println("          actually passes, or a round/time cap is hit.")
 	fmt.Println()
 	fmt.Println("Run 'ola ask -h' or 'ola coding -h' for command-specific help.")
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Quiet mode (-q/--quiet, $OLA_QUIET)
+//
+// quietMode is resolved once per process, right at the top of cmdAsk/
+// cmdCoding (flag wins over env - same precedence every other ola setting
+// uses), and read directly by dispatchToolCall, streamResponse, and the
+// tool-dispatch closures in cmdAsk/cmdCoding below rather than threaded
+// through as an extra parameter everywhere - ola only ever runs one
+// subcommand per process, so a package-level flag is the plain-Go
+// equivalent of "session state" here, the same way maxToolIterations etc.
+// are simple package-level constants rather than parameters. It gates two
+// independent things:
+//
+//  1. Terminal chrome (qprintln/qprintf below): tool_call echoes, the
+//     thinking banner + streamed thinking tokens, load/verify/round timing
+//     lines, the web_search summary. Never gates the model's own answer
+//     text (streamResponse always prints that) or the ask_user
+//     question/options/prompt (toolAskUser always prints that too) - those
+//     are the two things quiet mode exists to still show.
+//  2. "In-flight" ntfy.sh notifications: WRITE/EDIT/MKDIR (dispatchToolCall),
+//     scp_copy and mutating api_request calls (the extraTools closures in
+//     cmdAsk/cmdCoding), and mark_task_done (dispatchCodingToolCall). Never
+//     gates ask_user's own notification or the single end-of-session
+//     "Work Finished/Failed/Ended" notification sent by cmdAsk/cmdCoding -
+//     those are the two notifications quiet mode's own doc comment (see the
+//     package doc comment at the top of this file) promises will still fire.
+//
+// A hard-stop warning (iteration/duration cap hit, auto-verify retries
+// exhausted) is a third case that's neither of the above: too important to
+// silently drop, but not "the answer" either. printWarn below sends it to
+// stderr instead of stdout when quiet, rather than dropping or printing it
+// like ordinary chrome.
+var quietMode bool
+
+// qprintln/qprintf print ola's own terminal chrome - never the model's
+// answer text itself - and are silently dropped when quietMode is on. Every
+// call site pairs one of these with its own unconditional fmt.Fprint(outFile,
+// ...) alongside it, so nothing here ever affects the -o log file - only
+// what shows up live on the terminal.
+func qprintln(a ...interface{}) {
+	if quietMode {
+		return
+	}
+	fmt.Println(a...)
+}
+
+func qprintf(format string, a ...interface{}) {
+	if quietMode {
+		return
+	}
+	fmt.Printf(format, a...)
+}
+
+// printWarn surfaces a hard-stop warning (iteration/duration cap hit,
+// auto-verify retries exhausted) that a human should still see even in
+// quiet mode - unlike qprintln/qprintf's chrome, this is never simply
+// dropped. Outside quiet mode it prints to stdout, colorized like the rest
+// of the session's chrome, exactly as ola has always done; in quiet mode it
+// goes to stderr instead, so quiet mode's "only the answer and ask_user on
+// stdout" contract still holds while the warning itself remains visible
+// rather than disappearing.
+func printWarn(colored string) {
+	if quietMode {
+		fmt.Fprintln(os.Stderr, colored)
+		return
+	}
+	fmt.Println(colored)
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -709,6 +808,21 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("ทุก path ที่ tool ใช้อ้างอิงจาก current directory ที่รัน ola อยู่เสมอ")
 		fmt.Println("(ไม่มี --workdir ให้ตั้งค่า) และไม่สามารถหลุดออกไปนอก directory นี้ได้")
 		fmt.Println()
+		fmt.Println("Quiet mode (เปิดด้วย -q/--quiet หรือ OLA_QUIET, ปิดโดย default):")
+		fmt.Println("  ตัดสิ่งที่ ola พิมพ์ลง terminal ให้เหลือแค่ 2 อย่างที่ต้องเห็นสด ๆ จริง ๆ: คำตอบสุดท้ายของโมเดล")
+		fmt.Println("  และคำถาม/ตัวเลือก/prompt ของ ask_user (ยังต้องแสดงเสมอ เพราะเป็นทางเดียวที่จะปลดล็อกเซสชันที่")
+		fmt.Println("  ค้างรอคำตอบอยู่) สิ่งที่ถูกซ่อนจาก terminal (แต่ยังถูกบันทึกครบใน -o log file เหมือนเดิมทุกกรณี):")
+		fmt.Println("    - tool_call แต่ละครั้งและ preview ผลลัพธ์ (🔧/✓/✗)")
+		fmt.Println("    - thinking banner และ thinking token ที่ stream ออกมาสด ๆ")
+		fmt.Println("    - บรรทัด timing ต่างๆ (load, preload, prompt eval, round, tokens, verify progress)")
+		fmt.Println("    - สรุปผล web_search (จำนวนผลลัพธ์ + รายชื่อ)")
+		fmt.Println("  เมื่อเซสชันหยุดกลางคันแบบผิดปกติ (ชน iteration/verify cap) ข้อความเตือนจะไปออกที่ stderr")
+		fmt.Println("  แทน stdout แทนที่จะหายไปเฉย ๆ ส่วน -n/--dry-run ไม่ได้รับผลกระทบจาก -q เลย (ยังแสดงรายละเอียด")
+		fmt.Println("  เต็มเสมอ เพราะเป็นการขอดู payload ตรง ๆ ไม่ใช่การรันจริง)")
+		fmt.Println("  Push notification (ntfy.sh) ก็ถูกตัดแบบเดียวกัน: ส่งเฉพาะตอน ask_user ถูกเรียก และตอนจบงาน")
+		fmt.Println("  (Work Finished/Failed) เท่านั้น - notification ระหว่างทางของ WRITE/EDIT/MKDIR และ scp_copy/")
+		fmt.Println("  api_request (mutating) จะถูกงดไว้ ไม่ส่ง")
+		fmt.Println()
 		fmt.Println("Verify การแก้โค้ด (เปิดอัตโนมัติ, ปิดได้ด้วย --no-verify):")
 		fmt.Println("  ถ้า current directory มี toolchain ที่รู้จัก (go.mod, package.json, Cargo.toml,")
 		fmt.Println("  pyproject.toml/requirements.txt/setup.py, Makefile) ola จะเพิ่ม tool 'run_command'")
@@ -803,6 +917,7 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  OLA_OLLAMA_CONTEXT_SIZE   num_ctx เริ่มต้น (override ด้วย -c, default: 16384)")
 		fmt.Println("  OLA_OUTPUT_FILE           ไฟล์ output เริ่มต้น (override ด้วย -o, default: output.txt)")
 		fmt.Println("  OLA_TOPIC                 topic สำหรับส่ง notification ไป ntfy.sh (override ด้วย -x)")
+		fmt.Println("  OLA_QUIET                 เปิด quiet mode (override ด้วย -q/--quiet, default: ปิด) - ดูหัวข้อ Quiet mode ด้านบน")
 		fmt.Println("  OLA_OLLAMA_SEARCH_API_KEY API key ของ Ollama Web Search API (override ด้วย --ollama-search-key)")
 		fmt.Println("                            เปิด web_search - fallback ไปอ่าน $OLLAMA_API_KEY มาตรฐานถ้าไม่ได้ตั้งตัวนี้")
 		fmt.Println("  OLA_OLLAMA_SEARCH_API_BASE  Base URL ของ Ollama Web Search API (default: https://ollama.com)")
@@ -840,6 +955,8 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("                       เขียน/แก้ไฟล์ หรือเมื่อโมเดลเรียก ask_user (override $OLA_TOPIC)")
 		fmt.Println("  -o, --output <file>  บันทึกผลลัพธ์ + log ลงไฟล์ (default: $OLA_OUTPUT_FILE หรือ output.txt) เขียนทับไฟล์เดิมเสมอ เว้นแต่ใช้ -a")
 		fmt.Println("  -a, --append         ต่อท้ายไฟล์ output แทนการเขียนทับ (ใช้ได้ทั้งกับ -o หรือไฟล์ default ก็ได้ ไม่จำเป็นต้องคู่กับ -o)")
+		fmt.Println("  -q, --quiet          Quiet mode: terminal เหลือแค่ answer และคำถามจาก ask_user เท่านั้น (override $OLA_QUIET)")
+		fmt.Println("                       ไม่มีผลต่อไฟล์ -o/log ซึ่งยังคงบันทึกครบทุกอย่างเหมือนเดิม - ดูหัวข้อ Quiet mode ด้านบน")
 		fmt.Println("  -r, --raw            ไม่ใส่ separator \"===== แนบไฟล์ =====\" และ \"--- filename ---\" ระหว่างไฟล์ข้อความที่แนบ")
 		fmt.Println("  -f, --prompt-file <f> อ่าน prompt จากไฟล์แทนการพิมพ์เป็น argument (ถ้าใช้ตัวนี้ [files...] ทั้งหมด")
 		fmt.Println("                       จะถูกตีความเป็นไฟล์แนบทั้งหมด ไม่มี positional prompt แยกต่างหากอีกต่อไป)")
@@ -897,7 +1014,9 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("    ask_user จะได้รับ error กลับไปแทน พร้อมคำแนะนำให้ตัดสินใจเองแล้วระบุ assumption")
 		fmt.Println("  - Exit code จะเป็น 1 ถ้า Ollama ตอบกลับด้วย HTTP status >= 400 (เนื้อหาที่ตอบกลับมาจะยังถูกแสดง/บันทึกตามปกติ)")
 		fmt.Println("  - ใช้ -x <topic> หรือตั้งตัวแปร OLA_TOPIC เพื่อรับ notification ผ่าน ntfy.sh")
-		fmt.Println("    (แจ้งเตือนครอบคลุม: งานเสร็จ/error, เขียนไฟล์ [WRITE], แก้ไฟล์ [EDIT], และรอคำตอบ [ASK])")
+		fmt.Println("    (แจ้งเตือนครอบคลุม: งานเสร็จ/error, เขียนไฟล์ [WRITE], แก้ไฟล์ [EDIT], MKDIR, scp_copy,")
+		fmt.Println("    api_request [mutating], และรอคำตอบ [ASK] - ถ้าเปิด -q/--quiet ไว้ด้วย จะเหลือแค่ [ASK]")
+		fmt.Println("    กับตอนจบงาน [Work Finished/Failed] เท่านั้น ดูหัวข้อ Quiet mode ด้านบน)")
 		fmt.Println()
 		fmt.Println("Examples:")
 		fmt.Println("  export OLA_OLLAMA_MODEL=qwen3.6:27b")
@@ -910,6 +1029,7 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  ola ask --skills-dir /mnt/skills/public,/mnt/skills/private 'สร้างสไลด์สรุปบทที่ 5'")
 		fmt.Println("  ola ask --scp-hosts 'backup=moo@10.0.0.5/srv/backup' 'สำรอง report.txt ไปที่ backup หน่อย'")
 		fmt.Println("  ola ask --api-endpoints 'ollama=http://localhost:11434' 'เช็คว่ามีโมเดลอะไรบ้างใน ollama ตอนนี้'")
+		fmt.Println("  ola ask -q -x mytopic 'deploy to production'  # terminal เหลือแค่คำตอบ, ntfy ได้แค่ ASK/จบงาน")
 	}
 }
 
@@ -919,7 +1039,7 @@ func cmdAsk(args []string) int {
 
 	var model, ctxStr, outputFile, topic, promptFile string
 	var flagKey, flagNoThink, flagRaw, flagDryRun, flagAppend, flagHelp bool
-	var flagNoVerify bool
+	var flagNoVerify, flagQuiet bool
 	var buildCmd, testCmd, allowList string
 	var cmdTimeoutSec int
 	var searxngURL string
@@ -952,6 +1072,8 @@ func cmdAsk(args []string) int {
 	fs.BoolVar(&flagAppend, "append", false, "")
 	fs.StringVar(&topic, "x", "", "")
 	fs.StringVar(&topic, "topic", "", "")
+	fs.BoolVar(&flagQuiet, "q", false, "")
+	fs.BoolVar(&flagQuiet, "quiet", false, "")
 	fs.BoolVar(&flagNoVerify, "V", false, "")
 	fs.BoolVar(&flagNoVerify, "no-verify", false, "")
 	fs.StringVar(&buildCmd, "build-cmd", "", "")
@@ -999,6 +1121,12 @@ func cmdAsk(args []string) int {
 		fmt.Fprintln(os.Stderr, "error: ต้องระบุ prompt อย่างน้อย (หรือใช้ -f/--prompt-file)")
 		return 1
 	}
+
+	// Quiet mode: flag wins over $OLA_QUIET, same precedence as every other
+	// ola setting. Resolved before any terminal output below (including the
+	// prompt/attachment-loading load-timing lines) so nothing slips out
+	// before quietMode takes effect.
+	quietMode = flagQuiet || envBool("OLA_QUIET")
 
 	// Host + Auth
 	host := os.Getenv("OLA_OLLAMA_API_BASE")
@@ -1065,7 +1193,7 @@ func cmdAsk(args []string) int {
 	logLoad := func(label string, elapsed time.Duration) {
 		note := fmt.Sprintf("%s: %s", label, fmtLoadDur(elapsed))
 		loadTimings = append(loadTimings, note)
-		fmt.Printf("%s📥 %s%s\n", cDim, note, cReset)
+		qprintf("%s📥 %s%s\n", cDim, note, cReset)
 	}
 
 	var prompt string
@@ -1325,6 +1453,11 @@ func cmdAsk(args []string) int {
 		fmt.Printf("── Output file: %s ──\n", outputFile)
 		fmt.Printf("── Sandbox root (current directory): %s ──\n", cwd)
 		fmt.Printf("── Directory tree in prompt: %s ──\n", treeNote)
+		if quietMode {
+			fmt.Println("── Quiet mode: enabled (-q/--quiet or $OLA_QUIET) - ไม่มีผลต่อ --dry-run นี้ ซึ่งแสดงรายละเอียดเต็มเสมอ ──")
+		} else {
+			fmt.Println("── Quiet mode: disabled ──")
+		}
 		for _, lt := range loadTimings {
 			fmt.Printf("── Load time - %s ──\n", lt)
 		}
@@ -1434,6 +1567,9 @@ func cmdAsk(args []string) int {
 	} else {
 		fmt.Fprintln(outFile, "# thinking: enabled (default)")
 	}
+	if quietMode {
+		fmt.Fprintln(outFile, "# quiet mode: enabled (terminal only, this log file is always complete regardless)")
+	}
 	if flagKey {
 		fmt.Fprintln(outFile, "# auth: Bearer (OLA_OLLAMA_API_KEY)")
 	}
@@ -1516,7 +1652,7 @@ func cmdAsk(args []string) int {
 				reason, _ := args["reason"].(string)
 				note := formatSCPNotification(direction, alias, localPath, remotePath, reason)
 				recordChange([]*[]string{&sessionChanges}, note)
-				if ntfyTopic != "" {
+				if ntfyTopic != "" && !quietMode {
 					sendNotification(ntfyTopic, note)
 				}
 			}
@@ -1538,7 +1674,7 @@ func cmdAsk(args []string) int {
 				if isMutatingMethod(strings.ToUpper(strings.TrimSpace(method))) {
 					note := formatAPIRequestNotification(args)
 					recordChange([]*[]string{&sessionChanges}, note)
-					if ntfyTopic != "" {
+					if ntfyTopic != "" && !quietMode {
 						sendNotification(ntfyTopic, note)
 					}
 				}
@@ -1561,7 +1697,7 @@ func cmdAsk(args []string) int {
 		iteration++
 		if iteration > maxToolIterations {
 			warnMsg := fmt.Sprintf("⚠ หยุดการทำงาน: เกินจำนวนรอบสูงสุด (%d รอบ) ของ tool-calling loop", maxToolIterations)
-			fmt.Printf("\n%s%s%s\n", cRed, warnMsg, cReset)
+			printWarn(fmt.Sprintf("%s%s%s", cRed, warnMsg, cReset))
 			fmt.Fprintf(outFile, "\n[warning] %s\n", warnMsg)
 			break
 		}
@@ -1615,15 +1751,15 @@ func cmdAsk(args []string) int {
 			// first (same principle "coding" applies to report_complete -
 			// see runVerification/detectProjectCommands in coding.go).
 			if verifyEnabled && filesChanged && verifyRounds < maxAskVerifyRounds {
-				fmt.Printf("%s🔎 ola กำลัง verify การแก้ไขด้วย build/test ของโปรเจกต์เอง (%s)...%s\n", cDim, cmds.Label, cReset)
+				qprintf("%s🔎 ola กำลัง verify การแก้ไขด้วย build/test ของโปรเจกต์เอง (%s)...%s\n", cDim, cmds.Label, cReset)
 				passed, report := runVerification(cmds, cmdTimeout)
 				fmt.Fprintf(outFile, "\n[verify] %s\n", report)
 				if passed {
-					fmt.Printf("%s✓ verify ผ่าน - ยืนยันว่าการแก้ไขคอมไพล์/เทสต์ผ่านจริง%s\n", cDim, cReset)
+					qprintf("%s✓ verify ผ่าน - ยืนยันว่าการแก้ไขคอมไพล์/เทสต์ผ่านจริง%s\n", cDim, cReset)
 					break
 				}
 				verifyRounds++
-				fmt.Printf("%s✗ verify ไม่ผ่าน (ลองแก้ครั้งที่ %d/%d) - ป้อนผลลัพธ์กลับให้โมเดลแก้ต่อ%s\n", cRed, verifyRounds, maxAskVerifyRounds, cReset)
+				qprintf("%s✗ verify ไม่ผ่าน (ลองแก้ครั้งที่ %d/%d) - ป้อนผลลัพธ์กลับให้โมเดลแก้ต่อ%s\n", cRed, verifyRounds, maxAskVerifyRounds, cReset)
 				messages = append(messages,
 					ollamaMessage{Role: "assistant", Content: outcome.Content, Thinking: outcome.Thinking},
 					ollamaMessage{
@@ -1635,7 +1771,7 @@ func cmdAsk(args []string) int {
 			}
 			if verifyEnabled && filesChanged && verifyRounds >= maxAskVerifyRounds {
 				warnMsg := fmt.Sprintf("⚠ verify ยังไม่ผ่านหลังจากลองแก้ %d ครั้ง - หยุดและปล่อยให้ผู้ใช้ตรวจสอบเอง (ดูผลลัพธ์ verify ล่าสุดด้านบนใน %s)", maxAskVerifyRounds, outputFile)
-				fmt.Printf("%s%s%s\n", cRed, warnMsg, cReset)
+				printWarn(fmt.Sprintf("%s%s%s", cRed, warnMsg, cReset))
 				fmt.Fprintf(outFile, "\n[warning] %s\n", warnMsg)
 			}
 			break
@@ -1671,7 +1807,7 @@ func cmdAsk(args []string) int {
 
 	if iteration > 1 {
 		sessionTotal := fmtDur(time.Since(sessionStart))
-		fmt.Printf("%s🔁 session: %d round(s), total %s%s\n", cDim, iteration, sessionTotal, cReset)
+		qprintf("%s🔁 session: %d round(s), total %s%s\n", cDim, iteration, sessionTotal, cReset)
 		fmt.Fprintf(outFile, "🔁 session: %d round(s), total %s\n", iteration, sessionTotal)
 	}
 
@@ -2257,7 +2393,7 @@ func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.Fil
 	_ = json.Unmarshal(tc.Function.Arguments, &args)
 
 	argsPreview, _ := json.Marshal(args)
-	fmt.Printf("%s🔧 tool_call: %s(%s)%s\n", red, tc.Function.Name, string(argsPreview), reset)
+	qprintf("%s🔧 tool_call: %s(%s)%s\n", red, tc.Function.Name, string(argsPreview), reset)
 	fmt.Fprintf(outFile, "\n[tool_call] %s(%s)\n", tc.Function.Name, string(argsPreview))
 
 	loadStart := time.Now()
@@ -2272,7 +2408,7 @@ func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.Fil
 		result, err = toolWriteFile(args)
 		if err == nil {
 			recordChange(changeLog, formatFileChangeNotification("WRITE", args))
-			if ntfyTopic != "" {
+			if ntfyTopic != "" && !quietMode {
 				sendNotification(ntfyTopic, formatFileChangeNotification("WRITE", args))
 			}
 		}
@@ -2280,7 +2416,7 @@ func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.Fil
 		result, err = toolEditFile(args)
 		if err == nil {
 			recordChange(changeLog, formatFileChangeNotification("EDIT", args))
-			if ntfyTopic != "" {
+			if ntfyTopic != "" && !quietMode {
 				sendNotification(ntfyTopic, formatFileChangeNotification("EDIT", args))
 			}
 		}
@@ -2288,7 +2424,7 @@ func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.Fil
 		result, err = toolCreateFolder(args)
 		if err == nil {
 			recordChange(changeLog, formatFileChangeNotification("MKDIR", args))
-			if ntfyTopic != "" {
+			if ntfyTopic != "" && !quietMode {
 				sendNotification(ntfyTopic, formatFileChangeNotification("MKDIR", args))
 			}
 		}
@@ -2311,14 +2447,14 @@ func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.Fil
 
 	if err != nil {
 		result = "ERROR: " + err.Error()
-		fmt.Printf("%s   ✗ %s%s\n", red, result, reset)
+		qprintf("%s   ✗ %s%s\n", red, result, reset)
 	} else if tc.Function.Name != "ask_user" {
 		// ask_user already prints its own interaction; avoid double-printing.
 		preview := result
 		if len(preview) > 300 {
 			preview = preview[:300] + "…(truncated for display; full result sent to model and logged)"
 		}
-		fmt.Printf("%s   ✓ %s%s\n", red, preview, reset)
+		qprintf("%s   ✓ %s%s\n", red, preview, reset)
 	}
 	fmt.Fprintf(outFile, "[tool_result] %s\n", result)
 
@@ -2342,7 +2478,7 @@ func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.Fil
 	// time) and for tools with no meaningful I/O of their own.
 	if loadIcon, loadLabel := toolLoadTimingLabel(tc.Function.Name); loadIcon != "" {
 		loadStr := fmtLoadDur(loadElapsed)
-		fmt.Printf("%s   %s %s: %s%s\n", red, loadIcon, loadLabel, loadStr, reset)
+		qprintf("%s   %s %s: %s%s\n", red, loadIcon, loadLabel, loadStr, reset)
 		fmt.Fprintf(outFile, "[tool_load_time] %s (%s): %s\n", tc.Function.Name, loadLabel, loadStr)
 	}
 	return result
@@ -2361,20 +2497,20 @@ func printWebSearchSummary(queryItems []webSearchQueryItems, red, reset string, 
 	for _, q := range queryItems {
 		total += len(q.Items)
 	}
-	fmt.Printf("%s   🔎 พบผลลัพธ์ทั้งหมด %d รายการ จาก %d คำค้น%s\n", red, total, len(queryItems), reset)
+	qprintf("%s   🔎 พบผลลัพธ์ทั้งหมด %d รายการ จาก %d คำค้น%s\n", red, total, len(queryItems), reset)
 	fmt.Fprintf(outFile, "[web_search_summary] %d ผลลัพธ์ทั้งหมด จาก %d คำค้น\n", total, len(queryItems))
 
 	for _, q := range queryItems {
 		if q.Err != nil {
-			fmt.Printf("%s      ✗ [%s] ERROR: %v%s\n", red, q.Query, q.Err, reset)
+			qprintf("%s      ✗ [%s] ERROR: %v%s\n", red, q.Query, q.Err, reset)
 			fmt.Fprintf(outFile, "  [%s] ERROR: %v\n", q.Query, q.Err)
 			continue
 		}
-		fmt.Printf("%s      [%s] %d ผลลัพธ์%s\n", red, q.Query, len(q.Items), reset)
+		qprintf("%s      [%s] %d ผลลัพธ์%s\n", red, q.Query, len(q.Items), reset)
 		fmt.Fprintf(outFile, "  [%s] %d ผลลัพธ์\n", q.Query, len(q.Items))
 		for i, it := range q.Items {
-			fmt.Printf("%s        %d. %s%s\n", red, i+1, it.Title, reset)
-			fmt.Printf("%s           %s%s\n", red, it.URL, reset)
+			qprintf("%s        %d. %s%s\n", red, i+1, it.Title, reset)
+			qprintf("%s           %s%s\n", red, it.URL, reset)
 			fmt.Fprintf(outFile, "    %d. %s\n       %s\n", i+1, it.Title, it.URL)
 		}
 	}
@@ -2662,18 +2798,18 @@ func streamResponse(body io.Reader, outFile *os.File, cyan, bold, dim, reset str
 					if think != "" {
 						if state != "T" {
 							thinkStart = time.Now()
-							fmt.Print(cyan + " <<<--Thinking-->>>\n")
+							qprintf("%s <<<--Thinking-->>>\n", cyan)
 							fmt.Fprint(outFile, "<<<--Thinking-->>>\n")
 							state = "T"
 						}
-						fmt.Print(think)
+						qprintf("%s", think)
 						fmt.Fprint(outFile, think)
 						out.Thinking += think
 					}
 					if content != "" {
 						if state == "T" {
 							out.ThinkDuration = time.Since(thinkStart)
-							fmt.Print(reset + "\n\n" + bold + " <<<--Answer-->>>" + reset + "\n")
+							qprintf("%s\n\n%s <<<--Answer-->>>%s\n", reset, bold, reset)
 							fmt.Fprint(outFile, "\n\n<<<--Answer-->>>\n")
 						}
 						state = "A"
@@ -2698,26 +2834,26 @@ func streamResponse(body io.Reader, outFile *os.File, cyan, bold, dim, reset str
 
 	if state == "T" && out.ThinkDuration == 0 {
 		out.ThinkDuration = time.Since(thinkStart)
-		fmt.Print(reset)
+		qprintf("%s", reset)
 	}
 	if out.LoadDurationNS > 0 {
 		preloadStr := fmtDur(time.Duration(out.LoadDurationNS))
-		fmt.Printf("%s📦 preload (model load into memory): %s%s\n", dim, preloadStr, reset)
+		qprintf("%s📦 preload (model load into memory): %s%s\n", dim, preloadStr, reset)
 		fmt.Fprintf(outFile, "📦 preload (model load into memory): %s\n", preloadStr)
 	}
 	if out.PromptEvalDurationNS > 0 {
 		promptEvalStr := fmtLoadDur(time.Duration(out.PromptEvalDurationNS))
-		fmt.Printf("%s📝 prompt eval (ประมวลผล prompt เข้า context): %s%s\n", dim, promptEvalStr, reset)
+		qprintf("%s📝 prompt eval (ประมวลผล prompt เข้า context): %s%s\n", dim, promptEvalStr, reset)
 		fmt.Fprintf(outFile, "📝 prompt eval (ประมวลผล prompt เข้า context): %s\n", promptEvalStr)
 	}
 	total := time.Since(start)
 	totalStr := fmtDur(total)
 	if out.ThinkDuration > 0 {
 		thinkStr := fmtDur(out.ThinkDuration)
-		fmt.Printf("\n\n%s⏱  thinking: %s  |  round: %s%s\n", dim, thinkStr, totalStr, reset)
+		qprintf("\n\n%s⏱  thinking: %s  |  round: %s%s\n", dim, thinkStr, totalStr, reset)
 		fmt.Fprintf(outFile, "\n\n⏱  thinking: %s  |  round: %s\n", thinkStr, totalStr)
 	} else {
-		fmt.Printf("\n\n%s⏱  round: %s%s\n", dim, totalStr, reset)
+		qprintf("\n\n%s⏱  round: %s%s\n", dim, totalStr, reset)
 		fmt.Fprintf(outFile, "\n\n⏱  round: %s\n", totalStr)
 	}
 
@@ -2727,7 +2863,7 @@ func streamResponse(body io.Reader, outFile *os.File, cyan, bold, dim, reset str
 		if out.EvalDurationNS > 0 {
 			tps = float64(out.EvalTokens) / (float64(out.EvalDurationNS) / 1e9)
 		}
-		fmt.Printf("%s🔢 tokens: in %d  |  out %d  |  total %d  (%.1f tok/s)%s\n", dim, out.PromptTokens, out.EvalTokens, totalTokens, tps, reset)
+		qprintf("%s🔢 tokens: in %d  |  out %d  |  total %d  (%.1f tok/s)%s\n", dim, out.PromptTokens, out.EvalTokens, totalTokens, tps, reset)
 		fmt.Fprintf(outFile, "🔢 tokens: in %d  |  out %d  |  total %d  (%.1f tok/s)\n", out.PromptTokens, out.EvalTokens, totalTokens, tps)
 	}
 
@@ -2762,7 +2898,7 @@ func streamResponse(body io.Reader, outFile *os.File, cyan, bold, dim, reset str
 //
 // This tool is opt-in like everything else that reaches outside the
 // sandbox (run_command/web_search/web_fetch/read_skill - see coding.go/
-// integrations.go/integrations.go): unless OLA_SCP_HOSTS/--scp-hosts is actually
+// integrations.go): unless OLA_SCP_HOSTS/--scp-hosts is actually
 // configured, scp_copy is never added to the tool list and nothing in this
 // file runs.
 //
@@ -5316,11 +5452,11 @@ type codingRunContext struct {
 	state     *codingState
 	allowed   map[string]bool
 	cmdTO     time.Duration
-	cmds      projectCommands // needed by mark_task_done's build-only light gate
-	searchCfg searchConfig    // web_search/web_fetch config, may be all-zero (disabled)
-	skillsCfg skillsConfig    // read_skill config, may be all-zero (disabled)
+	cmds      projectCommands  // needed by mark_task_done's build-only light gate
+	searchCfg searchConfig     // web_search/web_fetch config, may be all-zero (disabled)
+	skillsCfg skillsConfig     // read_skill config, may be all-zero (disabled)
 	apiCfg    apiRequestConfig // api_request config, may be all-zero (disabled)
-	changes   []string        // recorded write/edit/task-done/api-mutating entries this session, for buildWorkSummary
+	changes   []string         // recorded write/edit/task-done/api-mutating entries this session, for buildWorkSummary
 }
 
 func dispatchCodingToolCall(tc toolCall, rc *codingRunContext) (result string, isReportComplete bool) {
@@ -5347,7 +5483,7 @@ func dispatchCodingToolCall(tc toolCall, rc *codingRunContext) (result string, i
 			if e == nil {
 				entry := truncateWords("[TASK] "+r, maxNotificationWords)
 				rc.changes = append(rc.changes, entry)
-				if rc.ntfyTopic != "" {
+				if rc.ntfyTopic != "" && !quietMode {
 					sendNotification(rc.ntfyTopic, entry)
 				}
 			}
@@ -5386,7 +5522,7 @@ func dispatchCodingToolCall(tc toolCall, rc *codingRunContext) (result string, i
 				if isMutatingMethod(strings.ToUpper(strings.TrimSpace(method))) {
 					note := formatAPIRequestNotification(args)
 					rc.changes = append(rc.changes, note)
-					if rc.ntfyTopic != "" {
+					if rc.ntfyTopic != "" && !quietMode {
 						sendNotification(rc.ntfyTopic, note)
 					}
 				}
@@ -5434,7 +5570,9 @@ func codingUsage(fs *flag.FlagSet) func() {
 		fmt.Println("mark_task_done มี build-only light gate ในตัว: ถ้าโปรเจกต์ build ไม่ผ่าน ola จะปฏิเสธ")
 		fmt.Println("ไม่ให้ปิด task นั้น (ป้อนผล build กลับให้โมเดลแก้ก่อน) เพื่อจับบั๊กตั้งแต่ task ที่ทำให้เกิด")
 		fmt.Println("แทนที่จะปล่อยให้สะสมไปเจอทีเดียวตอน report_complete - เบากว่า verify เต็มรูปแบบเพราะรัน")
-		fmt.Println("เฉพาะ build ไม่รวม test suite")
+		fmt.Println("เฉพาะ build ไม่รวม test suite ทุกครั้งที่ปิด task สำเร็จจะส่ง ntfy.sh notification [TASK] ทันที")
+		fmt.Println("(ถ้าตั้ง -x/OLA_TOPIC ไว้) เว้นแต่เปิด -q/--quiet ซึ่งจะงดแจ้งเตือนระหว่างทางนี้ - ดูหัวข้อ")
+		fmt.Println("Quiet mode ใน 'ola ask -h'")
 		fmt.Println()
 		fmt.Println("report_complete ไม่ได้จบ session ทันที - ola จะรันคำสั่ง build/test ของโปรเจกต์")
 		fmt.Println("เองอีกครั้งอย่างอิสระก่อน ถ้าไม่ผ่าน ผลลัพธ์ error จะถูกป้อนกลับเข้า conversation")
@@ -5461,6 +5599,8 @@ func codingUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  -T, --no-think          ปิด thinking mode")
 		fmt.Println("  -x, --topic <topic>     ส่ง notification ไป ntfy.sh (override $OLA_TOPIC)")
 		fmt.Println("  -o, --output <file>     บันทึก log ลงไฟล์ (default: $OLA_OUTPUT_FILE หรือ output.txt)")
+		fmt.Println("  -q, --quiet             Quiet mode: terminal เหลือแค่ answer/ask_user, notification เหลือแค่")
+		fmt.Println("                          ask_user กับตอนจบงาน (override $OLA_QUIET) - รายละเอียดเต็มดู 'ola ask -h' หัวข้อ Quiet mode")
 		fmt.Println("  -f, --requirements <f>  ไฟล์ requirements (default: requirements.md)")
 		fmt.Println("  --replan                ทิ้ง task state เดิม (.ola-coding-state.json) แล้ววางแผนใหม่")
 		fmt.Println("  --build-cmd <cmd>       ระบุคำสั่ง build เอง (override การตรวจจับอัตโนมัติ)")
@@ -5493,6 +5633,7 @@ func codingUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  ola coding --build-cmd 'go build ./...' --test-cmd 'go test ./...' --allow golangci-lint")
 		fmt.Println("  ola coding --skills-dir /mnt/skills/public,/mnt/skills/private")
 		fmt.Println("  ola coding --api-endpoints 'ollama=http://localhost:11434'")
+		fmt.Println("  ola coding -q -x mytopic --max-duration 6h  # รันแบบเงียบ, ntfy ได้แค่ ASK/จบงาน")
 	}
 }
 
@@ -5505,7 +5646,7 @@ func cmdCoding(args []string) int {
 	fs.SetOutput(io.Discard)
 
 	var model, ctxStr, outputFile, topic, reqFile, buildCmd, testCmd, allowList, maxDurStr string
-	var flagKey, flagNoThink, flagDryRun, flagHelp, flagReplan bool
+	var flagKey, flagNoThink, flagDryRun, flagHelp, flagReplan, flagQuiet bool
 	var maxIterations, cmdTimeoutSec int
 	var searxngURL string
 	var ollamaSearchKey string
@@ -5530,6 +5671,8 @@ func cmdCoding(args []string) int {
 	fs.StringVar(&outputFile, "output", "", "")
 	fs.StringVar(&topic, "x", "", "")
 	fs.StringVar(&topic, "topic", "", "")
+	fs.BoolVar(&flagQuiet, "q", false, "")
+	fs.BoolVar(&flagQuiet, "quiet", false, "")
 	fs.StringVar(&reqFile, "f", "requirements.md", "")
 	fs.StringVar(&reqFile, "requirements", "requirements.md", "")
 	fs.BoolVar(&flagReplan, "replan", false, "")
@@ -5572,6 +5715,11 @@ func cmdCoding(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: --max-duration รูปแบบไม่ถูกต้อง (%v)\n", err)
 		return 1
 	}
+
+	// Quiet mode: flag wins over $OLA_QUIET, same precedence as every other
+	// ola setting. Resolved before any terminal output below (including the
+	// requirements-file/directory-tree load-timing lines).
+	quietMode = flagQuiet || envBool("OLA_QUIET")
 
 	host := os.Getenv("OLA_OLLAMA_API_BASE")
 	if host == "" {
@@ -5629,7 +5777,7 @@ func cmdCoding(args []string) int {
 	logLoad := func(label string, elapsed time.Duration) {
 		note := fmt.Sprintf("%s: %s", label, fmtLoadDur(elapsed))
 		loadTimings = append(loadTimings, note)
-		fmt.Printf("%s📥 %s%s\n", cDim, note, cReset)
+		qprintf("%s📥 %s%s\n", cDim, note, cReset)
 	}
 
 	reqLoadStart := time.Now()
@@ -5691,7 +5839,7 @@ func cmdCoding(args []string) int {
 		state = loaded
 		if existed {
 			done, total := state.progress()
-			fmt.Printf("พบ state เดิมที่ %s (%d/%d tasks เสร็จแล้ว) - ทำงานต่อ ใช้ --replan ถ้าต้องการเริ่มวางแผนใหม่\n", codingStateFile, done, total)
+			qprintf("พบ state เดิมที่ %s (%d/%d tasks เสร็จแล้ว) - ทำงานต่อ ใช้ --replan ถ้าต้องการเริ่มวางแผนใหม่\n", codingStateFile, done, total)
 		}
 	}
 
@@ -5751,6 +5899,11 @@ func cmdCoding(args []string) int {
 		fmt.Printf("── Requirements file: %s ──\n", reqFile)
 		fmt.Printf("── Detected toolchain: %s (build: %q test: %q) ──\n", cmds.Label, cmds.BuildCmd, cmds.TestCmd)
 		fmt.Printf("── Sandbox root (current directory): %s ──\n", cwd)
+		if quietMode {
+			fmt.Println("── Quiet mode: enabled (-q/--quiet or $OLA_QUIET) - ไม่มีผลต่อ --dry-run นี้ ซึ่งแสดงรายละเอียดเต็มเสมอ ──")
+		} else {
+			fmt.Println("── Quiet mode: disabled ──")
+		}
 		for _, lt := range loadTimings {
 			fmt.Printf("── Load time - %s ──\n", lt)
 		}
@@ -5834,6 +5987,9 @@ func cmdCoding(args []string) int {
 		fmt.Fprintln(outFile, "# skills: disabled")
 	}
 	fmt.Fprintf(outFile, "# max-iterations: %d  max-duration: %s  cmd-timeout: %ds\n", maxIterations, maxDuration, cmdTimeoutSec)
+	if quietMode {
+		fmt.Fprintln(outFile, "# quiet mode: enabled (terminal only, this log file is always complete regardless)")
+	}
 	fmt.Fprintln(outFile, "---")
 	fmt.Fprintln(outFile)
 
@@ -5859,13 +6015,13 @@ func cmdCoding(args []string) int {
 		iteration++
 		if iteration > maxIterations {
 			warn := fmt.Sprintf("⚠ หยุดการทำงาน: เกินจำนวนรอบสูงสุด (%d รอบ)", maxIterations)
-			fmt.Printf("\n%s%s%s\n", cRed, warn, cReset)
+			printWarn(fmt.Sprintf("%s%s%s", cRed, warn, cReset))
 			fmt.Fprintf(outFile, "\n[warning] %s\n", warn)
 			break
 		}
 		if time.Since(sessionStart) > maxDuration {
 			warn := fmt.Sprintf("⚠ หยุดการทำงาน: เกินเวลาสูงสุด (%s)", maxDuration)
-			fmt.Printf("\n%s%s%s\n", cRed, warn, cReset)
+			printWarn(fmt.Sprintf("%s%s%s", cRed, warn, cReset))
 			fmt.Fprintf(outFile, "\n[warning] %s\n", warn)
 			break
 		}
@@ -5915,11 +6071,11 @@ func cmdCoding(args []string) int {
 
 		if verifyRequested {
 			done, total := state.progress()
-			fmt.Printf("%s🔎 ola กำลัง verify ด้วย build/test ของโปรเจกต์เอง (tasks: %d/%d)...%s\n", cDim, done, total, cReset)
+			qprintf("%s🔎 ola กำลัง verify ด้วย build/test ของโปรเจกต์เอง (tasks: %d/%d)...%s\n", cDim, done, total, cReset)
 			passed, report := runVerification(cmds, rc.cmdTO)
 			fmt.Fprintf(outFile, "\n[verify] %s\n", report)
 			if passed {
-				fmt.Printf("%s✓ verify ผ่าน - งานเสร็จสมบูรณ์%s\n", cDim, cReset)
+				qprintf("%s✓ verify ผ่าน - งานเสร็จสมบูรณ์%s\n", cDim, cReset)
 				fmt.Fprintf(outFile, "\n[complete] %s\n", reportSummary)
 				if ntfyTopic != "" {
 					sendNotification(ntfyTopic, buildWorkSummary("Work Finished", rc.changes, reportSummary))
@@ -5928,7 +6084,7 @@ func cmdCoding(args []string) int {
 				lastStatusCode = 200
 				break
 			}
-			fmt.Printf("%s✗ verify ไม่ผ่าน - ป้อนผลลัพธ์กลับให้โมเดลแก้ต่อ%s\n", cRed, cReset)
+			qprintf("%s✗ verify ไม่ผ่าน - ป้อนผลลัพธ์กลับให้โมเดลแก้ต่อ%s\n", cRed, cReset)
 			messages = append(messages, ollamaMessage{
 				Role: "tool", Name: "verify",
 				Content: "VERIFY FAILED - report_complete ถูกปฏิเสธเพราะ build/test ของโปรเจกต์ยังไม่ผ่านจริง:\n" + report,
@@ -5941,7 +6097,7 @@ func cmdCoding(args []string) int {
 	}
 
 	if iteration > 1 {
-		fmt.Printf("%s🔁 session: %d round(s), total %s%s\n", cDim, iteration, fmtDur(time.Since(sessionStart)), cReset)
+		qprintf("%s🔁 session: %d round(s), total %s%s\n", cDim, iteration, fmtDur(time.Since(sessionStart)), cReset)
 		fmt.Fprintf(outFile, "🔁 session: %d round(s), total %s\n", iteration, fmtDur(time.Since(sessionStart)))
 	}
 
@@ -5965,4 +6121,772 @@ func cmdCoding(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// ======================================================================
+// Section: api_request (originally api_request.go)
+// ======================================================================
+// Merged into main.go as part of a file-count cleanup; nothing about the
+// logic changed, only its location - see the package doc comment at the
+// top of this file for the full list of what got merged where and why
+// api_request specifically stayed a separate file for as long as it did
+// (it was the newest addition, added after the previous ola.go/
+// integrations.go/coding.go merge below).
+//
+// api_request.go - the "api_request" tool: a general-purpose HTTP client
+// the model can use to call APIs, following the same "only offer what the
+// user actually opted into" principle as web_search/web_fetch/scp_copy
+// (see main.go's package doc comment and integrations.go). Fully opt-in:
+// unless OLA_API_ENDPOINTS/--api-endpoints is set OR --api-allow-direct-url
+// is explicitly turned on, this tool does not exist for the session at
+// all and has zero effect.
+//
+// api_request is meaningfully more dangerous than web_fetch, so it gets
+// its own, stricter guardrails rather than reusing web_fetch's shape
+// as-is:
+//
+//   - web_fetch is GET-only and always public-web-only. api_request can
+//     send POST/PUT/PATCH/DELETE with an arbitrary body, so mutating
+//     methods are gated behind a second, separate opt-in
+//     (--api-allow-mutating/OLA_API_ALLOW_MUTATING) - a session that only
+//     wants read access to some internal API never accidentally exposes
+//     a DELETE.
+//
+//   - Two independent ways to pick a target, same split as
+//     scp_copy/web_fetch's own history in this codebase:
+//
+//     1. "endpoint" mode (preferred, always available once any endpoint
+//        is configured): the model picks a pre-approved alias from
+//        OLA_API_ENDPOINTS - it never supplies a host, port, or scheme
+//        itself, the same "operator pre-approves the destination" shape
+//        scp_copy uses for remote_alias. This is the only way to reach a
+//        private/internal host (e.g. Moo's own Ollama/Open WebUI/SearXNG
+//        stack on Docker Swarm) - see resolveAPIRequestConfig. Optional
+//        per-alias credentials (OLA_API_ENDPOINT_<ALIAS>_AUTH_HEADER/
+//        _AUTH_VALUE) are injected by ola itself and are never visible to
+//        or settable by the model, so a prompt-injected instruction from
+//        some earlier fetched web page can never exfiltrate them.
+//
+//     2. "url" mode (opt-in via --api-allow-direct-url/
+//        OLA_API_ALLOW_DIRECT_URL, off by default): the model supplies a
+//        full URL directly, same as web_fetch. Reuses web_fetch's own SSRF
+//        guard (validateFetchURL in main.go) verbatim, so a direct-mode
+//        api_request call is never less safe than web_fetch is today -
+//        private/reserved IPs and obviously-local hostnames are rejected
+//        exactly the same way.
+//
+//   - Header allowlist: the model can add arbitrary headers EXCEPT a
+//     small reserved set (Host, Content-Length, Transfer-Encoding,
+//     Connection, Authorization) - see isReservedRequestHeader. Blocking
+//     Authorization specifically means "call this API with a bearer
+//     token" always goes through the endpoint-alias + AUTH_HEADER config
+//     path above, never through a token the model typed inline, which
+//     would otherwise end up sitting in the tool_call preview printed to
+//     the terminal and -o log file.
+//
+//   - Request/response size caps (MaxRequestBytes/MaxResponseBytes,
+//     independent of each other) and a per-call timeout, same rationale
+//     as maxFetchDownloadBytes/FetchTimeout in integrations.go.
+//
+//   - A non-2xx HTTP response is NOT treated as a Go error - unlike
+//     web_fetch's doDirectFetch, which does error on non-200. Many real
+//     APIs put the actually-useful information (validation errors,
+//     structured problem-details bodies) in a 4xx/5xx response, and
+//     hiding that from the model would make the tool less useful for
+//     exactly the calls most worth showing it. Only genuine transport
+//     failures (DNS, connection refused, TLS, timeout) become a Go error.
+//     See formatAPIResponse.
+//
+// Available in both "ask" and "coding" (see extraTools in main.go and
+// codingToolset/dispatchCodingToolCall's extra closure) - the same set of
+// subcommands web_search/web_fetch are offered in, since api_request is a
+// general capability rather than an ask-only convenience like scp_copy.
+
+// ─────────────────────────────────────────────────────────────────
+// Config
+// ─────────────────────────────────────────────────────────────────
+
+const (
+	defaultAPIRequestTimeoutSec       = 30
+	defaultAPIRequestMaxBodyBytes     = 2 << 20 // 2MB - request body the model builds itself (json/form/multipart/text/binary)
+	defaultAPIRequestMaxResponseBytes = 4 << 20 // 4MB - raw download cap, independent of the further text-truncation below
+
+	// maxAPIResultOutput caps how much of a text/json/xml response body is
+	// actually shown to the model, same budget/rationale as
+	// maxWebResultOutput (integrations.go) - one verbose API response must
+	// not blow the context budget by itself.
+	maxAPIResultOutput = 6000
+)
+
+// apiEndpoint is one operator-configured, pre-approved API target. The
+// model only ever selects one of these by Alias - BaseURL, AuthHeader, and
+// AuthValue are never visible to or settable by the model, mirroring how
+// scpHost's user/host/port/remote-root are never model-controlled either.
+type apiEndpoint struct {
+	Alias      string
+	BaseURL    string
+	AuthHeader string // e.g. "Authorization" or "X-API-Key"; empty = no injected auth for this endpoint
+	AuthValue  string // never logged, never echoed back into any tool_call preview
+}
+
+// apiRequestConfig is the resolved result of OLA_API_ENDPOINTS/
+// --api-endpoints plus the direct-URL/mutating-method opt-ins and the
+// shared timeout/size caps. enabled() gates whether api_request is
+// offered to the model at all, mirroring searchConfig.searchEnabled()/
+// scpConfig.enabled() elsewhere in this codebase.
+type apiRequestConfig struct {
+	Endpoints     map[string]apiEndpoint
+	EndpointOrder []string // preserves config order for stable-ish error listings before sorting
+
+	AllowDirectURL bool // opt-in: model may also pass a raw "url" instead of "endpoint"+"path"
+	AllowMutating  bool // opt-in: POST/PUT/PATCH/DELETE; GET/HEAD/OPTIONS always allowed once enabled() is true
+
+	Timeout          time.Duration
+	MaxRequestBytes  int64
+	MaxResponseBytes int64
+}
+
+func (c apiRequestConfig) enabled() bool {
+	return len(c.Endpoints) > 0 || c.AllowDirectURL
+}
+
+// endpointList renders the allowed alias names for error messages, sorted
+// so the message is stable/testable rather than depending on map
+// iteration order - same approach as scpConfig.aliasList.
+func (c apiRequestConfig) endpointList() string {
+	if len(c.EndpointOrder) == 0 {
+		return "(ไม่มี - ยังไม่ได้ตั้งค่า OLA_API_ENDPOINTS/--api-endpoints)"
+	}
+	names := append([]string{}, c.EndpointOrder...)
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
+
+// resolveAPIRequestConfig applies flag > env > default precedence, the
+// same convention used throughout ola (resolveSearchConfig, resolveSCPConfig).
+// A bad individual OLA_API_ENDPOINTS entry is collected as a warning (that
+// one alias is skipped), not fatal - same non-fatal shape resolveSCPConfig
+// uses for OLA_SCP_HOSTS.
+func resolveAPIRequestConfig(endpointsFlag string, allowDirectFlag, allowMutatingFlag bool, timeoutSecFlag int, maxReqBytesFlag, maxRespBytesFlag int64) (apiRequestConfig, []string) {
+	var warnings []string
+
+	raw := endpointsFlag
+	if raw == "" {
+		raw = os.Getenv("OLA_API_ENDPOINTS")
+	}
+	endpoints := map[string]apiEndpoint{}
+	var order []string
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		ep, err := parseAPIEndpointEntry(entry)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("OLA_API_ENDPOINTS: ข้าม entry %q (%v)", entry, err))
+			continue
+		}
+		if _, dup := endpoints[ep.Alias]; dup {
+			warnings = append(warnings, fmt.Sprintf("OLA_API_ENDPOINTS: alias %q ซ้ำ - ใช้ตัวแรกที่เจอ", ep.Alias))
+			continue
+		}
+		ep.AuthHeader, ep.AuthValue = resolveAPIEndpointAuth(ep.Alias)
+		endpoints[ep.Alias] = ep
+		order = append(order, ep.Alias)
+	}
+
+	allowDirect := allowDirectFlag || envBool("OLA_API_ALLOW_DIRECT_URL")
+	allowMutating := allowMutatingFlag || envBool("OLA_API_ALLOW_MUTATING")
+
+	timeoutSec := timeoutSecFlag
+	if timeoutSec <= 0 {
+		timeoutSec = envInt("OLA_API_REQUEST_TIMEOUT_SEC", defaultAPIRequestTimeoutSec)
+	}
+	maxReq := maxReqBytesFlag
+	if maxReq <= 0 {
+		maxReq = int64(envInt("OLA_API_REQUEST_MAX_BODY_BYTES", defaultAPIRequestMaxBodyBytes))
+	}
+	maxResp := maxRespBytesFlag
+	if maxResp <= 0 {
+		maxResp = int64(envInt("OLA_API_REQUEST_MAX_RESPONSE_BYTES", defaultAPIRequestMaxResponseBytes))
+	}
+
+	return apiRequestConfig{
+		Endpoints:        endpoints,
+		EndpointOrder:    order,
+		AllowDirectURL:   allowDirect,
+		AllowMutating:    allowMutating,
+		Timeout:          time.Duration(timeoutSec) * time.Second,
+		MaxRequestBytes:  maxReq,
+		MaxResponseBytes: maxResp,
+	}, warnings
+}
+
+// parseAPIEndpointEntry parses one "alias=https://base.url" entry from
+// OLA_API_ENDPOINTS/--api-endpoints - deliberately simpler than
+// parseSCPHostEntry's "alias=user@host[:port]/root" shape, since an API
+// endpoint is just a base URL, not a user/host/port/root tuple. Only ONE
+// "=" is expected (between alias and the URL); base URLs don't contain a
+// bare "=" in practice, and unlike parseSCPHostEntry there's no second
+// delimiter to worry about.
+func parseAPIEndpointEntry(entry string) (apiEndpoint, error) {
+	const usage = `รูปแบบต้องเป็น "alias=https://base.url"`
+
+	eqIdx := strings.Index(entry, "=")
+	if eqIdx <= 0 {
+		return apiEndpoint{}, fmt.Errorf("%s", usage)
+	}
+	alias := strings.TrimSpace(entry[:eqIdx])
+	base := strings.TrimSpace(entry[eqIdx+1:])
+	if alias == "" || base == "" {
+		return apiEndpoint{}, fmt.Errorf("alias/base URL ต้องไม่ว่างเปล่า")
+	}
+	u, err := url.Parse(base)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return apiEndpoint{}, fmt.Errorf("base URL ต้องเป็น http/https ที่ถูกต้อง (ได้ %q)", base)
+	}
+	// Deliberately NO SSRF guard here, unlike validateFetchURL: an
+	// endpoint's base URL is trusted operator configuration, not
+	// model-controlled input - the whole point of endpoint mode is to let
+	// a private/internal host (e.g. http://localhost:11434) be reached
+	// safely, which the model itself could never do via direct-URL mode.
+	return apiEndpoint{Alias: alias, BaseURL: strings.TrimRight(base, "/")}, nil
+}
+
+// resolveAPIEndpointAuth reads an optional per-alias credential the model
+// never sees: OLA_API_ENDPOINT_<ALIAS>_AUTH_HEADER names the header (e.g.
+// "Authorization", "X-API-Key") and OLA_API_ENDPOINT_<ALIAS>_AUTH_VALUE is
+// its value. Both are read fresh from the environment (not from
+// --api-endpoints, which only ever carries base URLs) so a secret value
+// never has to appear in a shell history alongside the endpoint list, and
+// is never part of anything printed/logged for this alias's config.
+func resolveAPIEndpointAuth(alias string) (header, value string) {
+	key := envKeyFromAlias(alias)
+	header = strings.TrimSpace(os.Getenv("OLA_API_ENDPOINT_" + key + "_AUTH_HEADER"))
+	if header == "" {
+		return "", ""
+	}
+	return header, os.Getenv("OLA_API_ENDPOINT_" + key + "_AUTH_VALUE")
+}
+
+// envKeyFromAlias upper-cases alias and replaces every non [A-Z0-9] rune
+// with "_", turning an alias like "open-webui" into the env var fragment
+// "OPEN_WEBUI" (so OLA_API_ENDPOINT_OPEN_WEBUI_AUTH_HEADER is what you'd
+// set for it) - env var names can't contain "-".
+func envKeyFromAlias(alias string) string {
+	var b strings.Builder
+	for _, r := range strings.ToUpper(alias) {
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
+}
+
+// envBool reports whether an environment variable is set to a
+// conventional "true" value. Unlike envInt (which has a numeric default),
+// every api_request boolean opt-in defaults to false/off when unset, so a
+// simple presence-style check is all that's needed.
+func envBool(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Tool schema
+// ─────────────────────────────────────────────────────────────────
+
+var apiRequestTool = ollamaTool{
+	Type: "function",
+	Function: ollamaToolFunction{
+		Name: "api_request",
+		Description: "ยิง HTTP request ไปยัง API รองรับ 2 วิธีเลือกปลายทาง: (1) endpoint - ระบุ \"endpoint\" " +
+			"เป็นชื่อ alias ที่ผู้ใช้ตั้งค่าไว้ล่วงหน้า (OLA_API_ENDPOINTS) พร้อม \"path\" ต่อท้าย - วิธีนี้เท่านั้นที่เข้าถึง " +
+			"host ภายใน/private ได้ และถ้า endpoint นั้นตั้ง credential ไว้ ola จะแนบให้เองโดยที่โมเดลไม่เห็นค่าจริง " +
+			"(2) url - ระบุ URL ตรง (เฉพาะเมื่อเปิด --api-allow-direct-url ไว้) รองรับเฉพาะเว็บสาธารณะเหมือน web_fetch " +
+			"(ปฏิเสธ private/reserved IP) ระบุ query/headers เพิ่มเติมได้ (ยกเว้น header ที่สงวนไว้ เช่น Authorization - " +
+			"ถ้าต้องใช้ auth ให้ตั้งค่าไว้ที่ endpoint แทน) method GET/HEAD/OPTIONS ใช้ได้เสมอ ส่วน POST/PUT/PATCH/DELETE " +
+			"ต้องเปิด --api-allow-mutating ไว้ก่อน body รองรับหลายชนิดผ่าน body_type: json (body เป็น object/array), " +
+			"form (body เป็น object key:value, ส่งแบบ x-www-form-urlencoded), multipart (body เป็น object field:value " +
+			"บวก multipart_files สำหรับไฟล์แนบในเครื่อง), text (body เป็น string ดิบ), binary (body เป็น base64 string), " +
+			"none (ไม่มี body) response ที่ไม่ใช่ 2xx จะไม่ถือเป็น error - จะคืน status code และเนื้อหากลับมาให้ตัดสินใจเอง",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"endpoint": map[string]interface{}{
+					"type":        "string",
+					"description": "ชื่อ alias ของ endpoint ที่ config ไว้ (ระบุอย่างใดอย่างหนึ่งกับ url เท่านั้น)",
+				},
+				"path": map[string]interface{}{
+					"type":        "string",
+					"description": "path ต่อท้าย base URL ของ endpoint เช่น \"/api/tags\" (ใช้คู่กับ endpoint เท่านั้น)",
+				},
+				"url": map[string]interface{}{
+					"type":        "string",
+					"description": "URL ปลายทางแบบเต็ม http/https (ใช้ได้เฉพาะเมื่อเปิด --api-allow-direct-url - ระบุอย่างใดอย่างหนึ่งกับ endpoint เท่านั้น)",
+				},
+				"method": map[string]interface{}{
+					"type":        "string",
+					"enum":        []string{"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"},
+					"description": "default: GET",
+				},
+				"query": map[string]interface{}{
+					"type":        "object",
+					"description": "query string params เพิ่มเติม (key:value เป็น string หรือ ตัวเลข/บูลีน)",
+				},
+				"headers": map[string]interface{}{
+					"type":        "object",
+					"description": "header เพิ่มเติม (key:value เป็น string) - header ที่สงวนไว้ (Host, Authorization, Content-Length, Transfer-Encoding, Connection) จะถูกข้ามเสมอ",
+				},
+				"body_type": map[string]interface{}{
+					"type":        "string",
+					"enum":        []string{"json", "form", "multipart", "text", "binary", "none"},
+					"description": "default: none",
+				},
+				"body": map[string]interface{}{
+					"description": "เนื้อหา body ตาม body_type: json→object/array ใดๆ, form/multipart→object ของ field:value string, text→string ดิบ, binary→string base64, none→ไม่ต้องใส่",
+				},
+				"multipart_files": map[string]interface{}{
+					"type":        "array",
+					"items":       map[string]interface{}{"type": "string"},
+					"description": "รายการ path ไฟล์ในเครื่อง (ต้องอยู่ใต้ current directory) ที่จะแนบเป็น multipart file field - ใช้ได้เฉพาะ body_type=multipart",
+				},
+			},
+			"required": []string{},
+		},
+	},
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Reserved / blocked request headers
+// ─────────────────────────────────────────────────────────────────
+
+// reservedAPIRequestHeaders lists header names the model is never allowed
+// to set directly, regardless of endpoint/direct-URL mode:
+//   - Host/Content-Length/Transfer-Encoding/Connection are connection-level
+//     concerns net/http manages itself; letting the model set them risks
+//     request smuggling / a mismatched body length rather than anything
+//     useful.
+//   - Authorization is blocked so "call this API with a bearer token"
+//     always goes through the endpoint-alias + AUTH_HEADER/AUTH_VALUE
+//     config path (see resolveAPIEndpointAuth) instead of a token typed
+//     inline by the model - which would otherwise sit in plain text in
+//     the tool_call preview printed to the terminal and -o log file (see
+//     dispatchToolCall in main.go), and could be exfiltrated to an
+//     attacker-chosen direct-mode URL by a prompt-injected instruction.
+var reservedAPIRequestHeaders = map[string]bool{
+	"host":              true,
+	"content-length":    true,
+	"transfer-encoding": true,
+	"connection":        true,
+	"authorization":     true,
+}
+
+func isReservedRequestHeader(name string) bool {
+	return reservedAPIRequestHeaders[strings.ToLower(strings.TrimSpace(name))]
+}
+
+// allowedAPIRequestMethods is the full set api_request ever sends,
+// regardless of AllowMutating - anything else (TRACE, CONNECT, a typo)
+// is rejected outright rather than passed through to net/http.
+var allowedAPIRequestMethods = map[string]bool{
+	http.MethodGet:     true,
+	http.MethodHead:    true,
+	http.MethodOptions: true,
+	http.MethodPost:    true,
+	http.MethodPut:     true,
+	http.MethodPatch:   true,
+	http.MethodDelete:  true,
+}
+
+func isMutatingMethod(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Tool implementation
+// ─────────────────────────────────────────────────────────────────
+
+func toolAPIRequest(args map[string]interface{}, cfg apiRequestConfig) (string, error) {
+	if !cfg.enabled() {
+		return "", fmt.Errorf("api_request ถูกปิดใช้งานสำหรับเซสชันนี้ (ตั้ง OLA_API_ENDPOINTS/--api-endpoints หรือเปิด --api-allow-direct-url/OLA_API_ALLOW_DIRECT_URL ก่อน)")
+	}
+
+	method := strings.ToUpper(strings.TrimSpace(stringArg(args, "method")))
+	if method == "" {
+		method = http.MethodGet
+	}
+	if !allowedAPIRequestMethods[method] {
+		return "", fmt.Errorf("method %q ไม่รองรับ (รองรับเฉพาะ GET/HEAD/OPTIONS/POST/PUT/PATCH/DELETE)", method)
+	}
+	if isMutatingMethod(method) && !cfg.AllowMutating {
+		return "", fmt.Errorf(
+			"method %s ต้องเปิด --api-allow-mutating/OLA_API_ALLOW_MUTATING ก่อน "+
+				"(ค่า default อนุญาตแค่ GET/HEAD/OPTIONS เพื่อกันเรียก API ที่มีผลข้างเคียงโดยไม่ตั้งใจ)", method)
+	}
+
+	target, endpointAlias, err := resolveAPIRequestTarget(args, cfg)
+	if err != nil {
+		return "", err
+	}
+	if q := stringMapArg(args["query"]); len(q) > 0 {
+		qs := target.Query()
+		for k, v := range q {
+			qs.Set(k, v)
+		}
+		target.RawQuery = qs.Encode()
+	}
+
+	bodyType := strings.ToLower(strings.TrimSpace(stringArg(args, "body_type")))
+	bodyReader, contentType, err := buildAPIRequestBody(bodyType, args["body"], stringsFromArg(args["multipart_files"]), cfg.MaxRequestBytes)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequest(method, target.String(), bodyReader)
+	if err != nil {
+		return "", fmt.Errorf("สร้าง request ไม่สำเร็จ: %w", err)
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	for k, v := range stringMapArg(args["headers"]) {
+		if isReservedRequestHeader(k) {
+			continue
+		}
+		req.Header.Set(k, v)
+	}
+	// Endpoint auth is applied LAST, after any model-set headers, so a
+	// model-supplied header (even if it somehow matched the same name)
+	// can never shadow the operator-configured credential.
+	if endpointAlias != "" {
+		if ep := cfg.Endpoints[endpointAlias]; ep.AuthHeader != "" {
+			req.Header.Set(ep.AuthHeader, ep.AuthValue)
+		}
+	}
+
+	client := &http.Client{Timeout: cfg.Timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("เรียก API ไม่สำเร็จ: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, cfg.MaxResponseBytes))
+	if err != nil {
+		return "", fmt.Errorf("อ่าน response body ไม่ได้: %w", err)
+	}
+	return formatAPIResponse(resp, body), nil
+}
+
+// resolveAPIRequestTarget picks the destination URL for one call, either
+// from a pre-approved endpoint alias (+ optional path) or, only when
+// AllowDirectURL is on, a raw model-supplied URL run through the exact
+// same SSRF guard web_fetch uses (validateFetchURL, main.go).
+func resolveAPIRequestTarget(args map[string]interface{}, cfg apiRequestConfig) (target *url.URL, endpointAlias string, err error) {
+	endpointAlias = strings.TrimSpace(stringArg(args, "endpoint"))
+	rawURL := strings.TrimSpace(stringArg(args, "url"))
+
+	switch {
+	case endpointAlias != "" && rawURL != "":
+		return nil, "", fmt.Errorf("ระบุได้แค่ endpoint หรือ url อย่างใดอย่างหนึ่ง ไม่ใช่ทั้งคู่")
+
+	case endpointAlias != "":
+		ep, ok := cfg.Endpoints[endpointAlias]
+		if !ok {
+			return nil, "", fmt.Errorf("ไม่รู้จัก endpoint %q - endpoint ที่อนุญาตไว้: %s", endpointAlias, cfg.endpointList())
+		}
+		full, err := joinEndpointPath(ep.BaseURL, stringArg(args, "path"))
+		if err != nil {
+			return nil, "", err
+		}
+		u, err := url.Parse(full)
+		if err != nil {
+			return nil, "", fmt.Errorf("ประกอบ URL จาก endpoint %q ไม่สำเร็จ: %w", endpointAlias, err)
+		}
+		return u, endpointAlias, nil
+
+	case rawURL != "":
+		if !cfg.AllowDirectURL {
+			return nil, "", fmt.Errorf(
+				"การระบุ url ตรงถูกปิดใช้งาน (เปิดด้วย --api-allow-direct-url/OLA_API_ALLOW_DIRECT_URL) - " +
+					"ใช้ endpoint ที่ config ไว้แทน (ดู endpoint ที่มีได้จาก error เมื่อระบุ endpoint ผิด)")
+		}
+		if err := validateFetchURL(rawURL); err != nil {
+			return nil, "", err
+		}
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			return nil, "", fmt.Errorf("URL ไม่ถูกต้อง: %w", err)
+		}
+		return u, "", nil
+
+	default:
+		return nil, "", fmt.Errorf("ต้องระบุ endpoint (+path ถ้าต้องการ) หรือ url อย่างใดอย่างหนึ่ง")
+	}
+}
+
+// joinEndpointPath combines an endpoint's trusted BaseURL with a
+// model-supplied "path" - deliberately parsing p purely for its
+// Path/RawQuery and discarding any Scheme/Host it might contain, so a
+// path like "http://evil.example/x" can never redirect the request to a
+// different host: net/url parses "evil.example" as p's Host, which this
+// function never looks at, leaving only "/x" as the effective path.
+func joinEndpointPath(base, p string) (string, error) {
+	bu, err := url.Parse(base)
+	if err != nil {
+		return "", fmt.Errorf("endpoint base URL ไม่ถูกต้อง: %w", err)
+	}
+	if p == "" {
+		return bu.String(), nil
+	}
+	pu, err := url.Parse(p)
+	if err != nil {
+		return "", fmt.Errorf("path ไม่ถูกต้อง: %w", err)
+	}
+	joined := *bu
+	joined.Path = singleJoiningSlash(bu.Path, pu.Path)
+	if pu.RawQuery != "" {
+		joined.RawQuery = pu.RawQuery
+	}
+	return joined.String(), nil
+}
+
+// singleJoiningSlash joins two path segments with exactly one "/" between
+// them, the same small helper net/http/httputil's reverse proxy uses for
+// the identical "base path + sub path" problem.
+func singleJoiningSlash(a, b string) string {
+	aSlash := strings.HasSuffix(a, "/")
+	bSlash := strings.HasPrefix(b, "/")
+	switch {
+	case aSlash && bSlash:
+		return a + b[1:]
+	case !aSlash && !bSlash && b != "":
+		return a + "/" + b
+	default:
+		return a + b
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Body encoding
+// ─────────────────────────────────────────────────────────────────
+
+// buildAPIRequestBody encodes args["body"] (plus, for multipart,
+// args["multipart_files"]) according to bodyType, returning a ready
+// io.Reader and the Content-Type header that goes with it. Every branch
+// enforces maxBytes itself (after encoding, since json/form encoding can
+// grow the effective size) rather than relying on the caller to check
+// once at the end.
+func buildAPIRequestBody(bodyType string, bodyArg interface{}, files []string, maxBytes int64) (io.Reader, string, error) {
+	switch bodyType {
+	case "", "none":
+		return nil, "", nil
+
+	case "json":
+		if bodyArg == nil {
+			return nil, "", fmt.Errorf("body_type เป็น json ต้องระบุ body")
+		}
+		data, err := json.Marshal(bodyArg)
+		if err != nil {
+			return nil, "", fmt.Errorf("แปลง body เป็น JSON ไม่ได้: %w", err)
+		}
+		if int64(len(data)) > maxBytes {
+			return nil, "", fmt.Errorf("body ใหญ่เกินกำหนด (%d bytes, จำกัด %d bytes)", len(data), maxBytes)
+		}
+		return bytes.NewReader(data), "application/json", nil
+
+	case "form":
+		m := stringMapArg(bodyArg)
+		if len(m) == 0 {
+			return nil, "", fmt.Errorf("body_type เป็น form ต้องระบุ body เป็น object ของ key:value")
+		}
+		vals := url.Values{}
+		for k, v := range m {
+			vals.Set(k, v)
+		}
+		encoded := vals.Encode()
+		if int64(len(encoded)) > maxBytes {
+			return nil, "", fmt.Errorf("body ใหญ่เกินกำหนด (%d bytes, จำกัด %d bytes)", len(encoded), maxBytes)
+		}
+		return strings.NewReader(encoded), "application/x-www-form-urlencoded", nil
+
+	case "multipart":
+		return buildMultipartRequestBody(bodyArg, files, maxBytes)
+
+	case "text":
+		s, ok := bodyArg.(string)
+		if !ok || s == "" {
+			return nil, "", fmt.Errorf("body_type เป็น text ต้องระบุ body เป็น string")
+		}
+		if int64(len(s)) > maxBytes {
+			return nil, "", fmt.Errorf("body ใหญ่เกินกำหนด (%d bytes, จำกัด %d bytes)", len(s), maxBytes)
+		}
+		return strings.NewReader(s), "text/plain; charset=utf-8", nil
+
+	case "binary":
+		s, ok := bodyArg.(string)
+		if !ok || s == "" {
+			return nil, "", fmt.Errorf("body_type เป็น binary ต้องระบุ body เป็น base64 string")
+		}
+		data, err := base64.StdEncoding.DecodeString(s)
+		if err != nil {
+			return nil, "", fmt.Errorf("decode base64 ไม่สำเร็จ: %w", err)
+		}
+		if int64(len(data)) > maxBytes {
+			return nil, "", fmt.Errorf("body ใหญ่เกินกำหนด (%d bytes หลัง decode, จำกัด %d bytes)", len(data), maxBytes)
+		}
+		return bytes.NewReader(data), "application/octet-stream", nil
+
+	default:
+		return nil, "", fmt.Errorf("body_type ไม่รู้จัก: %q (ต้องเป็น json/form/multipart/text/binary/none)", bodyType)
+	}
+}
+
+// buildMultipartRequestBody writes both plain fields (from bodyArg, same
+// object shape as "form") and file attachments (from files, each resolved
+// through sandboxedPath - the same working-directory confinement
+// toolReadFile uses) into one multipart/form-data body. Each attached
+// file gets its own numbered field name ("file0", "file1", ...) so
+// multiple files never collide on a shared field name.
+func buildMultipartRequestBody(bodyArg interface{}, files []string, maxBytes int64) (io.Reader, string, error) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+
+	for k, v := range stringMapArg(bodyArg) {
+		if err := mw.WriteField(k, v); err != nil {
+			return nil, "", fmt.Errorf("เขียน multipart field %q ไม่ได้: %w", k, err)
+		}
+	}
+
+	for i, rel := range files {
+		full, err := sandboxedPath(rel)
+		if err != nil {
+			return nil, "", fmt.Errorf("multipart_files: %w", err)
+		}
+		f, err := os.Open(full)
+		if err != nil {
+			return nil, "", fmt.Errorf("เปิดไฟล์ %s ไม่ได้: %w", rel, err)
+		}
+		part, err := mw.CreateFormFile(fmt.Sprintf("file%d", i), filepath.Base(full))
+		if err != nil {
+			f.Close()
+			return nil, "", fmt.Errorf("สร้าง multipart file field สำหรับ %s ไม่ได้: %w", rel, err)
+		}
+		_, copyErr := io.Copy(part, f)
+		f.Close()
+		if copyErr != nil {
+			return nil, "", fmt.Errorf("อ่านไฟล์ %s ไม่สำเร็จ: %w", rel, copyErr)
+		}
+		if int64(buf.Len()) > maxBytes {
+			return nil, "", fmt.Errorf("multipart body ใหญ่เกินกำหนด (จำกัด %d bytes) หลังแนบ %s", maxBytes, rel)
+		}
+	}
+
+	if err := mw.Close(); err != nil {
+		return nil, "", fmt.Errorf("ปิด multipart writer ไม่สำเร็จ: %w", err)
+	}
+	if int64(buf.Len()) > maxBytes {
+		return nil, "", fmt.Errorf("multipart body ใหญ่เกินกำหนด (%d bytes, จำกัด %d bytes)", buf.Len(), maxBytes)
+	}
+	return &buf, mw.FormDataContentType(), nil
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Response formatting
+// ─────────────────────────────────────────────────────────────────
+
+// formatAPIResponse renders one HTTP response for the model: status line,
+// a small fixed set of response headers worth surfacing by default
+// (Content-Type/Content-Length/Location - not the full header set, which
+// is long and mostly irrelevant), then the body. A binary/non-text body
+// is deliberately NOT included (only its size + content-type are
+// reported) so a large binary response can never blow the context budget
+// via an accidental base64 dump; a text/json/xml body is truncated to
+// maxAPIResultOutput, same as web_fetch's own result truncation.
+func formatAPIResponse(resp *http.Response, body []byte) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "HTTP %d %s\n", resp.StatusCode, http.StatusText(resp.StatusCode))
+	for _, h := range []string{"Content-Type", "Content-Length", "Location"} {
+		if v := resp.Header.Get(h); v != "" {
+			fmt.Fprintf(&b, "%s: %s\n", h, v)
+		}
+	}
+	b.WriteString("\n")
+
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	switch {
+	case len(body) == 0:
+		b.WriteString("(response body ว่างเปล่า)")
+	case strings.Contains(ct, "json") || strings.Contains(ct, "text") || strings.Contains(ct, "xml") || ct == "":
+		b.WriteString(truncateText(string(body), maxAPIResultOutput))
+	default:
+		fmt.Fprintf(&b, "(response body เป็น binary/ไม่ใช่ข้อความ - %d bytes, content-type %q - ไม่แสดงเนื้อหา)", len(body), resp.Header.Get("Content-Type"))
+	}
+	return b.String()
+}
+
+// formatAPIRequestNotification renders a one-line summary of a mutating
+// api_request call for the session change log / ntfy.sh notification -
+// same rationale and truncateWords/maxNotificationWords budget as
+// formatFileChangeNotification (write_file/edit_file) and
+// formatSCPNotification (scp_copy) use for their own side-effecting calls.
+func formatAPIRequestNotification(args map[string]interface{}) string {
+	method := strings.ToUpper(strings.TrimSpace(stringArg(args, "method")))
+	target := stringArg(args, "endpoint")
+	if target != "" {
+		if p := stringArg(args, "path"); p != "" {
+			target += p
+		}
+	} else {
+		target = stringArg(args, "url")
+	}
+	return truncateWords(fmt.Sprintf("[API:%s] %s", method, target), maxNotificationWords)
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Small arg-decoding helpers shared by this file
+// ─────────────────────────────────────────────────────────────────
+
+// stringArg reads a string-typed tool argument, returning "" for a
+// missing key or a value of the wrong type rather than panicking - same
+// permissive-decode approach stringsFromArg (integrations.go) uses.
+func stringArg(args map[string]interface{}, key string) string {
+	s, _ := args[key].(string)
+	return s
+}
+
+// stringMapArg converts a JSON-decoded object argument (map[string]interface{},
+// as produced by json.Unmarshal into map[string]interface{}) into a clean
+// map[string]string. Non-string scalar values (numbers/bools) are
+// coerced via fmt.Sprint for convenience, since local models sometimes
+// emit an unquoted number for something like a query param; nested
+// objects/arrays are dropped since neither query strings nor form/header
+// values have a sane string representation for those.
+func stringMapArg(v interface{}) map[string]string {
+	raw, _ := v.(map[string]interface{})
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(raw))
+	for k, val := range raw {
+		switch t := val.(type) {
+		case string:
+			out[k] = t
+		case float64, bool:
+			out[k] = fmt.Sprint(t)
+		}
+	}
+	return out
 }

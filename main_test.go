@@ -1,19 +1,30 @@
-// unit_test.go - focused, no-network unit tests, consolidated from
+// main_test.go - ola's whole test suite in one file: focused, no-network
+// unit tests (originally unit_test.go, itself already a consolidation of
 // coding_test.go, folder_delay_test.go, stream_test.go, notify_test.go,
-// time_test.go, scp_test.go, search_test.go, and skills_test.go during a
-// file-count cleanup (see integration_test.go for the end-to-end/
-// httptest-driven tests, kept separate on purpose so the two styles of
-// test don't get mixed together in one file).
-
+// time_test.go, scp_test.go, search_test.go, and skills_test.go),
+// end-to-end httptest-driven tests that drive the real cmdAsk/cmdCoding
+// entry points against a mocked Ollama /api/chat endpoint (originally
+// integration_test.go, itself a consolidation of ask_integration_test.go,
+// coding_integration_test.go, scp_integration_test.go, and
+// freshness_test.go), api_request-specific tests (originally
+// api_request_test.go), and the quiet-mode tests for -q/--quiet/$OLA_QUIET
+// (new). Merged into one file as part of the same file-count cleanup this
+// package's non-test .go files went through - see main.go's own package
+// doc comment - nothing about any individual test changed, only its
+// location. Look for the "======= Section:" banners below to find where
+// each former file's content begins.
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -24,6 +35,10 @@ import (
 	"time"
 	"unicode/utf8"
 )
+
+// ======================================================================
+// Section: unit_test.go
+// ======================================================================
 
 // ======================================================================
 // coding_test.go
@@ -3257,5 +3272,1573 @@ func TestCmdAskWithoutSkillsDirNeverOffersReadSkill(t *testing.T) {
 	}
 	if strings.Contains(gotBody, "AVAILABLE SKILLS") {
 		t.Fatalf("expected no AVAILABLE SKILLS section in the system prompt when skills are disabled, got: %s", gotBody)
+	}
+}
+
+// ======================================================================
+// Section: integration_test.go
+// ======================================================================
+
+// ======================================================================
+// coding_integration_test.go
+// ======================================================================
+
+// streamLine renders one NDJSON chunk matching ollamaStreamChunk's shape.
+func streamLine(content, toolName, toolArgsJSON string, done bool) string {
+	toolCallsField := ""
+	if toolName != "" {
+		toolCallsField = fmt.Sprintf(`,"tool_calls":[{"function":{"name":%q,"arguments":%s}}]`, toolName, toolArgsJSON)
+	}
+	doneStr := "false"
+	if done {
+		doneStr = "true"
+	}
+	return fmt.Sprintf(`{"message":{"role":"assistant","content":%q%s},"done":%s}`, content, toolCallsField, doneStr) + "\n"
+}
+
+// TestCmdCodingFullLoop drives cmdCoding against a real temp Go project
+// through a scripted, multi-round mock model that:
+//  1. registers a task list (add_tasks)
+//  2. writes a main.go that DOES NOT COMPILE
+//  3. claims completion (report_complete) - expecting ola's independent
+//     verify step to reject it
+//  4. on the next round, fixes the file (edit_file), marks the task done,
+//     and calls report_complete again - expecting verify to now pass and
+//     the session to end successfully.
+//
+// This exercises the whole new machinery end-to-end: tool dispatch for the
+// four new coding tools, the independent build/test verification gate
+// (never trusting report_complete on its own), state persistence to
+// .ola-coding-state.json/PROGRESS.md, and clean loop termination.
+func TestCmdCodingFullLoop(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	if err := os.WriteFile("go.mod", []byte("module codingtest\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("requirements.md", []byte("# ระบบทดสอบ\nสร้างโปรแกรม hello world ภาษา Go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var round int32
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&round, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		switch n {
+		case 1:
+			// Round 1: plan the single task.
+			fmt.Fprint(w, streamLine("", "add_tasks", `{"tasks":["Write hello world main.go"]}`, true))
+		case 2:
+			// Round 2: write BROKEN Go code (missing closing brace/paren).
+			broken := `package main
+
+import "fmt"
+
+func main() {
+	fmt.Println("hello"
+}
+`
+			argsJSON := fmt.Sprintf(`{"path":"main.go","content":%q}`, broken)
+			fmt.Fprint(w, streamLine("", "write_file", argsJSON, true))
+		case 3:
+			// Round 3: claim done before actually verifying - ola should
+			// catch this since the file doesn't compile.
+			fmt.Fprint(w, streamLine("", "report_complete", `{"summary":"hello world program written"}`, true))
+		case 4:
+			// Round 4: model sees the VERIFY FAILED tool result for the
+			// previous report_complete and fixes the file for real.
+			argsJSON := fmt.Sprintf(`{"path":"main.go","old_str":%q,"new_str":%q}`,
+				`fmt.Println("hello"
+}`, `fmt.Println("hello")
+}`)
+			fmt.Fprint(w, streamLine("", "edit_file", argsJSON, true))
+		case 5:
+			fmt.Fprint(w, streamLine("", "mark_task_done", `{"task_id":"T0","note":"fixed and compiles"}`, true))
+		case 6:
+			fmt.Fprint(w, streamLine("", "report_complete", `{"summary":"hello world program written and verified"}`, true))
+		default:
+			t.Errorf("unexpected extra round %d", n)
+			fmt.Fprint(w, streamLine("unexpected extra round", "", "", true))
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdCoding([]string{"-m", "mock-model", "-o", "coding-output.log"})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdCoding to exit 0, got %d", exitCode)
+	}
+	if got := atomic.LoadInt32(&round); got != 6 {
+		t.Fatalf("expected exactly 6 mock rounds (plan, break, false-complete, fix, mark-done, real-complete), got %d", got)
+	}
+
+	// The fixed program should actually compile and run correctly now.
+	out, err := exec.Command("go", "run", "main.go").CombinedOutput()
+	if err != nil {
+		t.Fatalf("expected the final main.go to build/run cleanly, got error: %v\noutput: %s", err, out)
+	}
+	if !strings.Contains(string(out), "hello") {
+		t.Fatalf("expected program output to contain 'hello', got: %s", out)
+	}
+
+	progress, err := os.ReadFile(codingProgressFile)
+	if err != nil {
+		t.Fatalf("expected %s to exist: %v", codingProgressFile, err)
+	}
+	if !strings.Contains(string(progress), "1 / 1 tasks") {
+		t.Fatalf("expected PROGRESS.md to show 1/1 tasks done, got:\n%s", progress)
+	}
+
+	state, existed := loadCodingState(codingStateFile)
+	if !existed {
+		t.Fatal("expected .ola-coding-state.json to exist after a completed run")
+	}
+	if len(state.Tasks) != 1 || !state.Tasks[0].Done {
+		t.Fatalf("expected persisted state to show 1 completed task, got: %+v", state.Tasks)
+	}
+}
+
+// ======================================================================
+// ask_integration_test.go
+// ======================================================================
+
+// TestCmdAskAutoVerifyLoop drives cmdAsk against a real temp Go project
+// through a scripted, multi-round mock model that:
+//  1. writes a main.go that DOES NOT COMPILE via write_file
+//  2. gives a plain final answer (no tool call) claiming the fix is done -
+//     expecting ola's independent post-answer verify step to catch that it
+//     doesn't actually build and feed the failure back instead of trusting
+//     the model's word
+//  3. on the next round, fixes the file via edit_file
+//  4. gives another plain final answer - expecting verify to now pass and
+//     the session to end successfully
+//
+// This exercises the new "ask" auto-verify gate end-to-end: conditional
+// run_command tool exposure, filesChanged tracking, the independent
+// build/test re-check after a plain final answer (never trusting the
+// model's own claim that a change works), and clean loop termination once
+// verification actually passes.
+// TestCmdAskVerifyDisabledForNonCodeFileEdit is the regression test for the
+// "vibe coding" bug: editing a plain-text/doc file inside a directory that
+// happens to have a detected toolchain (here: a go.mod) must NOT trigger
+// ola's auto-verify machinery. Before the isVerifiableEdit fix, filesChanged
+// was set for ANY successful write_file/edit_file call regardless of what
+// was edited, so a "fix a typo in notes.txt" session inside a Go repo would
+// still try to "go build" it - or worse, misdetect a completely unrelated
+// toolchain (e.g. Node) in a directory that also happened to have a
+// package.json lying around, and try to run that instead.
+func TestCmdAskVerifyDisabledForNonCodeFileEdit(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	if err := os.WriteFile("go.mod", []byte("module doctest\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("notes.txt", []byte("this is a note\nwith a typo: helllo\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var round int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&round, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if n == 1 {
+			argsJSON := fmt.Sprintf(`{"path":"notes.txt","old_str":%q,"new_str":%q}`, "helllo", "hello")
+			fmt.Fprint(w, streamLine("", "edit_file", argsJSON, true))
+			return
+		}
+		// If verify had (wrongly) kicked in, this would be round 2 seeing a
+		// [verify]-fed-back tool message instead of a clean final answer.
+		fmt.Fprint(w, streamLine("แก้ typo ให้แล้วครับ", "", "", true))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdAsk([]string{"-m", "mock-model", "-o", "ask-doc.log", "fix the typo in notes.txt"})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdAsk to exit 0, got %d", exitCode)
+	}
+	if got := atomic.LoadInt32(&round); got != 2 {
+		t.Fatalf("expected exactly 2 rounds (edit, final answer - no verify round), got %d", got)
+	}
+
+	fixed, err := os.ReadFile("notes.txt")
+	if err != nil {
+		t.Fatalf("expected notes.txt to exist: %v", err)
+	}
+	if !strings.Contains(string(fixed), "hello") {
+		t.Fatalf("expected the typo fix to have been applied, got: %s", fixed)
+	}
+
+	log, err := os.ReadFile("ask-doc.log")
+	if err != nil {
+		t.Fatalf("expected output log to exist: %v", err)
+	}
+	if strings.Contains(string(log), "[verify]") {
+		t.Fatalf("expected NO verify/build attempt for a plain .txt doc edit in a Go repo, got:\n%s", log)
+	}
+	if !strings.Contains(string(log), "[verify-skip]") {
+		t.Fatalf("expected a '[verify-skip] ...' note explaining why verify was skipped, got:\n%s", log)
+	}
+}
+
+// TestCmdAskPromptFile confirms -f/--prompt-file reads the prompt text from
+// a file instead of requiring it as a positional argument, and that in this
+// mode every remaining positional argument is treated as an attachment.
+func TestCmdAskPromptFile(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	if err := os.WriteFile("prompt.txt", []byte("สรุปไฟล์ที่แนบมาให้หน่อย\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("attached.txt", []byte("เนื้อหาไฟล์แนบ\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotBody string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("รับทราบครับ", "", "", true))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdAsk([]string{"-m", "mock-model", "-o", "ask-pf.log", "-f", "prompt.txt", "attached.txt"})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdAsk to exit 0, got %d", exitCode)
+	}
+	if !strings.Contains(gotBody, "สรุปไฟล์ที่แนบมาให้หน่อย") {
+		t.Fatalf("expected the prompt file's content to be used as the prompt, got request body: %s", gotBody)
+	}
+	if !strings.Contains(gotBody, "เนื้อหาไฟล์แนบ") {
+		t.Fatalf("expected attached.txt's content to be attached since -f leaves all positionals as attachments, got: %s", gotBody)
+	}
+}
+
+func TestCmdAskAutoVerifyLoop(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	if err := os.WriteFile("go.mod", []byte("module asktest\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var round int32
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&round, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		switch n {
+		case 1:
+			// Round 1: write BROKEN Go code (missing closing paren/brace).
+			broken := `package main
+
+import "fmt"
+
+func main() {
+	fmt.Println("hello"
+}
+`
+			argsJSON := fmt.Sprintf(`{"path":"main.go","content":%q}`, broken)
+			fmt.Fprint(w, streamLine("", "write_file", argsJSON, true))
+		case 2:
+			// Round 2: plain final answer claiming success, before ola's
+			// own independent verify has actually run - this is the "vibe
+			// coding" failure mode: the model asserting a fix works
+			// without having checked. No tool call at all this round.
+			fmt.Fprint(w, streamLine("แก้ไขให้แล้วครับ โปรแกรมทำงานถูกต้อง", "", "", true))
+		case 3:
+			// Round 3: model sees the VERIFY FAILED tool result fed back
+			// after its premature claim, and actually fixes the file.
+			argsJSON := fmt.Sprintf(`{"path":"main.go","old_str":%q,"new_str":%q}`,
+				`fmt.Println("hello"
+}`, `fmt.Println("hello")
+}`)
+			fmt.Fprint(w, streamLine("", "edit_file", argsJSON, true))
+		case 4:
+			// Round 4: final answer again, this time verify should pass.
+			fmt.Fprint(w, streamLine("แก้ไขและตรวจสอบแล้ว โปรแกรมคอมไพล์ผ่าน", "", "", true))
+		default:
+			t.Errorf("unexpected extra round %d", n)
+			fmt.Fprint(w, streamLine("unexpected extra round", "", "", true))
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdAsk([]string{"-m", "mock-model", "-o", "ask-output.log", "fix the compile error in main.go"})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdAsk to exit 0, got %d", exitCode)
+	}
+	if got := atomic.LoadInt32(&round); got != 4 {
+		t.Fatalf("expected exactly 4 mock rounds (break, false-claim, fix, real-final-answer), got %d", got)
+	}
+
+	// The fixed program should actually compile and run correctly now.
+	out, err := exec.Command("go", "run", "main.go").CombinedOutput()
+	if err != nil {
+		t.Fatalf("expected the final main.go to build/run cleanly, got error: %v\noutput: %s", err, out)
+	}
+	if !strings.Contains(string(out), "hello") {
+		t.Fatalf("expected program output to contain 'hello', got: %s", out)
+	}
+
+	log, err := os.ReadFile("ask-output.log")
+	if err != nil {
+		t.Fatalf("expected output log to exist: %v", err)
+	}
+	if !strings.Contains(string(log), "exit_code=1") {
+		t.Fatalf("expected output log to show the first, failing verify attempt (exit_code=1), got:\n%s", log)
+	}
+	if strings.Count(string(log), "[verify]") < 2 {
+		t.Fatalf("expected at least 2 verify attempts logged (1 failed + 1 passed), got:\n%s", log)
+	}
+}
+
+// TestCmdAskVerifyGivesUpAfterMaxRounds makes sure a persistently broken
+// build doesn't turn "ask" into an unbounded loop: the model here never
+// actually fixes anything (it keeps re-asserting success), so verify must
+// keep failing, and ola must stop after maxAskVerifyRounds attempts rather
+// than retrying forever.
+func TestCmdAskVerifyGivesUpAfterMaxRounds(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	if err := os.WriteFile("go.mod", []byte("module askgiveup\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var round int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&round, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if n == 1 {
+			broken := "package main\n\nfunc main() {\n\tprintln(\"never fixed\"\n}\n"
+			argsJSON := fmt.Sprintf(`{"path":"main.go","content":%q}`, broken)
+			fmt.Fprint(w, streamLine("", "write_file", argsJSON, true))
+			return
+		}
+		// Every subsequent round: just keep claiming it's done, never
+		// actually fixing the syntax error.
+		fmt.Fprint(w, streamLine("เสร็จแล้วครับ", "", "", true))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdAsk([]string{"-m", "mock-model", "-o", "ask-giveup.log", "fix main.go"})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdAsk to still exit 0 (HTTP-level success even though verify never passed), got %d", exitCode)
+	}
+	// 1 write round + (maxAskVerifyRounds + 1) final-answer rounds: the
+	// last final-answer round is the one where verifyRounds has already
+	// reached the cap, so it warns and stops instead of verifying again.
+	wantRounds := int32(1 + maxAskVerifyRounds + 1)
+	if got := atomic.LoadInt32(&round); got != wantRounds {
+		t.Fatalf("expected exactly %d rounds before giving up, got %d", wantRounds, got)
+	}
+
+	log, err := os.ReadFile("ask-giveup.log")
+	if err != nil {
+		t.Fatalf("expected output log to exist: %v", err)
+	}
+	if got := strings.Count(string(log), "[verify]"); got != maxAskVerifyRounds {
+		t.Fatalf("expected exactly %d verify attempts logged, got %d in:\n%s", maxAskVerifyRounds, got, log)
+	}
+	if !strings.Contains(string(log), "[warning]") {
+		t.Fatalf("expected a [warning] entry noting verify gave up, got:\n%s", log)
+	}
+}
+
+// TestCmdAskVerifyDisabledForPlainQuestions makes sure a session that never
+// touches a file (a plain Q&A prompt) never triggers verification at all,
+// even when run inside a directory with a detected Go toolchain - the
+// auto-verify gate must be conditioned on filesChanged, not merely on cwd
+// having a go.mod.
+func TestCmdAskVerifyDisabledForPlainQuestions(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	if err := os.WriteFile("go.mod", []byte("module asktest2\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var round int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&round, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("Go is a statically typed, compiled language.", "", "", true))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdAsk([]string{"-m", "mock-model", "-o", "ask-output2.log", "what is Go?"})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdAsk to exit 0, got %d", exitCode)
+	}
+	if got := atomic.LoadInt32(&round); got != 1 {
+		t.Fatalf("expected exactly 1 round for a plain question with no file edits, got %d", got)
+	}
+
+	log, err := os.ReadFile("ask-output2.log")
+	if err != nil {
+		t.Fatalf("expected output log to exist: %v", err)
+	}
+	if strings.Contains(string(log), "[verify]") {
+		t.Fatalf("expected no verify attempts for a session that never edited a file, got:\n%s", log)
+	}
+}
+
+// ======================================================================
+// scp_integration_test.go
+// ======================================================================
+
+// TestCmdAskSCPCopyEndToEnd drives cmdAsk (the same real entry point
+// exercised in ask_integration_test.go) with --scp-hosts configured and a
+// fake `scp` binary on PATH (see installFakeSCP/fakeSCPScript in
+// scp_test.go), confirming:
+//   - scp_copy is only advertised to the model once --scp-hosts is set
+//     (searched for in the outgoing request body, same style as
+//     TestCmdAskSystemPromptReachesModelWithFreshnessGuidanceWhenSearchEnabled
+//     in freshness_test.go)
+//   - a model-issued scp_copy tool call actually runs end-to-end through
+//     dispatchToolCall's "extra" mechanism and moves real bytes
+//   - the -o log records the call/result plus the scp_copy status line
+//   - no ask_user confirmation round is inserted - the call completes in
+//     the very next round, per the "no confirmation prompt" design
+//     decision documented in scp.go
+func TestCmdAskSCPCopyEndToEnd(t *testing.T) {
+	installFakeSCP(t, fakeSCPScript)
+
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	remoteDir := t.TempDir()
+	t.Setenv("FAKE_SCP_REMOTE_ROOT", remoteDir)
+
+	if err := os.WriteFile("report.txt", []byte("สรุปผลประจำวัน\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var round int32
+	var gotBody string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&round, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if n == 1 {
+			b, _ := io.ReadAll(r.Body)
+			gotBody = string(b)
+			argsJSON := `{"direction":"upload","remote_alias":"backup","local_path":"report.txt","remote_path":"reports/report.txt","reason":"สำรองรายงานประจำวัน"}`
+			fmt.Fprint(w, streamLine("", "scp_copy", argsJSON, true))
+			return
+		}
+		fmt.Fprint(w, streamLine("สำรองไฟล์เรียบร้อยแล้วครับ", "", "", true))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdAsk([]string{
+		"-m", "mock-model", "-o", "ask-scp.log",
+		"--scp-hosts", "backup=moo@testhost/",
+		"สำรอง report.txt ไปที่ backup หน่อย",
+	})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdAsk to exit 0, got %d", exitCode)
+	}
+	if got := atomic.LoadInt32(&round); got != 2 {
+		t.Fatalf("expected exactly 2 rounds (scp_copy call, then final answer - no ask_user confirmation round), got %d", got)
+	}
+	if !strings.Contains(gotBody, `"scp_copy"`) {
+		t.Fatalf("expected scp_copy to be advertised as a tool once --scp-hosts is set, got request body: %s", gotBody)
+	}
+
+	uploaded, err := os.ReadFile(remoteDir + "/reports/report.txt")
+	if err != nil {
+		t.Fatalf("expected the file to actually land on the (fake) remote side: %v", err)
+	}
+	if !strings.Contains(string(uploaded), "สรุปผลประจำวัน") {
+		t.Fatalf("expected uploaded content to match the source file, got: %q", uploaded)
+	}
+
+	log, err := os.ReadFile("ask-scp.log")
+	if err != nil {
+		t.Fatalf("expected output log to exist: %v", err)
+	}
+	if !strings.Contains(string(log), "# scp_copy: enabled") {
+		t.Fatalf("expected the log header to report scp_copy as enabled, got:\n%s", log)
+	}
+	if !strings.Contains(string(log), "[tool_call] scp_copy") {
+		t.Fatalf("expected a scp_copy tool_call entry in the log, got:\n%s", log)
+	}
+	if strings.Contains(string(log), "[ASK]") {
+		t.Fatalf("expected NO ask_user confirmation before the scp_copy call, got:\n%s", log)
+	}
+}
+
+// TestCmdAskSCPCopyNotOfferedWithoutConfig confirms a plain session (no
+// --scp-hosts/OLA_SCP_HOSTS) never even sees scp_copy in its tool list -
+// the same "only offer what's actually configured" principle web_search/
+// skills/run_command already follow.
+func TestCmdAskSCPCopyNotOfferedWithoutConfig(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	var gotBody string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("รับทราบครับ", "", "", true))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdAsk([]string{"-m", "mock-model", "-o", "ask-noscp.log", "สวัสดี"})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdAsk to exit 0, got %d", exitCode)
+	}
+	if strings.Contains(gotBody, `"scp_copy"`) {
+		t.Fatalf("expected scp_copy NOT to be offered without --scp-hosts/OLA_SCP_HOSTS configured, got: %s", gotBody)
+	}
+}
+
+// TestCmdAskAPIRequestEndToEnd drives cmdAsk against a mocked Ollama
+// /api/chat endpoint whose first round calls api_request against a second,
+// separate httptest.Server standing in for the "real" external API (the
+// endpoint alias points at this second server, not at Ollama itself) -
+// mirroring TestCmdAskSCPCopyEndToEnd's two-server shape (one mock model,
+// one mock "remote side").
+func TestCmdAskAPIRequestEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	var gotPath, gotQuery string
+	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.Query().Get("q")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"models":["qwen3.6:27b"]}`)
+	}))
+	defer apiSrv.Close()
+
+	var round int32
+	var gotBody string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&round, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if n == 1 {
+			b, _ := io.ReadAll(r.Body)
+			gotBody = string(b)
+			argsJSON := `{"endpoint":"ollama","path":"/api/tags","query":{"q":"list"}}`
+			fmt.Fprint(w, streamLine("", "api_request", argsJSON, true))
+			return
+		}
+		fmt.Fprint(w, streamLine("มีโมเดล qwen3.6:27b ครับ", "", "", true))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdAsk([]string{
+		"-m", "mock-model", "-o", "ask-api.log",
+		"--api-endpoints", "ollama=" + apiSrv.URL,
+		"เช็คว่ามีโมเดลอะไรบ้างใน ollama ตอนนี้",
+	})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdAsk to exit 0, got %d", exitCode)
+	}
+	if got := atomic.LoadInt32(&round); got != 2 {
+		t.Fatalf("expected exactly 2 rounds (api_request call, then final answer), got %d", got)
+	}
+	if !strings.Contains(gotBody, `"api_request"`) {
+		t.Fatalf("expected api_request to be advertised as a tool once --api-endpoints is set, got request body: %s", gotBody)
+	}
+	if gotPath != "/api/tags" {
+		t.Fatalf("expected the external API to actually receive /api/tags, got %q", gotPath)
+	}
+	if gotQuery != "list" {
+		t.Fatalf("expected the query param to reach the external API, got %q", gotQuery)
+	}
+
+	log, err := os.ReadFile("ask-api.log")
+	if err != nil {
+		t.Fatalf("expected output log to exist: %v", err)
+	}
+	if !strings.Contains(string(log), "# api_request: enabled") {
+		t.Fatalf("expected the log header to report api_request as enabled, got:\n%s", log)
+	}
+	if !strings.Contains(string(log), "[tool_call] api_request") {
+		t.Fatalf("expected an api_request tool_call entry in the log, got:\n%s", log)
+	}
+	if !strings.Contains(string(log), `"models":["qwen3.6:27b"]`) {
+		t.Fatalf("expected the external API's actual response body in the tool_result, got:\n%s", log)
+	}
+}
+
+// TestCmdAskAPIRequestNotOfferedWithoutConfig mirrors
+// TestCmdAskSCPCopyNotOfferedWithoutConfig: a plain session (no
+// --api-endpoints/OLA_API_ENDPOINTS, no --api-allow-direct-url) never even
+// sees api_request in its tool list.
+func TestCmdAskAPIRequestNotOfferedWithoutConfig(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	var gotBody string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("รับทราบครับ", "", "", true))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdAsk([]string{"-m", "mock-model", "-o", "ask-noapi.log", "สวัสดี"})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdAsk to exit 0, got %d", exitCode)
+	}
+	if strings.Contains(gotBody, `"api_request"`) {
+		t.Fatalf("expected api_request NOT to be offered without --api-endpoints/OLA_API_ENDPOINTS or --api-allow-direct-url configured, got: %s", gotBody)
+	}
+}
+
+// ======================================================================
+// freshness_test.go
+// ======================================================================
+
+// ─────────────────────────────────────────────────────────────────
+// Proactive time/freshness tool use: the system prompt (both "ask" and
+// "coding") must explicitly tell the model to call get_current_time and/or
+// web_search on its own whenever a request depends on "now" or on
+// information that may be stale in its training data - WITHOUT the human
+// having to spell that out in the prompt every single time (e.g. "เมื่อวาน
+// วันอะไร", "หาข่าวเกี่ยวกับ AI ในรอบ 3 วันนี้แล้วสรุปให้หน่อย",
+// "สถานการณ์ราคาทองคำเป็นอย่างไรบ้าง").
+// ─────────────────────────────────────────────────────────────────
+
+// TestAskSystemPromptHasProactiveTimeFreshnessGuidance confirms the "ask"
+// system prompt contains a dedicated section spelling out relative-time and
+// freshness triggers, names both tools involved, and gives at least one of
+// the concrete Thai example phrasings from the motivating request.
+func TestAskSystemPromptHasProactiveTimeFreshnessGuidance(t *testing.T) {
+	p := builtinSystemPrompt
+	for _, want := range []string{
+		"get_current_time", "web_search",
+		"เมื่อวาน",           // relative-time trigger example ("yesterday")
+		"สถานการณ์ราคาทองคำ", // freshness trigger example (gold price situation)
+	} {
+		if !strings.Contains(p, want) {
+			t.Fatalf("expected the ask system prompt to mention %q, but it did not", want)
+		}
+	}
+	// The guidance must be explicit that this happens WITHOUT the user
+	// asking for it - that's the actual point of the feature. Collapse
+	// whitespace first since the source wraps prose across lines, and a
+	// multi-word phrase check would otherwise be defeated by a literal "\n"
+	// landing in the middle of it.
+	flat := strings.Join(strings.Fields(p), " ")
+	if !strings.Contains(flat, "even when the user never") {
+		t.Fatalf("expected the prompt to state tool use should happen even when not explicitly requested")
+	}
+}
+
+// TestCodingSystemPromptHasProactiveTimeFreshnessGuidance mirrors the above
+// for "coding"'s own (separate) system prompt constant.
+func TestCodingSystemPromptHasProactiveTimeFreshnessGuidance(t *testing.T) {
+	p := builtinCodingSystemPrompt
+	for _, want := range []string{"get_current_time", "web_search", "PROACTIVE"} {
+		if !strings.Contains(p, want) {
+			t.Fatalf("expected the coding system prompt to mention %q, but it did not", want)
+		}
+	}
+}
+
+// TestGetCurrentTimeToolDescriptionMentionsRelativeTimePhrases confirms the
+// reinforcement lives at the tool-schema level too, not just buried in the
+// long system prompt - local models often attend more to a tool's own
+// description than to a distant system-prompt section.
+func TestGetCurrentTimeToolDescriptionMentionsRelativeTimePhrases(t *testing.T) {
+	var desc string
+	for _, tl := range builtinTools {
+		if tl.Function.Name == "get_current_time" {
+			desc = tl.Function.Description
+		}
+	}
+	if desc == "" {
+		t.Fatal("expected to find get_current_time in builtinTools")
+	}
+	if !strings.Contains(desc, "เมื่อวาน") {
+		t.Fatalf("expected get_current_time's description to mention a relative-time example (เมื่อวาน), got: %s", desc)
+	}
+}
+
+// TestWebSearchToolDescriptionMentionsProactiveUse confirms webSearchTool's
+// own description instructs proactive/automatic use for freshness-sensitive
+// queries, without waiting for the user to explicitly ask for a search.
+func TestWebSearchToolDescriptionMentionsProactiveUse(t *testing.T) {
+	desc := webSearchTool.Function.Description
+	if !strings.Contains(desc, "ไม่ต้องรอให้ผู้ใช้") {
+		t.Fatalf("expected web_search's description to say it should be used without waiting for the user to ask, got: %s", desc)
+	}
+	if !strings.Contains(desc, "get_current_time") {
+		t.Fatalf("expected web_search's description to reference pairing with get_current_time for relative time windows, got: %s", desc)
+	}
+}
+
+// TestCmdAskSystemPromptReachesModelWithFreshnessGuidanceWhenSearchEnabled
+// is an end-to-end check (same shape as TestCmdAskReadSkillEndToEnd in
+// skills_test.go): confirms that in a real cmdAsk run with web_search
+// enabled (--searxng-url pointed at a mock server), the actual HTTP request
+// sent to the model includes both the PROACTIVE TIME/FRESHNESS section and
+// the web_search tool - i.e. the guidance genuinely reaches the wire, not
+// just present in the Go source constant.
+func TestCmdAskSystemPromptReachesModelWithFreshnessGuidanceWhenSearchEnabled(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	// Mock SearXNG - never actually expected to be hit in this test, since
+	// the mock model below answers immediately without calling any tool;
+	// we're only checking what the model WAS OFFERED and told, not
+	// exercising an actual search round trip.
+	searxng := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"results":[]}`)
+	}))
+	defer searxng.Close()
+
+	var round int32
+	var gotBody string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&round, 1)
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("สวัสดีครับ", "", "", true))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdAsk([]string{"-m", "mock-model", "-o", "ask-freshness.log", "--searxng-url", searxng.URL, "สวัสดีครับ"})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdAsk to exit 0, got %d", exitCode)
+	}
+	if atomic.LoadInt32(&round) != 1 {
+		t.Fatalf("expected exactly 1 round, got %d", round)
+	}
+
+	if !strings.Contains(gotBody, "PROACTIVE TIME/FRESHNESS") {
+		t.Fatalf("expected the request payload's system prompt to include the PROACTIVE TIME/FRESHNESS section, got: %s", gotBody)
+	}
+	if !strings.Contains(gotBody, `"web_search"`) {
+		t.Fatalf("expected web_search to be offered as a tool once --searxng-url is set, got: %s", gotBody)
+	}
+	if !strings.Contains(gotBody, `"get_current_time"`) {
+		t.Fatalf("expected get_current_time to always be offered as a tool, got: %s", gotBody)
+	}
+}
+
+// ======================================================================
+// Section: api_request_test.go
+// ======================================================================
+
+// testAPIRequestConfig builds an apiRequestConfig with a single "test"
+// endpoint pointed at srv, mirroring testSCPConfig's shape in unit_test.go.
+func testAPIRequestConfig(srv *httptest.Server) apiRequestConfig {
+	return apiRequestConfig{
+		Endpoints:        map[string]apiEndpoint{"test": {Alias: "test", BaseURL: srv.URL}},
+		EndpointOrder:    []string{"test"},
+		Timeout:          defaultAPIRequestTimeoutSec * 1e9,
+		MaxRequestBytes:  defaultAPIRequestMaxBodyBytes,
+		MaxResponseBytes: defaultAPIRequestMaxResponseBytes,
+	}
+}
+
+func TestToolAPIRequestDisabledWithEmptyConfig(t *testing.T) {
+	if _, err := toolAPIRequest(map[string]interface{}{"endpoint": "test", "path": "/x"}, apiRequestConfig{}); err == nil {
+		t.Fatal("expected an error when api_request is not configured")
+	}
+}
+
+func TestToolAPIRequestRejectsUnknownEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	cfg := testAPIRequestConfig(srv)
+
+	_, err := toolAPIRequest(map[string]interface{}{"endpoint": "not-configured", "path": "/x"}, cfg)
+	if err == nil {
+		t.Fatal("expected an unknown endpoint alias to be rejected")
+	}
+	if !strings.Contains(err.Error(), "test") {
+		t.Fatalf("expected the error to list the allowed endpoint(s), got: %v", err)
+	}
+}
+
+func TestToolAPIRequestRejectsBothEndpointAndURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	cfg := testAPIRequestConfig(srv)
+	cfg.AllowDirectURL = true
+
+	args := map[string]interface{}{"endpoint": "test", "path": "/x", "url": "https://example.com"}
+	if _, err := toolAPIRequest(args, cfg); err == nil {
+		t.Fatal("expected specifying both endpoint and url to be rejected")
+	}
+}
+
+func TestToolAPIRequestRequiresEndpointOrURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	cfg := testAPIRequestConfig(srv)
+
+	if _, err := toolAPIRequest(map[string]interface{}{}, cfg); err == nil {
+		t.Fatal("expected omitting both endpoint and url to be rejected")
+	}
+}
+
+func TestToolAPIRequestEndpointModeGETWithQuery(t *testing.T) {
+	var gotPath, gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.Query().Get("q")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+	cfg := testAPIRequestConfig(srv)
+
+	args := map[string]interface{}{
+		"endpoint": "test", "path": "/api/tags",
+		"query": map[string]interface{}{"q": "hello"},
+	}
+	result, err := toolAPIRequest(args, cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotPath != "/api/tags" {
+		t.Fatalf("expected path /api/tags, got %q", gotPath)
+	}
+	if gotQuery != "hello" {
+		t.Fatalf("expected query q=hello, got %q", gotQuery)
+	}
+	if !strings.Contains(result, "HTTP 200") || !strings.Contains(result, `"ok":true`) {
+		t.Fatalf("expected result to include status and body, got: %s", result)
+	}
+}
+
+func TestToolAPIRequestDefaultMethodIsGET(t *testing.T) {
+	var gotMethod string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+	}))
+	defer srv.Close()
+	cfg := testAPIRequestConfig(srv)
+
+	if _, err := toolAPIRequest(map[string]interface{}{"endpoint": "test", "path": "/"}, cfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotMethod != http.MethodGet {
+		t.Fatalf("expected default method GET, got %q", gotMethod)
+	}
+}
+
+func TestToolAPIRequestRejectsMutatingMethodByDefault(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("server should never be hit - method should be rejected before any request is sent")
+	}))
+	defer srv.Close()
+	cfg := testAPIRequestConfig(srv) // AllowMutating defaults to false
+
+	args := map[string]interface{}{"endpoint": "test", "path": "/x", "method": "POST"}
+	if _, err := toolAPIRequest(args, cfg); err == nil {
+		t.Fatal("expected POST to be rejected when AllowMutating is false")
+	}
+}
+
+func TestToolAPIRequestRejectsUnsupportedMethod(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("server should never be hit")
+	}))
+	defer srv.Close()
+	cfg := testAPIRequestConfig(srv)
+	cfg.AllowMutating = true
+
+	args := map[string]interface{}{"endpoint": "test", "path": "/x", "method": "TRACE"}
+	if _, err := toolAPIRequest(args, cfg); err == nil {
+		t.Fatal("expected an unsupported method (TRACE) to be rejected even with AllowMutating on")
+	}
+}
+
+func TestToolAPIRequestAllowsMutatingWhenEnabled(t *testing.T) {
+	var gotMethod, gotBody, gotContentType string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotContentType = r.Header.Get("Content-Type")
+		buf := make([]byte, 1024)
+		n, _ := r.Body.Read(buf)
+		gotBody = string(buf[:n])
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+	cfg := testAPIRequestConfig(srv)
+	cfg.AllowMutating = true
+
+	args := map[string]interface{}{
+		"endpoint": "test", "path": "/create", "method": "POST",
+		"body_type": "json", "body": map[string]interface{}{"name": "moo"},
+	}
+	result, err := toolAPIRequest(args, cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Fatalf("expected POST, got %q", gotMethod)
+	}
+	if gotContentType != "application/json" {
+		t.Fatalf("expected application/json content-type, got %q", gotContentType)
+	}
+	if !strings.Contains(gotBody, `"name":"moo"`) {
+		t.Fatalf("expected JSON body to contain name=moo, got: %s", gotBody)
+	}
+	if !strings.Contains(result, "HTTP 201") {
+		t.Fatalf("expected result to report HTTP 201, got: %s", result)
+	}
+}
+
+func TestToolAPIRequestNon2xxIsNotAGoError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"bad input"}`))
+	}))
+	defer srv.Close()
+	cfg := testAPIRequestConfig(srv)
+
+	result, err := toolAPIRequest(map[string]interface{}{"endpoint": "test", "path": "/x"}, cfg)
+	if err != nil {
+		t.Fatalf("expected a 4xx response to NOT be a Go error, got: %v", err)
+	}
+	if !strings.Contains(result, "HTTP 400") || !strings.Contains(result, "bad input") {
+		t.Fatalf("expected result to surface the 400 status and body, got: %s", result)
+	}
+}
+
+func TestToolAPIRequestFormBody(t *testing.T) {
+	var gotBody, gotContentType string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotContentType = r.Header.Get("Content-Type")
+		buf := make([]byte, 1024)
+		n, _ := r.Body.Read(buf)
+		gotBody = string(buf[:n])
+	}))
+	defer srv.Close()
+	cfg := testAPIRequestConfig(srv)
+	cfg.AllowMutating = true
+
+	args := map[string]interface{}{
+		"endpoint": "test", "path": "/x", "method": "POST",
+		"body_type": "form", "body": map[string]interface{}{"a": "1", "b": "two"},
+	}
+	if _, err := toolAPIRequest(args, cfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotContentType != "application/x-www-form-urlencoded" {
+		t.Fatalf("expected form content-type, got %q", gotContentType)
+	}
+	if !strings.Contains(gotBody, "a=1") || !strings.Contains(gotBody, "b=two") {
+		t.Fatalf("expected form-encoded body, got: %s", gotBody)
+	}
+}
+
+func TestToolAPIRequestTextBody(t *testing.T) {
+	var gotBody, gotContentType string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotContentType = r.Header.Get("Content-Type")
+		buf := make([]byte, 1024)
+		n, _ := r.Body.Read(buf)
+		gotBody = string(buf[:n])
+	}))
+	defer srv.Close()
+	cfg := testAPIRequestConfig(srv)
+	cfg.AllowMutating = true
+
+	args := map[string]interface{}{
+		"endpoint": "test", "path": "/x", "method": "PUT",
+		"body_type": "text", "body": "hello plain text",
+	}
+	if _, err := toolAPIRequest(args, cfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.HasPrefix(gotContentType, "text/plain") {
+		t.Fatalf("expected text/plain content-type, got %q", gotContentType)
+	}
+	if gotBody != "hello plain text" {
+		t.Fatalf("expected raw text body, got: %s", gotBody)
+	}
+}
+
+func TestToolAPIRequestBinaryBody(t *testing.T) {
+	var gotBody []byte
+	var gotContentType string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotContentType = r.Header.Get("Content-Type")
+		buf := make([]byte, 1024)
+		n, _ := r.Body.Read(buf)
+		gotBody = buf[:n]
+	}))
+	defer srv.Close()
+	cfg := testAPIRequestConfig(srv)
+	cfg.AllowMutating = true
+
+	raw := []byte{0x00, 0x01, 0xFF, 0x10}
+	args := map[string]interface{}{
+		"endpoint": "test", "path": "/x", "method": "POST",
+		"body_type": "binary", "body": base64.StdEncoding.EncodeToString(raw),
+	}
+	if _, err := toolAPIRequest(args, cfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotContentType != "application/octet-stream" {
+		t.Fatalf("expected application/octet-stream content-type, got %q", gotContentType)
+	}
+	if string(gotBody) != string(raw) {
+		t.Fatalf("expected raw bytes to round-trip, got: %v want: %v", gotBody, raw)
+	}
+}
+
+func TestToolAPIRequestMultipartBody(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	if err := os.WriteFile(filepath.Join(dir, "attach.txt"), []byte("file contents"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotContentType string
+	var gotFieldValue, gotFileContent string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotContentType = r.Header.Get("Content-Type")
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Errorf("server failed to parse multipart form: %v", err)
+			return
+		}
+		gotFieldValue = r.FormValue("note")
+		f, _, err := r.FormFile("file0")
+		if err != nil {
+			t.Errorf("server failed to read file0: %v", err)
+			return
+		}
+		defer f.Close()
+		buf := make([]byte, 1024)
+		n, _ := f.Read(buf)
+		gotFileContent = string(buf[:n])
+	}))
+	defer srv.Close()
+	cfg := testAPIRequestConfig(srv)
+	cfg.AllowMutating = true
+
+	args := map[string]interface{}{
+		"endpoint": "test", "path": "/upload", "method": "POST",
+		"body_type":       "multipart",
+		"body":            map[string]interface{}{"note": "hi"},
+		"multipart_files": []interface{}{"attach.txt"},
+	}
+	if _, err := toolAPIRequest(args, cfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.HasPrefix(gotContentType, "multipart/form-data") {
+		t.Fatalf("expected multipart/form-data content-type, got %q", gotContentType)
+	}
+	if gotFieldValue != "hi" {
+		t.Fatalf("expected field note=hi, got %q", gotFieldValue)
+	}
+	if gotFileContent != "file contents" {
+		t.Fatalf("expected attached file contents to round-trip, got %q", gotFileContent)
+	}
+}
+
+func TestToolAPIRequestMultipartRejectsPathEscape(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("server should never be hit - path escape should be rejected before sending")
+	}))
+	defer srv.Close()
+	cfg := testAPIRequestConfig(srv)
+	cfg.AllowMutating = true
+
+	args := map[string]interface{}{
+		"endpoint": "test", "path": "/upload", "method": "POST",
+		"body_type":       "multipart",
+		"multipart_files": []interface{}{"../../etc/passwd"},
+	}
+	if _, err := toolAPIRequest(args, cfg); err == nil {
+		t.Fatal("expected a multipart_files path escaping the sandbox to be rejected")
+	}
+}
+
+func TestToolAPIRequestReservedHeadersAreFilteredAndEndpointAuthWins(t *testing.T) {
+	var gotAuth, gotHost, gotCustom string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotHost = r.Host
+		gotCustom = r.Header.Get("X-Custom")
+	}))
+	defer srv.Close()
+	cfg := testAPIRequestConfig(srv)
+	ep := cfg.Endpoints["test"]
+	ep.AuthHeader = "Authorization"
+	ep.AuthValue = "Bearer secret-token"
+	cfg.Endpoints["test"] = ep
+
+	args := map[string]interface{}{
+		"endpoint": "test", "path": "/x",
+		"headers": map[string]interface{}{
+			"Authorization": "Bearer model-supplied-should-be-ignored",
+			"Host":          "evil.example",
+			"X-Custom":      "hello",
+		},
+	}
+	if _, err := toolAPIRequest(args, cfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotAuth != "Bearer secret-token" {
+		t.Fatalf("expected endpoint's own auth to win, got Authorization=%q", gotAuth)
+	}
+	if strings.Contains(gotHost, "evil.example") {
+		t.Fatalf("expected model-supplied Host header to be ignored, got Host=%q", gotHost)
+	}
+	if gotCustom != "hello" {
+		t.Fatalf("expected non-reserved custom header to pass through, got %q", gotCustom)
+	}
+}
+
+func TestToolAPIRequestDirectURLDisabledByDefault(t *testing.T) {
+	cfg := apiRequestConfig{
+		Endpoints: map[string]apiEndpoint{"test": {Alias: "test", BaseURL: "http://example.invalid"}},
+	}
+	args := map[string]interface{}{"url": "https://example.com"}
+	if _, err := toolAPIRequest(args, cfg); err == nil {
+		t.Fatal("expected direct-URL mode to be rejected when AllowDirectURL is false")
+	}
+}
+
+func TestToolAPIRequestDirectURLRejectsPrivateAndLocalURLs(t *testing.T) {
+	cfg := apiRequestConfig{AllowDirectURL: true, Timeout: defaultAPIRequestTimeoutSec * 1e9, MaxResponseBytes: defaultAPIRequestMaxResponseBytes}
+	cases := []string{
+		"http://localhost:11434/api/tags",
+		"http://127.0.0.1:8080/admin",
+		"http://169.254.169.254/latest/meta-data/",
+		"ftp://example.com/file",
+	}
+	for _, u := range cases {
+		if _, err := toolAPIRequest(map[string]interface{}{"url": u}, cfg); err == nil {
+			t.Fatalf("expected %q to be rejected by the SSRF guard", u)
+		}
+	}
+}
+
+// redirectAllTransportAPI mirrors redirectAllTransport in unit_test.go
+// (web_fetch's own parallel-fetch test) - a test-only RoundTripper that
+// dials target no matter what host/port the request was addressed to, so
+// a direct-mode call to a fake public hostname can land on a local
+// httptest.Server without tripping the SSRF guard (which only rejects
+// obviously-local/private hosts, not made-up public-looking ones).
+type redirectAllTransportAPI struct {
+	target string
+	base   http.Transport
+}
+
+func (rt *redirectAllTransportAPI) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	req.URL.Host = rt.target
+	return rt.base.RoundTrip(req)
+}
+
+func TestToolAPIRequestDirectURLAllowsPublicHTTPS(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	origTransport := http.DefaultTransport
+	http.DefaultTransport = &redirectAllTransportAPI{target: srv.Listener.Addr().String()}
+	defer func() { http.DefaultTransport = origTransport }()
+
+	cfg := apiRequestConfig{AllowDirectURL: true, Timeout: defaultAPIRequestTimeoutSec * 1e9, MaxResponseBytes: defaultAPIRequestMaxResponseBytes}
+	result, err := toolAPIRequest(map[string]interface{}{"url": "http://public.example.invalid/hello"}, cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(result, "ok") {
+		t.Fatalf("expected response body to come through, got: %s", result)
+	}
+}
+
+func TestJoinEndpointPathIgnoresHostInPath(t *testing.T) {
+	// A path that looks like a full URL (with its own scheme/host) must
+	// never redirect the request away from the endpoint's own base host -
+	// only its Path/RawQuery should ever be used.
+	full, err := joinEndpointPath("https://trusted.example/api", "http://evil.example/steal?x=1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	u, err := url.Parse(full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Host != "trusted.example" {
+		t.Fatalf("expected host to stay trusted.example, got %q (full: %s)", u.Host, full)
+	}
+	if u.Path != "/api/steal" {
+		t.Fatalf("expected joined path /api/steal, got %q (full: %s)", u.Path, full)
+	}
+}
+
+func TestSingleJoiningSlash(t *testing.T) {
+	cases := []struct{ a, b, want string }{
+		{"/api", "/x", "/api/x"},
+		{"/api/", "/x", "/api/x"},
+		{"/api", "x", "/api/x"},
+		{"/api/", "x", "/api/x"},
+		{"/api", "", "/api"},
+	}
+	for _, c := range cases {
+		if got := singleJoiningSlash(c.a, c.b); got != c.want {
+			t.Errorf("singleJoiningSlash(%q, %q) = %q, want %q", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+func TestFormatAPIResponseTruncatesLongTextBody(t *testing.T) {
+	resp := &http.Response{Header: http.Header{"Content-Type": []string{"text/plain"}}, StatusCode: 200}
+	long := strings.Repeat("x", maxAPIResultOutput+500)
+	out := formatAPIResponse(resp, []byte(long))
+	if len(out) >= len(long) {
+		t.Fatalf("expected long text body to be truncated, output was %d bytes (input %d bytes)", len(out), len(long))
+	}
+}
+
+func TestFormatAPIResponseHidesBinaryBody(t *testing.T) {
+	resp := &http.Response{Header: http.Header{"Content-Type": []string{"image/png"}}, StatusCode: 200}
+	binary := []byte{0x89, 0x50, 0x4E, 0x47, 0x00, 0x01, 0x02}
+	out := formatAPIResponse(resp, binary)
+	if strings.Contains(out, string(binary)) {
+		t.Fatal("expected binary body to never be echoed back verbatim")
+	}
+	if !strings.Contains(out, "binary") {
+		t.Fatalf("expected a note that the body is binary and hidden, got: %s", out)
+	}
+}
+
+func TestResolveAPIRequestConfigParsesEndpointsAndAuth(t *testing.T) {
+	os.Setenv("OLA_API_ENDPOINT_OLLAMA_AUTH_HEADER", "Authorization")
+	os.Setenv("OLA_API_ENDPOINT_OLLAMA_AUTH_VALUE", "Bearer xyz")
+	defer os.Unsetenv("OLA_API_ENDPOINT_OLLAMA_AUTH_HEADER")
+	defer os.Unsetenv("OLA_API_ENDPOINT_OLLAMA_AUTH_VALUE")
+
+	cfg, warnings := resolveAPIRequestConfig("ollama=http://localhost:11434,bad-entry,openwebui=http://localhost:8080", false, false, 0, 0, 0)
+	if len(warnings) != 1 {
+		t.Fatalf("expected exactly 1 warning for the malformed entry, got %d: %v", len(warnings), warnings)
+	}
+	if !cfg.enabled() {
+		t.Fatal("expected config with endpoints to be enabled")
+	}
+	ollama, ok := cfg.Endpoints["ollama"]
+	if !ok {
+		t.Fatal("expected 'ollama' endpoint to be parsed")
+	}
+	if ollama.BaseURL != "http://localhost:11434" {
+		t.Fatalf("unexpected BaseURL: %q", ollama.BaseURL)
+	}
+	if ollama.AuthHeader != "Authorization" || ollama.AuthValue != "Bearer xyz" {
+		t.Fatalf("expected auth header/value to be picked up from env, got %q/%q", ollama.AuthHeader, ollama.AuthValue)
+	}
+	if _, ok := cfg.Endpoints["openwebui"]; !ok {
+		t.Fatal("expected 'openwebui' endpoint to be parsed despite the earlier bad entry")
+	}
+}
+
+func TestResolveAPIRequestConfigDisabledWhenNothingSet(t *testing.T) {
+	cfg, warnings := resolveAPIRequestConfig("", false, false, 0, 0, 0)
+	if len(warnings) != 0 {
+		t.Fatalf("expected no warnings, got: %v", warnings)
+	}
+	if cfg.enabled() {
+		t.Fatal("expected config to be disabled when nothing was configured")
+	}
+}
+
+func TestAPIRequestToolNotOfferedWhenDisabled_sanity(t *testing.T) {
+	// Mirrors TestWebSearchToolNotOfferedWhenDisabled_sanity's shape: a
+	// quick sanity check that the gating condition itself behaves as
+	// expected, independent of the CLI wiring in main.go/cmdCoding.
+	var cfg apiRequestConfig
+	if cfg.enabled() {
+		t.Fatal("expected zero-value apiRequestConfig to be disabled")
+	}
+}
+
+// ======================================================================
+// quiet_test.go (new: -q/--quiet and $OLA_QUIET)
+// ======================================================================
+// Drives the real cmdAsk entry point (same httptest pattern as the rest of
+// this file) and captures os.Stdout to check what quiet mode actually
+// trims vs. what it always leaves alone. Notification gating (WRITE/EDIT/
+// MKDIR/TASK/scp_copy/api_request suppressed, ask_user + end-of-session
+// summary always sent) isn't covered here since sendNotification posts to
+// the real https://ntfy.sh unconditionally - there's no seam to point it
+// at a mock server without changing sendNotification's own signature, and
+// these tests would rather stay hermetic than depend on network access.
+// Likewise, ask_user's own terminal banner isn't covered here: toolAskUser
+// checks isStdinTerminal() before printing anything, and that's false for
+// a go test process's stdin, so the banner never fires either way in this
+// harness - that behavior is simply unmodified by any of the qprint*
+// changes (see main.go's dispatchToolCall), which is verifiable by
+// inspection rather than by a test that would need a real pty to exercise.
+
+// captureStdout temporarily redirects os.Stdout to a pipe for the duration
+// of fn, returning everything written to it. Used to inspect exactly what
+// a cmdAsk/cmdCoding run printed to the terminal without relying on any
+// particular buffering behavior of fmt.Print* itself.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	done := make(chan string)
+	go func() {
+		var buf strings.Builder
+		io.Copy(&buf, r)
+		done <- buf.String()
+	}()
+	fn()
+	w.Close()
+	os.Stdout = old
+	return <-done
+}
+
+// mockThinkToolAnswerServer returns an /api/chat mock that streams a
+// thinking chunk + a get_current_time tool call on round 1, then a plain
+// final answer on round 2 - enough surface area to exercise every
+// terminal-chrome code path quiet mode is supposed to touch (thinking
+// banner/tokens, tool_call echo + result preview, load-timing line, the
+// round/token stats footer) in a single small script.
+func mockThinkToolAnswerServer(t *testing.T, finalAnswer string) *httptest.Server {
+	t.Helper()
+	var round int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&round, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if n == 1 {
+			fmt.Fprint(w, `{"message":{"role":"assistant","thinking":"hmm let me think","content":""},"done":false}`+"\n")
+			fmt.Fprint(w, `{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"get_current_time","arguments":{}}}]},"done":true}`+"\n")
+		} else {
+			fmt.Fprintf(w, `{"message":{"role":"assistant","content":%q},"done":true}`+"\n", finalAnswer)
+		}
+	})
+	return httptest.NewServer(mux)
+}
+
+// TestQuietModeDefaultStillShowsChrome pins down the "quiet mode is opt-in"
+// half of the contract: with neither -q nor $OLA_QUIET set, behavior must
+// stay exactly as it was before this feature existed.
+func TestQuietModeDefaultStillShowsChrome(t *testing.T) {
+	dir := t.TempDir()
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	srv := mockThinkToolAnswerServer(t, "THE-FINAL-ANSWER-TEXT")
+	defer srv.Close()
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	out := captureStdout(t, func() {
+		cmdAsk([]string{"-m", "mock-model", "-o", "noisy.log", "สวัสดี"})
+	})
+
+	if !strings.Contains(out, "THE-FINAL-ANSWER-TEXT") {
+		t.Fatalf("expected answer text in stdout, got: %q", out)
+	}
+	if !strings.Contains(out, "tool_call") {
+		t.Errorf("expected tool_call echo in non-quiet stdout, got: %q", out)
+	}
+	if !strings.Contains(out, "Thinking") {
+		t.Errorf("expected thinking banner in non-quiet stdout, got: %q", out)
+	}
+	if !strings.Contains(out, "⏱") {
+		t.Errorf("expected round timing footer in non-quiet stdout, got: %q", out)
+	}
+}
+
+// TestQuietModeFlagTrimsTerminalButNotLogFile is the core of the feature:
+// -q must trim the terminal down to just the answer, while the -o log file
+// stays exactly as complete as it's always been.
+func TestQuietModeFlagTrimsTerminalButNotLogFile(t *testing.T) {
+	dir := t.TempDir()
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	srv := mockThinkToolAnswerServer(t, "THE-FINAL-ANSWER-TEXT")
+	defer srv.Close()
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	out := captureStdout(t, func() {
+		cmdAsk([]string{"-m", "mock-model", "-q", "-o", "quiet.log", "สวัสดี"})
+	})
+	quietMode = false // package-global set by cmdAsk; reset for later tests in this binary
+
+	if !strings.Contains(out, "THE-FINAL-ANSWER-TEXT") {
+		t.Fatalf("expected answer text to still be in stdout under -q, got: %q", out)
+	}
+	for _, unwanted := range []string{"tool_call", "Thinking", "⏱", "📥", "🔧"} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("did not expect %q in quiet stdout, got: %q", unwanted, out)
+		}
+	}
+
+	logData, err := os.ReadFile("quiet.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logStr := string(logData)
+	for _, wanted := range []string{"tool_call", "Thinking"} {
+		if !strings.Contains(logStr, wanted) {
+			t.Errorf("expected -o log file to still contain %q even in quiet mode, got: %q", wanted, logStr)
+		}
+	}
+}
+
+// TestQuietModeEnvVarMatchesFlag confirms $OLA_QUIET is a real substitute
+// for -q, not just a documented-but-unwired env var.
+func TestQuietModeEnvVarMatchesFlag(t *testing.T) {
+	dir := t.TempDir()
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	srv := mockThinkToolAnswerServer(t, "ENV-QUIET-ANSWER")
+	defer srv.Close()
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	os.Setenv("OLA_QUIET", "1")
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+	defer os.Unsetenv("OLA_QUIET")
+
+	out := captureStdout(t, func() {
+		cmdAsk([]string{"-m", "mock-model", "-o", "envquiet.log", "สวัสดี"})
+	})
+	quietMode = false
+
+	if !strings.Contains(out, "ENV-QUIET-ANSWER") {
+		t.Fatalf("expected answer text in stdout, got: %q", out)
+	}
+	if strings.Contains(out, "⏱") {
+		t.Errorf("expected OLA_QUIET=1 to trim timing lines same as -q, got: %q", out)
 	}
 }
