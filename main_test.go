@@ -44,72 +44,50 @@ import (
 // coding_test.go
 // ======================================================================
 
-func TestValidateCommandAllowsKnownToolchainBinaries(t *testing.T) {
-	allowed := map[string]bool{"go": true}
-	if err := validateCommand("go build ./...", allowed); err != nil {
-		t.Fatalf("expected allowed command to pass, got error: %v", err)
+func TestValidateCommandAllowsAnyBinary(t *testing.T) {
+	if err := validateCommand("go build ./..."); err != nil {
+		t.Fatalf("expected command to pass, got error: %v", err)
 	}
-	if err := validateCommand("go build ./... && go test ./...", allowed); err != nil {
-		t.Fatalf("expected chained allowed commands to pass, got error: %v", err)
+	if err := validateCommand("go build ./... && go test ./..."); err != nil {
+		t.Fatalf("expected chained commands to pass, got error: %v", err)
 	}
-}
-
-func TestValidateCommandRejectsDisallowedBinary(t *testing.T) {
-	allowed := map[string]bool{"go": true}
-	if err := validateCommand("rm -rf /", allowed); err == nil {
-		t.Fatal("expected dangerous command to be rejected")
+	// run_command has no allowlist or denylist: anything non-empty passes
+	// validateCommand - it's the model's/operator's own responsibility, not
+	// ola's, to decide what's safe to run.
+	if err := validateCommand("rm -rf /tmp/some-dir"); err != nil {
+		t.Fatalf("expected unrestricted command to pass, got error: %v", err)
 	}
-	if err := validateCommand("curl http://example.com", allowed); err == nil {
-		t.Fatal("expected disallowed binary to be rejected")
-	}
-	if err := validateCommand("go build ./... && curl http://evil", allowed); err == nil {
-		t.Fatal("expected chained command with a disallowed segment to be rejected")
+	if err := validateCommand("curl http://example.com"); err != nil {
+		t.Fatalf("expected unrestricted command to pass, got error: %v", err)
 	}
 }
 
 func TestValidateCommandRejectsEmpty(t *testing.T) {
-	if err := validateCommand("   ", map[string]bool{"go": true}); err == nil {
+	if err := validateCommand("   "); err == nil {
 		t.Fatal("expected empty command to be rejected")
-	}
-}
-
-func TestSplitCommandSegments(t *testing.T) {
-	got := splitCommandSegments("go build ./... && go test ./... ; echo done | cat")
-	want := []string{"go build ./...", "go test ./...", "echo done", "cat"}
-	if len(got) != len(want) {
-		t.Fatalf("got %d segments, want %d: %v", len(got), len(want), got)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("segment %d: got %q want %q", i, got[i], want[i])
-		}
 	}
 }
 
 func TestIsVerifiableEditGatesByToolchainExtension(t *testing.T) {
 	cases := []struct {
 		path, label string
-		forceAny    bool
 		want        bool
 	}{
-		{"main.go", "go", false, true},
-		{"notes.txt", "go", false, false},
-		{"README.md", "go", false, false},
-		{"package.json", "node", false, true},
-		{"index.js", "node", false, true},
-		{"design.txt", "node", false, false},
-		{"lib.rs", "rust", false, true},
-		{"app.py", "python", false, true},
-		{"anything.txt", "generic", false, false},
-		// An explicit --build-cmd/--test-cmd override means the user opted
-		// in deliberately - any file counts, regardless of extension.
-		{"notes.txt", "go", true, true},
-		{"", "go", false, false},
+		{"main.go", "go", true},
+		{"notes.txt", "go", false},
+		{"README.md", "go", false},
+		{"package.json", "node", true},
+		{"index.js", "node", true},
+		{"design.txt", "node", false},
+		{"lib.rs", "rust", true},
+		{"app.py", "python", true},
+		{"anything.txt", "generic", false},
+		{"", "go", false},
 	}
 	for _, c := range cases {
-		got := isVerifiableEdit(c.path, c.label, c.forceAny)
+		got := isVerifiableEdit(c.path, c.label)
 		if got != c.want {
-			t.Errorf("isVerifiableEdit(%q, %q, %v) = %v, want %v", c.path, c.label, c.forceAny, got, c.want)
+			t.Errorf("isVerifiableEdit(%q, %q) = %v, want %v", c.path, c.label, got, c.want)
 		}
 	}
 }
@@ -179,7 +157,7 @@ func TestMarkTaskDoneRejectedWhenBuildBroken(t *testing.T) {
 	defer outFile.Close()
 
 	rc := &codingRunContext{
-		outFile: outFile, state: state, allowed: cmds.AllowBins,
+		outFile: outFile, state: state,
 		cmdTO: 5 * time.Second, cmds: cmds,
 	}
 
@@ -207,6 +185,322 @@ func TestMarkTaskDoneRejectedWhenBuildBroken(t *testing.T) {
 	}
 	if !state.Tasks[0].Done {
 		t.Fatal("expected task to be marked done after the build-only gate passes")
+	}
+}
+
+// TestStuckDetectionBlocksAfterFailStreak confirms that a task rejected
+// maxTaskFailStreak times in a row gets hard-blocked (refused without even
+// re-running the build check), and that calling add_tasks clears the block
+// so the task can be retried.
+func TestStuckDetectionBlocksAfterFailStreak(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	if err := os.WriteFile("go.mod", []byte("module stucktest\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Broken from the start, and stays broken for this whole test.
+	if err := os.WriteFile("main.go", []byte("package main\n\nfunc main() {\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmds := detectProjectCommands(dir)
+
+	state := newCodingState()
+	state.addTasks([]string{"do the thing"})
+
+	outFile, err := os.CreateTemp(dir, "log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+
+	rc := &codingRunContext{
+		outFile: outFile, state: state,
+		cmdTO: 5 * time.Second, cmds: cmds,
+	}
+	markArgs, _ := json.Marshal(map[string]interface{}{"task_id": "T0"})
+	tc := toolCall{Function: toolCallFunction{Name: "mark_task_done", Arguments: markArgs}}
+
+	// First maxTaskFailStreak calls should each be rejected for the build
+	// failure itself, not yet hard-blocked.
+	for i := 0; i < maxTaskFailStreak; i++ {
+		result, _ := dispatchCodingToolCall(tc, rc)
+		if strings.Contains(result, "ถูกบล็อก") {
+			t.Fatalf("did not expect a hard block until after %d failures, got block on attempt %d: %s", maxTaskFailStreak, i+1, result)
+		}
+		if !strings.Contains(result, "ถูกปฏิเสธ") {
+			t.Fatalf("expected rejection on attempt %d, got: %s", i+1, result)
+		}
+	}
+	if !state.Tasks[0].Blocked {
+		t.Fatalf("expected task to be marked Blocked after %d consecutive failures, state: %+v", maxTaskFailStreak, state.Tasks[0])
+	}
+
+	// The NEXT attempt must be refused as a hard block, without even
+	// re-running the (still broken) build check.
+	result, isReport := dispatchCodingToolCall(tc, rc)
+	if isReport {
+		t.Fatal("mark_task_done must never report as report_complete")
+	}
+	if !strings.Contains(result, "ถูกบล็อก") {
+		t.Fatalf("expected a hard block message once maxTaskFailStreak is reached, got: %s", result)
+	}
+
+	// add_tasks (re-planning) should clear the block.
+	addArgs, _ := json.Marshal(map[string]interface{}{"tasks": []string{"a smaller sub-task"}})
+	addTC := toolCall{Function: toolCallFunction{Name: "add_tasks", Arguments: addArgs}}
+	if _, _ = dispatchCodingToolCall(addTC, rc); state.Tasks[0].Blocked {
+		t.Fatal("expected add_tasks to clear the Blocked flag on existing tasks")
+	}
+
+	// Fix the build - mark_task_done should now succeed again for T0.
+	if err := os.WriteFile("main.go", []byte("package main\n\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	result, _ = dispatchCodingToolCall(tc, rc)
+	if strings.Contains(result, "ถูกปฏิเสธ") || strings.Contains(result, "ถูกบล็อก") {
+		t.Fatalf("expected mark_task_done to succeed after unblock + fix, got: %s", result)
+	}
+	if !state.Tasks[0].Done {
+		t.Fatal("expected T0 to be marked done")
+	}
+}
+
+// TestRunLintCheckGoCatchesVetFailure confirms the Go lint gate (go vet)
+// rejects code that compiles but fails vet (here: a Printf format-string
+// mismatch), and that runBuildOnly treats a lint failure the same as a
+// build failure (blocking).
+func TestRunLintCheckGoCatchesVetFailure(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/go.mod", []byte("module linttest\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Compiles fine, but go vet flags the Printf/argument mismatch.
+	badVet := "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Printf(\"%d\\n\", \"not a number\")\n}\n"
+	if err := os.WriteFile(dir+"/main.go", []byte(badVet), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmds := detectProjectCommands(dir)
+	if cmds.LintCmd == "" {
+		t.Fatal("expected a LintCmd to be set for a detected Go project")
+	}
+
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	passed, report := runLintCheck(cmds, 10*time.Second)
+	if passed {
+		t.Fatalf("expected go vet to catch the Printf mismatch, got passed=true, report: %s", report)
+	}
+
+	// runBuildOnly must surface the same failure (lint blocks like a build
+	// failure) even though the code compiles cleanly.
+	buildPassed, buildReport := runBuildOnly(cmds, 10*time.Second)
+	if buildPassed {
+		t.Fatalf("expected runBuildOnly to fail on a lint violation, got passed=true, report: %s", buildReport)
+	}
+	if !strings.Contains(buildReport, "[lint]") {
+		t.Fatalf("expected runBuildOnly's failure report to be tagged [lint], got: %s", buildReport)
+	}
+}
+
+// TestTaskAcceptanceCheckGatesMarkTaskDone confirms that a task registered
+// with its own acceptance_check must pass THAT specific command, not just
+// the shared build-only gate, before mark_task_done accepts it.
+func TestTaskAcceptanceCheckGatesMarkTaskDone(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	if err := os.WriteFile("go.mod", []byte("module accepttest\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("main.go", []byte("package main\n\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmds := detectProjectCommands(dir)
+
+	state := newCodingState()
+	// "go test ./nonexistent/..." matches no packages -> non-zero exit,
+	// even though the project itself builds cleanly.
+	added := state.addTaskItems([]taskInput{{Description: "add a feature", AcceptanceCheck: "go test ./nonexistent/..."}})
+	if len(added) != 1 {
+		t.Fatalf("expected 1 task to be added, got %d", len(added))
+	}
+
+	outFile, err := os.CreateTemp(dir, "log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+
+	rc := &codingRunContext{
+		outFile: outFile, state: state,
+		cmdTO: 10 * time.Second, cmds: cmds,
+	}
+	markArgs, _ := json.Marshal(map[string]interface{}{"task_id": "T0"})
+	tc := toolCall{Function: toolCallFunction{Name: "mark_task_done", Arguments: markArgs}}
+
+	result, _ := dispatchCodingToolCall(tc, rc)
+	if !strings.Contains(result, "acceptance_check") {
+		t.Fatalf("expected rejection to mention acceptance_check, got: %s", result)
+	}
+	if state.Tasks[0].Done {
+		t.Fatal("task must not be marked done when its own acceptance_check fails, even if the project builds")
+	}
+
+	// Fix the acceptance_check to something that will actually pass, and
+	// confirm the task can then be closed.
+	state.Tasks[0].AcceptanceCheck = "go build ./..."
+	result, _ = dispatchCodingToolCall(tc, rc)
+	if strings.Contains(result, "ถูกปฏิเสธ") {
+		t.Fatalf("expected mark_task_done to succeed with a passing acceptance_check, got: %s", result)
+	}
+	if !state.Tasks[0].Done {
+		t.Fatal("expected task to be marked done once its acceptance_check passes")
+	}
+}
+
+// TestSelfReviewGateBlocksReportComplete confirms report_complete is
+// refused until self_review_requirements has been called with
+// all_requirements_met=true, and that a subsequent successful file edit
+// invalidates a prior passing review.
+func TestSelfReviewGateBlocksReportComplete(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+	if err := os.WriteFile("go.mod", []byte("module reviewtest\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("main.go", []byte("package main\n\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmds := detectProjectCommands(dir)
+	outFile, err := os.CreateTemp(dir, "log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+
+	rc := &codingRunContext{
+		outFile: outFile, state: newCodingState(),
+		cmdTO: 10 * time.Second, cmds: cmds, selfReviewEnabled: true,
+	}
+
+	reportArgs, _ := json.Marshal(map[string]interface{}{"summary": "done"})
+	reportTC := toolCall{Function: toolCallFunction{Name: "report_complete", Arguments: reportArgs}}
+
+	// 1) No self-review yet -> must be refused, and NOT reported as an
+	// accepted report_complete.
+	result, isReport := dispatchCodingToolCall(reportTC, rc)
+	if isReport {
+		t.Fatal("report_complete must not be accepted before a passing self_review_requirements call")
+	}
+	if !strings.Contains(result, "self_review_requirements") {
+		t.Fatalf("expected rejection to mention self_review_requirements, got: %s", result)
+	}
+
+	// 2) A dishonest/incomplete self-review (all_requirements_met=false)
+	// still must not unlock report_complete.
+	reviewArgs, _ := json.Marshal(map[string]interface{}{"all_requirements_met": false, "missing_items": []string{"the login page"}})
+	reviewTC := toolCall{Function: toolCallFunction{Name: "self_review_requirements", Arguments: reviewArgs}}
+	dispatchCodingToolCall(reviewTC, rc)
+	_, isReport = dispatchCodingToolCall(reportTC, rc)
+	if isReport {
+		t.Fatal("report_complete must not be accepted after a self-review that reported missing items")
+	}
+
+	// 3) A passing self-review unlocks report_complete.
+	passArgs, _ := json.Marshal(map[string]interface{}{"all_requirements_met": true})
+	passTC := toolCall{Function: toolCallFunction{Name: "self_review_requirements", Arguments: passArgs}}
+	dispatchCodingToolCall(passTC, rc)
+	_, isReport = dispatchCodingToolCall(reportTC, rc)
+	if !isReport {
+		t.Fatal("expected report_complete to be accepted after a passing self_review_requirements call")
+	}
+
+	// 4) Any further edit invalidates that pass - report_complete must be
+	// refused again until a fresh review.
+	writeArgs, _ := json.Marshal(map[string]interface{}{"path": "notes.txt", "content": "x", "reason": "test"})
+	writeTC := toolCall{Function: toolCallFunction{Name: "write_file", Arguments: writeArgs}}
+	dispatchCodingToolCall(writeTC, rc)
+	_, isReport = dispatchCodingToolCall(reportTC, rc)
+	if isReport {
+		t.Fatal("expected a file edit to invalidate a prior passing self-review, requiring a fresh call")
+	}
+}
+
+// TestEditVerifyAppendsAutoBuildCheckResult confirms that when
+// editVerifyEnabled is set, a successful write_file to a source file
+// immediately triggers a build-only check and appends the (failing) result
+// to the tool's own return value, without waiting for mark_task_done.
+func TestEditVerifyAppendsAutoBuildCheckResult(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+	if err := os.WriteFile("go.mod", []byte("module editverifytest\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmds := detectProjectCommands(dir)
+	outFile, err := os.CreateTemp(dir, "log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+
+	rc := &codingRunContext{
+		outFile: outFile, state: newCodingState(),
+		cmdTO: 10 * time.Second, cmds: cmds, editVerifyEnabled: true,
+	}
+	broken := "package main\n\nfunc main() {\n"
+	writeArgs, _ := json.Marshal(map[string]interface{}{"path": "main.go", "content": broken, "reason": "test"})
+	writeTC := toolCall{Function: toolCallFunction{Name: "write_file", Arguments: writeArgs}}
+
+	result, _ := dispatchCodingToolCall(writeTC, rc)
+	if !strings.Contains(result, "auto lint/build-check") {
+		t.Fatalf("expected the write_file result to include the immediate auto build-check output, got: %s", result)
+	}
+	if !strings.Contains(result, "ล้มเหลว") {
+		t.Fatalf("expected the auto build-check to report failure for broken code, got: %s", result)
+	}
+}
+
+// TestPreflightCheckDetectsMissingBinary confirms preflightCheck flags a
+// binary that isn't in PATH while not flagging one that is (using "go",
+// which the test binary itself requires to have been built).
+func TestPreflightCheckDetectsMissingBinary(t *testing.T) {
+	cmds := projectCommands{
+		Label: "go", BuildCmd: "go build ./...", TestCmd: "go test ./...",
+		LintCmd: "definitely-not-a-real-binary-xyz --check",
+	}
+	missing := preflightCheck(cmds)
+	found := false
+	for _, m := range missing {
+		if m == "definitely-not-a-real-binary-xyz" {
+			found = true
+		}
+		if m == "go" {
+			t.Fatal("did not expect 'go' to be reported missing")
+		}
+	}
+	if !found {
+		t.Fatalf("expected preflightCheck to flag the nonexistent binary, got missing: %v", missing)
 	}
 }
 
@@ -268,7 +562,7 @@ func TestDetectProjectCommandsGoModule(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmds := detectProjectCommands(dir)
-	if cmds.Label != "go" || cmds.BuildCmd != "go build ./..." || !cmds.AllowBins["go"] {
+	if cmds.Label != "go" || cmds.BuildCmd != "go build ./..." || cmds.TestCmd != "go test ./..." {
 		t.Fatalf("unexpected detection for go module: %+v", cmds)
 	}
 }
@@ -281,7 +575,7 @@ func TestDetectProjectCommandsGeneric(t *testing.T) {
 	}
 }
 
-func TestToolRunCommandExecutesAllowedCommand(t *testing.T) {
+func TestToolRunCommandExecutesCommand(t *testing.T) {
 	dir := t.TempDir()
 	cwd, _ := os.Getwd()
 	defer os.Chdir(cwd)
@@ -289,19 +583,19 @@ func TestToolRunCommandExecutesAllowedCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	args := map[string]interface{}{"command": "true"}
-	result, err := toolRunCommand(args, map[string]bool{"true": true}, 5*time.Second)
+	result, err := toolRunCommand(args, 5*time.Second)
 	if err != nil {
-		t.Fatalf("expected allowed command to run: %v", err)
+		t.Fatalf("expected command to run: %v", err)
 	}
 	if !strings.Contains(result, "exit_code=0") {
 		t.Fatalf("expected success exit code in result, got: %s", result)
 	}
 }
 
-func TestToolRunCommandRejectsDisallowedCommand(t *testing.T) {
-	args := map[string]interface{}{"command": "curl http://example.com"}
-	if _, err := toolRunCommand(args, map[string]bool{"go": true}, 5*time.Second); err == nil {
-		t.Fatal("expected disallowed command to be rejected before execution")
+func TestToolRunCommandRejectsEmptyCommand(t *testing.T) {
+	args := map[string]interface{}{"command": ""}
+	if _, err := toolRunCommand(args, 5*time.Second); err == nil {
+		t.Fatal("expected empty command to be rejected before execution")
 	}
 }
 
@@ -2580,9 +2874,9 @@ func TestResolveSkillsDirsFallsBackToEnv(t *testing.T) {
 	}
 }
 
-// TestResolveSkillsDirsSplitsAndTrimsCommaList mirrors --allow's
-// comma-separated convention: multiple directories, extra whitespace and
-// empty segments handled gracefully.
+// TestResolveSkillsDirsSplitsAndTrimsCommaList mirrors ola's other
+// comma-separated flags' convention: multiple directories, extra whitespace
+// and empty segments handled gracefully.
 func TestResolveSkillsDirsSplitsAndTrimsCommaList(t *testing.T) {
 	got := resolveSkillsDirs(" /a/skills , /b/skills ,,/c/skills")
 	want := []string{"/a/skills", "/b/skills", "/c/skills"}
@@ -3348,20 +3642,31 @@ func main() {
 			argsJSON := fmt.Sprintf(`{"path":"main.go","content":%q}`, broken)
 			fmt.Fprint(w, streamLine("", "write_file", argsJSON, true))
 		case 3:
-			// Round 3: claim done before actually verifying - ola should
+			// Round 3: required self-review pass before report_complete is
+			// even considered - the model (wrongly) claims everything's
+			// covered; ola's own independent build/test check below is
+			// what actually catches the broken file, not this step.
+			fmt.Fprint(w, streamLine("", "self_review_requirements", `{"all_requirements_met":true}`, true))
+		case 4:
+			// Round 4: claim done before actually verifying - ola should
 			// catch this since the file doesn't compile.
 			fmt.Fprint(w, streamLine("", "report_complete", `{"summary":"hello world program written"}`, true))
-		case 4:
-			// Round 4: model sees the VERIFY FAILED tool result for the
-			// previous report_complete and fixes the file for real.
+		case 5:
+			// Round 5: model sees the VERIFY FAILED tool result for the
+			// previous report_complete and fixes the file for real. This
+			// edit also invalidates the round-3 self-review pass.
 			argsJSON := fmt.Sprintf(`{"path":"main.go","old_str":%q,"new_str":%q}`,
 				`fmt.Println("hello"
 }`, `fmt.Println("hello")
 }`)
 			fmt.Fprint(w, streamLine("", "edit_file", argsJSON, true))
-		case 5:
-			fmt.Fprint(w, streamLine("", "mark_task_done", `{"task_id":"T0","note":"fixed and compiles"}`, true))
 		case 6:
+			fmt.Fprint(w, streamLine("", "mark_task_done", `{"task_id":"T0","note":"fixed and compiles"}`, true))
+		case 7:
+			// Round 7: fresh self-review required again since round 5's
+			// edit invalidated the earlier one.
+			fmt.Fprint(w, streamLine("", "self_review_requirements", `{"all_requirements_met":true}`, true))
+		case 8:
 			fmt.Fprint(w, streamLine("", "report_complete", `{"summary":"hello world program written and verified"}`, true))
 		default:
 			t.Errorf("unexpected extra round %d", n)
@@ -3378,8 +3683,8 @@ func main() {
 	if exitCode != 0 {
 		t.Fatalf("expected cmdCoding to exit 0, got %d", exitCode)
 	}
-	if got := atomic.LoadInt32(&round); got != 6 {
-		t.Fatalf("expected exactly 6 mock rounds (plan, break, false-complete, fix, mark-done, real-complete), got %d", got)
+	if got := atomic.LoadInt32(&round); got != 8 {
+		t.Fatalf("expected exactly 8 mock rounds (plan, break, self-review, false-complete, fix, mark-done, self-review, real-complete), got %d", got)
 	}
 
 	// The fixed program should actually compile and run correctly now.

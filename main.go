@@ -264,8 +264,9 @@ the normal case and only reach for it when it actually applies.
   go.mod) and verification is enabled for this session. If you do not see
   run_command in your tools, skip the VERIFYING CODE CHANGES section below
   entirely - there is nothing to run, and you should not claim otherwise.
-  When it is present, only allowlisted binaries relevant to this project's
-  toolchain may run; arbitrary shell commands are rejected.
+  When it is present, it runs any shell command given to it - there is no
+  binary allowlist, so use it responsibly and only for what the task
+  actually needs.
 - web_search(queries, max_results?): ONLY present when ola has a web
   search backend configured for this session (opt-in) - either Ollama's
   hosted Web Search API or a local SearXNG instance. Accepts a list, not
@@ -818,13 +819,13 @@ var runCommandTool = ollamaTool{
 	Type: "function",
 	Function: ollamaToolFunction{
 		Name:        "run_command",
-		Description: "Run a build/test/lint command for this project from the current directory. Only binaries relevant to this project's detected toolchain are allowed; arbitrary shell commands are rejected.",
+		Description: "Run a shell command for this project from the current directory (e.g. build/test/lint, or anything else needed). No restriction on which binaries may be invoked.",
 		Parameters: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"command": map[string]interface{}{
 					"type":        "string",
-					"description": "The command to run, e.g. \"go test ./...\". May chain with &&/;/| as long as every segment's binary is allowed.",
+					"description": "The command to run, e.g. \"go test ./...\". May chain with &&/;/|.",
 				},
 			},
 			"required": []string{"command"},
@@ -870,7 +871,6 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  (คำถามทั่วไปที่ไม่แตะไฟล์โค้ดจะไม่ได้รับผลกระทบใดๆ ในทุกกรณี)")
 		fmt.Println("  Verify จะ trigger เฉพาะเมื่อไฟล์ที่แก้เป็น source file ของ toolchain ที่ตรวจพบจริงๆ (เช่น .go")
 		fmt.Println("  สำหรับโปรเจกต์ Go) การแก้ไฟล์เอกสาร/ข้อความ (.txt, .md, ฯลฯ) จะไม่ trigger build/test อัตโนมัติ")
-		fmt.Println("  เว้นแต่ระบุ --build-cmd/--test-cmd เอง ซึ่งถือว่าตั้งใจ override แล้ว")
 		fmt.Println()
 		fmt.Println("Web search / fetch:")
 		fmt.Println("  web_search ปิดโดย default จนกว่าจะตั้งค่าหนึ่งในสอง backend ต่อไปนี้ (ถ้าตั้งทั้งคู่ SearXNG จะถูกใช้ก่อน):")
@@ -905,7 +905,7 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("scp_copy - คัดลอกไฟล์ระหว่างเครื่องนี้กับ remote host ผ่าน SSH (เปิดเมื่อระบุ --scp-hosts หรือ OLA_SCP_HOSTS เท่านั้น):")
 		fmt.Println("  ใช้ scp binary ของระบบเรียกตรงผ่าน argv (ไม่ผ่าน sh -c) ไม่มี tool call ไหนที่ยอมให้โมเดลระบุ")
 		fmt.Println("  user/host/port/remote-root เองได้เลย - ต้องตั้งค่าไว้ล่วงหน้าเท่านั้นผ่าน OLA_SCP_HOSTS โดยโมเดล")
-		fmt.Println("  เลือกได้แค่ \"remote_alias\" จากรายชื่อที่ตั้งไว้ (เหมือนหลักการ allowlist ของ run_command - เดา/พิมพ์")
+		fmt.Println("  เลือกได้แค่ \"remote_alias\" จากรายชื่อที่ตั้งไว้ล่วงหน้าเท่านั้น (เดา/พิมพ์")
 		fmt.Println("  host เองไม่ได้) รูปแบบ: \"alias=user@host[:port]/remote/root\" คั่นหลาย host ด้วย comma เช่น")
 		fmt.Println("    OLA_SCP_HOSTS=\"backup=moo@10.0.0.5:22/srv/backup,nas=moo@nas.local/mnt/data\"")
 		fmt.Println("  ทั้งฝั่ง local (--scp-local-dir, default: current directory) และฝั่ง remote (root ต่อ alias ด้านบน)")
@@ -923,7 +923,7 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("api_request - ยิง HTTP request ไปยัง API (เปิดเมื่อระบุ --api-endpoints/OLA_API_ENDPOINTS หรือ")
 		fmt.Println("  --api-allow-direct-url เท่านั้น) สองวิธีเลือกปลายทาง:")
 		fmt.Println("    1. endpoint - โมเดลเลือก \"endpoint\" เป็นชื่อ alias ที่ตั้งไว้ล่วงหน้าเท่านั้น (เหมือนหลักการ")
-		fmt.Println("       allowlist ของ scp_copy/run_command - เดา/พิมพ์ host เองไม่ได้) รูปแบบ: \"alias=https://base.url\"")
+		fmt.Println("       allowlist ของ scp_copy - เดา/พิมพ์ host เองไม่ได้) รูปแบบ: \"alias=https://base.url\"")
 		fmt.Println("       คั่นหลาย endpoint ด้วย comma เช่น")
 		fmt.Println("         OLA_API_ENDPOINTS=\"ollama=http://localhost:11434,openwebui=http://localhost:8080\"")
 		fmt.Println("       endpoint เท่านั้นที่เข้าถึง host ภายใน/private ได้ ถ้า endpoint ต้องใช้ credential ตั้งค่าแยกผ่าน")
@@ -1024,9 +1024,6 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("                       จะถูกตีความเป็นไฟล์แนบทั้งหมด ไม่มี positional prompt แยกต่างหากอีกต่อไป)")
 		fmt.Println("  -n, --dry-run        แสดง JSON payload ของ request รอบแรก (รวม tools) และ system prompt โดยไม่เรียก API จริง")
 		fmt.Println("  -V, --no-verify      ปิดการ verify อัตโนมัติทั้งหมด (ไม่เพิ่ม tool run_command เลย ไม่ว่า directory จะมี toolchain หรือไม่)")
-		fmt.Println("      --build-cmd <s>  override คำสั่ง build ที่ auto-detect ได้ (เช่น กรณี detect ผิดหรือไม่มี toolchain ที่รู้จัก)")
-		fmt.Println("      --test-cmd <s>   override คำสั่ง test ที่ auto-detect ได้")
-		fmt.Println("      --allow <list>   binary เพิ่มเติมที่อนุญาตให้ run_command เรียกได้ คั่นด้วย comma เช่น \"golangci-lint,staticcheck\"")
 		fmt.Println("      --cmd-timeout <sec>  timeout ต่อการเรียก run_command/verify หนึ่งครั้ง (default: 60)")
 		fmt.Println("      --ollama-search-key <k>  override OLA_OLLAMA_SEARCH_API_KEY/$OLLAMA_API_KEY (เปิด web_search)")
 		fmt.Println("      --searxng-url <u>    override OLA_SEARXNG_API_BASE (เปิด web_search - ชนะ Ollama key ถ้าตั้งทั้งคู่)")
@@ -1102,7 +1099,6 @@ func cmdAsk(args []string) int {
 	var model, ctxStr, outputFile, topic, promptFile string
 	var flagKey, flagNoThink, flagRaw, flagDryRun, flagAppend, flagHelp bool
 	var flagNoVerify, flagQuiet bool
-	var buildCmd, testCmd, allowList string
 	var cmdTimeoutSec int
 	var searxngURL string
 	var ollamaSearchKey string
@@ -1142,9 +1138,6 @@ func cmdAsk(args []string) int {
 	fs.BoolVar(&flagQuiet, "quiet", false, "")
 	fs.BoolVar(&flagNoVerify, "V", false, "")
 	fs.BoolVar(&flagNoVerify, "no-verify", false, "")
-	fs.StringVar(&buildCmd, "build-cmd", "", "")
-	fs.StringVar(&testCmd, "test-cmd", "", "")
-	fs.StringVar(&allowList, "allow", "", "")
 	fs.IntVar(&cmdTimeoutSec, "cmd-timeout", defaultAskCmdTimeoutSec, "")
 	fs.StringVar(&promptFile, "f", "", "")
 	fs.StringVar(&promptFile, "prompt-file", "", "")
@@ -1297,22 +1290,6 @@ func cmdAsk(args []string) int {
 	// output and logging can always show what would have applied.
 	cwd, cwdErr := os.Getwd()
 	cmds := detectProjectCommands(cwd)
-	if buildCmd != "" {
-		cmds.BuildCmd = buildCmd
-		cmds.AllowBins[firstWord(buildCmd)] = true
-	}
-	if testCmd != "" {
-		cmds.TestCmd = testCmd
-		cmds.AllowBins[firstWord(testCmd)] = true
-	}
-	if allowList != "" {
-		for _, b := range strings.Split(allowList, ",") {
-			b = strings.TrimSpace(b)
-			if b != "" {
-				cmds.AllowBins[b] = true
-			}
-		}
-	}
 	// verifyEnabled gates both whether run_command is offered to the model
 	// at all and whether ola runs its own independent re-check after the
 	// model's final answer. It only turns on when there's actually
@@ -1322,13 +1299,6 @@ func cmdAsk(args []string) int {
 	// use is completely unaffected.
 	verifyEnabled := !flagNoVerify && (cmds.BuildCmd != "" || cmds.TestCmd != "")
 	cmdTimeout := time.Duration(cmdTimeoutSec) * time.Second
-	// forceVerifyAnyFile: the user explicitly told ola what to build/test
-	// via --build-cmd/--test-cmd, so they've opted into verify regardless
-	// of which file extension gets touched. Without an explicit override,
-	// verify only triggers for edits to files that actually look like this
-	// toolchain's source code (see isVerifiableEdit) - editing a .txt/.md
-	// doc in a Go repo must never make ola try to "go build" on its behalf.
-	forceVerifyAnyFile := buildCmd != "" || testCmd != ""
 
 	// Auto-inject a directory listing when the user didn't attach any files
 	// themselves. This gives the model a map of the project up front instead
@@ -1673,7 +1643,7 @@ func cmdAsk(args []string) int {
 			if !verifyEnabled {
 				return "", nil, false
 			}
-			r, e := toolRunCommand(args, cmds.AllowBins, cmdTimeout)
+			r, e := toolRunCommand(args, cmdTimeout)
 			return r, e, true
 		case "web_search":
 			if !searchCfg.searchEnabled() {
@@ -1817,7 +1787,7 @@ func cmdAsk(args []string) int {
 				var editArgs map[string]interface{}
 				_ = json.Unmarshal(tc.Function.Arguments, &editArgs)
 				path, _ := editArgs["path"].(string)
-				if isVerifiableEdit(path, cmds.Label, forceVerifyAnyFile) {
+				if isVerifiableEdit(path, cmds.Label) {
 					filesChanged = true
 				} else if verifyEnabled {
 					fmt.Fprintf(outFile, "[verify-skip] %s ไม่ใช่ source file ของ toolchain %q ที่ตรวจพบ - จะไม่ trigger build/test อัตโนมัติ\n", path, cmds.Label)
@@ -2936,9 +2906,8 @@ func streamResponse(body io.Reader, outFile *os.File, cyan, bold, dim, reset str
 //  1. The remote user/host/port/root directory are NEVER supplied by the
 //     model. They come exclusively from OLA_SCP_HOSTS/--scp-hosts, set by
 //     the human running ola. The model can only pick a "remote_alias" name
-//     out of that pre-approved list - the same "deterministic allowlist,
-//     not model input" principle validateCommand's binary allowlist uses
-//     for run_command, just applied to a name instead of a command.
+//     out of that pre-approved list - a deterministic, human-configured
+//     allowlist, not something the model's own input can extend.
 //  2. Both sides are sandboxed by path, the same way read_file/write_file
 //     are (sandboxedPathIn) - local_path can never escape the configured
 //     local root, remote_path can never escape the remote root configured
@@ -4154,7 +4123,7 @@ func truncateText(s string, limit int) string {
 // line of body text (for "description").
 //
 // Multiple directories can be configured at once, comma-separated (same
-// convention as --allow's binary list, e.g. "/mnt/skills/public,
+// convention as --skills-dir's other comma-separated flags, e.g. "/mnt/skills/public,
 // /mnt/skills/private"). Directories are scanned in the given order; the
 // first skill found with a given name wins, and a same-named skill found
 // again in a later directory is skipped with a warning rather than
@@ -4630,7 +4599,7 @@ func toolReadSkill(args map[string]interface{}, skills []skillInfo) (string, err
 //     plan -> implement -> verify -> report workflow:
 //     - add_tasks       register a checklist of implementation tasks
 //     - mark_task_done  check off a task as it's completed
-//     - run_command     build/test/lint the project (allowlisted)
+//     - run_command     run any shell command (build/test/lint, etc.)
 //     - report_complete claim the work is done
 //     Same as "ask", read_skill (see the integrations section above) is also
 //     added whenever a
@@ -4640,8 +4609,7 @@ func toolReadSkill(args map[string]interface{}, skills []skillInfo) (string, err
 //     itself matters more than in a supervised "ask" session.
 //  3. report_complete does NOT end the loop by itself. ola independently
 //     re-runs the project's build/test command (auto-detected from the
-//     repo, or overridden with --build-cmd/--test-cmd) and only accepts
-//     completion if that actually passes. If it fails, the failure output
+//     repo) and only accepts completion if that actually passes. If it fails, the failure output
 //     is fed back into the conversation as a tool result and the loop
 //     keeps going - this is the "verify, and if it's wrong, loop back and
 //     fix it" behavior requested for this command, driven by ola itself
@@ -4704,6 +4672,16 @@ const (
 	// run_command call gets sent back to the model, so one verbose build
 	// log can't blow the context budget in one shot.
 	maxRunCommandOutput = 8000
+
+	// maxTaskFailStreak: after this many consecutive mark_task_done
+	// rejections for the same task_id, ola blocks any further
+	// mark_task_done attempt on that task until the model explicitly
+	// reacts to being stuck - either add_tasks (splitting the task into
+	// smaller pieces) or ask_user (asking a human) clears the block. A
+	// weak model left unchecked will otherwise retry the exact same
+	// failing approach indefinitely; this forces an explicit re-plan
+	// instead of a silent infinite loop.
+	maxTaskFailStreak = 3
 )
 
 // ─────────────────────────────────────────────────────────────────
@@ -4749,25 +4727,47 @@ requirements is actually built and actually works.
   days/hours/minutes/seconds), each unit optional but, when present, in
   that exact order - e.g. "1d2h30m", "45s", "2h". Capped at 24h per call.
 - add_tasks(tasks): register your implementation plan as a checklist, one
-  short string per concrete task. Call this ONCE, early, right after you've
-  read the requirements and looked over the repository - not per file, per
-  feature area (e.g. "Set up project scaffolding", "Implement user auth",
-  "Write tests for the payment flow"). You can call it again later ONLY if
-  you discover genuinely new work that wasn't foreseeable at planning time.
+  entry per concrete task, at feature-area granularity (e.g. "Set up
+  project scaffolding", "Implement user auth", "Write tests for the
+  payment flow") - not per file. Call this ONCE, early, right after you've
+  read the requirements and looked over the repository. Each entry can be
+  a plain string, or an object {"description": ..., "acceptance_check":
+  ...}. Give an acceptance_check whenever a task has a sensible narrow
+  test - a specific command (e.g. "go test ./internal/auth/...") that
+  verifies THIS task alone, not just that the whole project still builds.
+  Omit it only for tasks with no sensible narrow test (e.g. "set up
+  project scaffolding"). Smaller, individually-testable tasks are far
+  easier for you to actually get right than a few large ones - prefer
+  more, smaller tasks. You can call add_tasks again later if you discover
+  genuinely new work, or if a task turns out to need splitting into
+  smaller pieces (see mark_task_done below).
 - mark_task_done(task_id, note?): check off a task from the list add_tasks
   gave you, once it is actually implemented (not just planned). Include a
-  short note of what was done. ola runs a fast build-only check of its own
-  before accepting this call (not the full test suite - that only happens
-  at report_complete) and will reject the call with the build failure
-  output if it doesn't pass; fix the build first, then call
-  mark_task_done again.
-- run_command(command): run a build/test/lint command for this project
-  (e.g. "go build ./..." or "go test ./..." or "npm test"). Only a
-  restricted set of binaries relevant to this project's toolchain are
-  allowed - if a command is rejected, use one of the project's normal
-  build/test/lint entry points instead of trying to route around the
-  restriction. Use this liberally while implementing, to catch problems
-  early instead of discovering them all at once at the end.
+  short note of what was done. Before accepting this, ola independently
+  runs (a) a lint/static-analysis pass for this project's language, (b) a
+  build-only check, and (c) this task's own acceptance_check if it has
+  one (not the full test suite - that only happens at report_complete);
+  any failure rejects the call with the real output, and you're expected
+  to fix it and call mark_task_done again. If the SAME task gets rejected
+  3 times in a row, ola blocks any further mark_task_done attempt on it
+  until you either call add_tasks to split it into smaller pieces, or
+  ask_user to escalate - this is a hard stop meant to catch you retrying
+  the same failing approach instead of rethinking it.
+- self_review_requirements(all_requirements_met, missing_items?): required
+  once, right before report_complete. Re-read the original requirements
+  (in the first message of this conversation) yourself, item by item, and
+  honestly compare against what you've actually implemented so far - do
+  not assume "the build passes" means "every requirement is done". Set
+  all_requirements_met=true only if it genuinely is; otherwise list what's
+  missing in missing_items and go implement it. report_complete will be
+  refused without a call to this that returned all_requirements_met=true,
+  and ANY file edit after that call invalidates it - you'll need to call
+  it again after your next round of changes.
+- run_command(command): run any shell command for this project (e.g. "go
+  build ./..." or "go test ./..." or "npm test", or anything else this
+  task needs). There is no binary allowlist - use it liberally while
+  implementing, to catch problems early instead of discovering them all
+  at once at the end, but stay focused on what the task actually needs.
 - web_search(queries, max_results?): ONLY present when ola has a local
   SearXNG search backend configured for this session (opt-in). Accepts a
   list, not just one item - independent queries run in parallel
@@ -4807,15 +4807,19 @@ guessing:
   your final report rather than silently fabricating a "current" fact -
   get_current_time, by contrast, is always available.
 - report_complete(summary): declare that every task is implemented and the
-  project builds/tests cleanly. IMPORTANT: this does not end the session by
-  itself. ola will independently re-run the project's build/test command
-  after you call this. If that check fails, you will see the failure output
-  fed back as a tool result and you are expected to fix it and call
-  report_complete again - do not call report_complete speculatively before
-  you have already run the build/tests yourself via run_command and seen
-  them pass. Once verification actually passes, this summary is what gets
-  sent as the "work finished" push notification, so write it for a human
-  glancing at their phone, not just "done".
+  project lints/builds/tests cleanly. Requires a FRESH
+  self_review_requirements(all_requirements_met=true) call first - any file
+  edit since that call invalidates it and report_complete will be refused
+  until you review again. IMPORTANT: even past that gate, this does not end
+  the session by itself. ola will independently re-run the project's own
+  lint/build/test commands after you call this. If that check fails, you
+  will see the failure output fed back as a tool result and you are
+  expected to fix it and call self_review_requirements then report_complete
+  again - do not call report_complete speculatively before you have already
+  run the build/tests yourself via run_command and seen them pass. Once
+  verification actually passes, this summary is what gets sent as the
+  "work finished" push notification, so write it for a human glancing at
+  their phone, not just "done".
 
 # WORKFLOW
 1. Read the requirements file and look over the repository (search_files /
@@ -4824,16 +4828,27 @@ guessing:
    approach, ask_user once per open question - don't guess silently on
    decisions that are hard to reverse later, but don't ask about things you
    can reasonably decide yourself either.
-3. Call add_tasks once with your concrete implementation checklist.
-4. Work through the tasks: write/edit files, run_command to build/test as
-   you go, mark_task_done as each one is genuinely finished (not just
-   started).
+3. Call add_tasks once with your concrete implementation checklist, giving
+   each task an acceptance_check where a narrow test makes sense (see
+   add_tasks above). Prefer more, smaller tasks over a few large ones.
+4. Work through the tasks one at a time: write/edit files, run_command to
+   build/test as you go (every write_file/edit_file also triggers an
+   automatic lint+build check whose result is appended to that tool's
+   result - read it, it's the fastest signal you'll get that something
+   just broke), mark_task_done as each one is genuinely finished (not just
+   started). If a task keeps getting rejected, don't keep retrying the
+   same fix - split it into smaller tasks with add_tasks, or ask_user.
 5. When you believe all tasks are done: run_command the project's real
-   build and test commands yourself first. Only once those pass, call
-   report_complete with a short summary of what was built.
+   build and test commands yourself first. Then call
+   self_review_requirements, comparing your implementation against the
+   original requirements honestly. Only once that returns
+   all_requirements_met=true, call report_complete with a short summary of
+   what was built.
 6. If ola's independent verification after report_complete comes back
    failing, treat the failure output as the next thing to fix - do not
-   re-declare completion until you've addressed it and re-verified.
+   re-declare completion until you've addressed it, called
+   self_review_requirements again (your previous pass was invalidated by
+   the fix), and re-verified.
 7. If you ever get stuck in a way no reasonable assumption can resolve
    (e.g. a task in the requirements is actually contradictory), say so
    plainly in a normal final answer (no tool call) rather than looping
@@ -4869,14 +4884,27 @@ var codingExtraTools = []ollamaTool{
 		Type: "function",
 		Function: ollamaToolFunction{
 			Name:        "add_tasks",
-			Description: "Register the implementation checklist for this session as a list of short task descriptions. Call once, early, with the full plan at feature-area granularity.",
+			Description: "Register the implementation checklist for this session, at feature-area granularity, one entry per concrete unit of work. Call once, early. Each task SHOULD include an acceptance_check: a concrete command (e.g. \"go test ./internal/auth/...\") that specifically verifies THIS task, not just that the whole project still builds - this is what lets mark_task_done judge each task narrowly instead of only checking a generic build. Omit acceptance_check only for tasks with no sensible narrow test (e.g. \"set up project scaffolding\"). Can also be called again later to split a task that's stuck (see mark_task_done).",
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
 					"tasks": map[string]interface{}{
-						"type":        "array",
-						"items":       map[string]interface{}{"type": "string"},
-						"description": "Short task descriptions, one per concrete unit of work.",
+						"type": "array",
+						"items": map[string]interface{}{
+							"type": "object",
+							"properties": map[string]interface{}{
+								"description": map[string]interface{}{
+									"type":        "string",
+									"description": "Short description of this concrete unit of work.",
+								},
+								"acceptance_check": map[string]interface{}{
+									"type":        "string",
+									"description": "Optional: a specific, narrow command that verifies this task alone (e.g. \"go test ./pkg/auth/...\"). Must use a binary available to run_command.",
+								},
+							},
+							"required": []string{"description"},
+						},
+						"description": "One entry per concrete task. A plain string is also accepted as shorthand for {\"description\": \"...\"} with no acceptance_check.",
 					},
 				},
 				"required": []string{"tasks"},
@@ -4887,7 +4915,7 @@ var codingExtraTools = []ollamaTool{
 		Type: "function",
 		Function: ollamaToolFunction{
 			Name:        "mark_task_done",
-			Description: "Mark a previously registered task (by its task_id, e.g. \"T3\") as completed.",
+			Description: "Mark a previously registered task (by its task_id, e.g. \"T3\") as completed. ola runs a lint + build-only check (plus the task's own acceptance_check, if it has one) before accepting this. If the same task is rejected 3 times in a row, it becomes blocked and must be split further via add_tasks, or escalated via ask_user, before it can be retried.",
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -4908,8 +4936,30 @@ var codingExtraTools = []ollamaTool{
 	{
 		Type: "function",
 		Function: ollamaToolFunction{
+			Name:        "self_review_requirements",
+			Description: "Required once, right before report_complete: re-read the original requirements (in the first user message of this conversation) and honestly compare against what has actually been implemented so far. If ANY requirement isn't done, set all_requirements_met=false and list it in missing_items instead of guessing it's fine. report_complete will be refused until this has been called with all_requirements_met=true, and any further file edit after calling this invalidates it, requiring a fresh call.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"all_requirements_met": map[string]interface{}{
+						"type":        "boolean",
+						"description": "true only if every requirement in the requirements file is genuinely implemented.",
+					},
+					"missing_items": map[string]interface{}{
+						"type":        "array",
+						"items":       map[string]interface{}{"type": "string"},
+						"description": "Any requirement not yet implemented. Empty/omit only when all_requirements_met is true.",
+					},
+				},
+				"required": []string{"all_requirements_met"},
+			},
+		},
+	},
+	{
+		Type: "function",
+		Function: ollamaToolFunction{
 			Name:        "report_complete",
-			Description: "Declare that all tasks are implemented and the project builds/tests cleanly. ola will independently re-verify before actually ending the session.",
+			Description: "Declare that all tasks are implemented and the project lints/builds/tests cleanly. Requires a fresh self_review_requirements(all_requirements_met=true) call first (any file edit since invalidates it). ola will independently re-verify (lint + build + test) before actually ending the session.",
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -4954,6 +5004,26 @@ type codingTask struct {
 	Done        bool   `json:"done"`
 	Note        string `json:"note,omitempty"`
 	DoneAt      string `json:"done_at,omitempty"`
+
+	// AcceptanceCheck is an optional, task-specific verification command
+	// (e.g. "go test ./internal/auth/...") supplied by the model via
+	// add_tasks. When set, mark_task_done runs THIS in addition to the
+	// shared lint+build-only gate, so completion is judged against a
+	// scope narrow enough to actually catch whether this particular task
+	// works, not just whether the whole project still compiles. Falls
+	// back to lint+build-only alone when empty (e.g. a task with no
+	// sensible narrow test, like "set up project scaffolding").
+	AcceptanceCheck string `json:"acceptance_check,omitempty"`
+
+	// FailCount tracks consecutive mark_task_done rejections for this
+	// task (reset to 0 on success). Persisted so a resumed session
+	// remembers a task was already struggling.
+	FailCount int `json:"fail_count,omitempty"`
+
+	// Blocked is set once FailCount reaches maxTaskFailStreak: further
+	// mark_task_done calls on this task are refused until add_tasks or
+	// ask_user is called (see dispatchCodingToolCall), which clears it.
+	Blocked bool `json:"blocked,omitempty"`
 }
 
 type codingState struct {
@@ -4993,19 +5063,87 @@ func (s *codingState) save(path string) error {
 	return os.WriteFile(path, data, 0644)
 }
 
-func (s *codingState) addTasks(descriptions []string) []codingTask {
+// taskInput is the richer per-task shape add_tasks now accepts (description
+// plus an optional acceptance_check).
+type taskInput struct {
+	Description     string
+	AcceptanceCheck string
+}
+
+func (s *codingState) addTaskItems(items []taskInput) []codingTask {
 	var added []codingTask
-	for _, d := range descriptions {
-		d = strings.TrimSpace(d)
+	for _, it := range items {
+		d := strings.TrimSpace(it.Description)
 		if d == "" {
 			continue
 		}
-		t := codingTask{ID: fmt.Sprintf("T%d", s.nextID), Description: d}
+		t := codingTask{
+			ID:              fmt.Sprintf("T%d", s.nextID),
+			Description:     d,
+			AcceptanceCheck: strings.TrimSpace(it.AcceptanceCheck),
+		}
 		s.nextID++
 		s.Tasks = append(s.Tasks, t)
 		added = append(added, t)
 	}
 	return added
+}
+
+// addTasks is the plain-description convenience form of addTaskItems, kept
+// for backward compatibility (existing callers/tests that only deal in
+// descriptions, with no acceptance_check).
+func (s *codingState) addTasks(descriptions []string) []codingTask {
+	items := make([]taskInput, len(descriptions))
+	for i, d := range descriptions {
+		items[i] = taskInput{Description: d}
+	}
+	return s.addTaskItems(items)
+}
+
+// findTask returns a pointer into s.Tasks for the given id, or nil.
+func (s *codingState) findTask(id string) *codingTask {
+	for i := range s.Tasks {
+		if s.Tasks[i].ID == id {
+			return &s.Tasks[i]
+		}
+	}
+	return nil
+}
+
+// bumpFail increments a task's consecutive-failure streak and blocks it
+// once maxTaskFailStreak is reached. Returns the task's Blocked state after
+// the increment.
+func (s *codingState) bumpFail(id string) bool {
+	t := s.findTask(id)
+	if t == nil {
+		return false
+	}
+	t.FailCount++
+	if t.FailCount >= maxTaskFailStreak {
+		t.Blocked = true
+	}
+	return t.Blocked
+}
+
+// resetFail clears a task's failure streak (called on a successful
+// mark_task_done).
+func (s *codingState) resetFail(id string) {
+	if t := s.findTask(id); t != nil {
+		t.FailCount = 0
+		t.Blocked = false
+	}
+}
+
+// unblockAll clears Blocked/FailCount on every task. Called whenever the
+// model responds to being stuck via add_tasks (re-planning) or ask_user
+// (asking a human) - either counts as "the stuck situation was addressed",
+// so blocked tasks get another chance rather than staying permanently
+// stuck for the rest of the session.
+func (s *codingState) unblockAll() {
+	for i := range s.Tasks {
+		s.Tasks[i].FailCount = 0
+		s.Tasks[i].Blocked = false
+	}
 }
 
 func (s *codingState) markDone(id, note string) (codingTask, error) {
@@ -5046,8 +5184,14 @@ func (s *codingState) renderMarkdown() string {
 			mark = "x"
 		}
 		b.WriteString(fmt.Sprintf("- [%s] %s: %s", mark, t.ID, t.Description))
+		if t.AcceptanceCheck != "" {
+			b.WriteString(fmt.Sprintf(" (`%s`)", t.AcceptanceCheck))
+		}
 		if t.Note != "" {
 			b.WriteString(fmt.Sprintf(" _(%s)_", t.Note))
+		}
+		if t.Blocked {
+			b.WriteString(fmt.Sprintf(" ⚠ BLOCKED (ปฏิเสธซ้ำ %d ครั้ง - ต้อง add_tasks แตกงานหรือ ask_user)", t.FailCount))
 		}
 		b.WriteString("\n")
 	}
@@ -5072,65 +5216,119 @@ func logDecision(question, resolution string) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// Project type detection + command allowlisting for run_command
+// Project type detection for run_command's build/test/lint defaults
 // ─────────────────────────────────────────────────────────────────
 
 type projectCommands struct {
-	Label     string
-	BuildCmd  string
-	TestCmd   string
-	AllowBins map[string]bool
+	Label    string
+	BuildCmd string
+	TestCmd  string
+	LintCmd  string // human-readable label only; runLintCheck has the real per-toolchain logic
 }
 
 // detectProjectCommands looks at marker files in cwd to guess a reasonable
-// build/test command and the set of binaries run_command is allowed to
-// invoke for this project. This is deliberately simple pattern-matching,
-// not a build-system integration - --build-cmd/--test-cmd/--allow override
-// it when it guesses wrong.
+// build/test/lint command for this project. This is deliberately simple
+// pattern-matching, not a build-system integration - --lint-cmd overrides
+// it when it guesses wrong. run_command itself is unrestricted and does
+// not depend on this detection at all; these commands are only used for
+// ola's own verify/lint gates (see runBuildOnly/runLintCheck).
 func detectProjectCommands(cwd string) projectCommands {
 	exists := func(name string) bool {
 		_, err := os.Stat(filepath.Join(cwd, name))
 		return err == nil
 	}
+	// hasESLintConfig is checked before turning on Node's lint gate: an
+	// eslint invocation against a project with no config at all fails (or
+	// launches an interactive "no config found, install?" prompt) for
+	// reasons that have nothing to do with code quality, which would
+	// block mark_task_done/report_complete forever with no way for the
+	// model to fix it. Only enable the gate when a config actually exists
+	// (or package.json declares eslint as a dependency).
+	hasESLintConfig := func() bool {
+		for _, f := range []string{".eslintrc", ".eslintrc.js", ".eslintrc.cjs", ".eslintrc.json", ".eslintrc.yml", ".eslintrc.yaml", "eslint.config.js", "eslint.config.mjs"} {
+			if exists(f) {
+				return true
+			}
+		}
+		if data, err := os.ReadFile(filepath.Join(cwd, "package.json")); err == nil {
+			return strings.Contains(string(data), "eslint")
+		}
+		return false
+	}
 	switch {
 	case exists("go.mod"):
 		return projectCommands{
 			Label: "go", BuildCmd: "go build ./...", TestCmd: "go test ./...",
-			AllowBins: map[string]bool{"go": true, "gofmt": true},
+			LintCmd: "go vet ./... && gofmt -l .",
 		}
 	case exists("package.json"):
+		lint := ""
+		if hasESLintConfig() {
+			lint = "npx eslint ."
+		}
 		return projectCommands{
 			Label: "node", BuildCmd: "npm run build", TestCmd: "npm test",
-			AllowBins: map[string]bool{"npm": true, "npx": true, "node": true, "yarn": true, "pnpm": true},
+			LintCmd: lint,
 		}
 	case exists("Cargo.toml"):
 		return projectCommands{
 			Label: "rust", BuildCmd: "cargo build", TestCmd: "cargo test",
-			AllowBins: map[string]bool{"cargo": true, "rustc": true},
+			LintCmd: "cargo clippy --all-targets -- -D warnings",
 		}
 	case exists("pyproject.toml") || exists("requirements.txt") || exists("setup.py"):
 		return projectCommands{
 			Label: "python", BuildCmd: "", TestCmd: "pytest",
-			AllowBins: map[string]bool{"python3": true, "python": true, "pytest": true, "pip": true, "pip3": true},
+			// python3 -m compileall is a syntax-only pass (no external
+			// linter dependency needed) - it catches broken code but not
+			// style/logic issues the way ruff/pyflakes would. Deliberately
+			// conservative default; override with --lint-cmd for something
+			// stricter if ruff/pyflakes are available in the environment.
+			LintCmd: "python3 -m compileall -q .",
 		}
 	case exists("Makefile"):
 		return projectCommands{
 			Label: "make", BuildCmd: "make", TestCmd: "make test",
-			AllowBins: map[string]bool{"make": true},
 		}
 	default:
-		return projectCommands{Label: "generic", AllowBins: map[string]bool{}}
+		return projectCommands{Label: "generic"}
 	}
 }
 
+// preflightCheck reports which binaries detectProjectCommands (plus any
+// --lint-cmd override) says this session's own build/test/lint gate may
+// need to invoke, but that aren't actually present in PATH. Called once
+// before the coding loop starts (see cmdCoding) so a missing toolchain is
+// caught immediately with a clear, actionable error - instead of being
+// discovered several API-call rounds in, the first time ola tries its own
+// lint/build/verify gate, wasting both time and tokens on a session that
+// was guaranteed to fail from the start.
+func preflightCheck(cmds projectCommands) []string {
+	var missing []string
+	seen := map[string]bool{}
+	check := func(bin string) {
+		if bin == "" || seen[bin] {
+			return
+		}
+		seen[bin] = true
+		if _, err := exec.LookPath(bin); err != nil {
+			missing = append(missing, bin)
+		}
+	}
+	check(firstWord(cmds.BuildCmd))
+	check(firstWord(cmds.TestCmd))
+	check(firstWord(cmds.LintCmd))
+	sort.Strings(missing)
+	return missing
+}
+
 // sourceExtsForToolchain returns the file extensions treated as "source
-// code" for a detected/overridden project toolchain. Used to decide whether
-// an edited file should trigger the auto-verify (build/test) machinery in
-// "ask" - editing a file outside this set (README.md, notes.txt, a JSON
-// fixture, etc.) has no business running "go build" or "npm run build" just
-// because the current directory happens to contain a go.mod or
-// package.json. Intentionally conservative/simple pattern matching, same
-// spirit as detectProjectCommands itself.
+// code" for a detected project toolchain. Used to decide whether an edited
+// file should trigger the auto-verify (build/test) machinery in "ask" -
+// editing a file outside this set (README.md, notes.txt, a JSON fixture,
+// etc.) has no business running "go build" or "npm run build" just because
+// the current directory happens to contain a go.mod or package.json.
+// Intentionally conservative/simple pattern matching, same spirit as
+// detectProjectCommands itself.
 func sourceExtsForToolchain(label string) map[string]bool {
 	switch label {
 	case "go":
@@ -5146,9 +5344,7 @@ func sourceExtsForToolchain(label string) map[string]bool {
 		return map[string]bool{".py": true}
 	case "make":
 		// Makefile-driven projects can be almost any compiled language;
-		// this is a best-effort guess covering the common C/C++ case, not
-		// a general answer - --build-cmd/--test-cmd lets the user override
-		// when it guesses wrong (see isVerifiableEdit's forceAny).
+		// this is a best-effort guess covering the common C/C++ case.
 		return map[string]bool{".c": true, ".h": true, ".cc": true, ".cpp": true, ".hpp": true}
 	default:
 		return map[string]bool{}
@@ -5157,13 +5353,8 @@ func sourceExtsForToolchain(label string) map[string]bool {
 
 // isVerifiableEdit reports whether editing path should be treated as a code
 // change that warrants the auto-verify machinery, given the detected
-// toolchain label. forceAny is true when the user explicitly overrode
-// --build-cmd/--test-cmd themselves - at that point they've opted in
-// explicitly, so any edited file counts rather than guessing from extension.
-func isVerifiableEdit(path, toolchainLabel string, forceAny bool) bool {
-	if forceAny {
-		return true
-	}
+// toolchain label.
+func isVerifiableEdit(path, toolchainLabel string) bool {
 	if path == "" {
 		return false
 	}
@@ -5184,59 +5375,13 @@ func firstWord(segment string) string {
 	return filepath.Base(fields[0])
 }
 
-// splitCommandSegments splits a shell command on &&, ||, ;, and | so each
-// piece's binary can be checked individually against the allowlist. This is
-// intentionally naive (no real shell parsing) - good enough to catch the
-// common "buildCmd && testCmd" pattern without pulling in a shell grammar.
-var chainSplitter = regexp.MustCompile(`&&|\|\||[;|]`)
-
-func splitCommandSegments(cmd string) []string {
-	parts := chainSplitter.Split(cmd, -1)
-	var out []string
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// dangerousSubstrings is a denylist checked against the whole raw command
-// string regardless of the allowlist, as defense in depth against a
-// segment that technically starts with an allowed binary but tries to do
-// something destructive via its arguments (e.g. "go run rm-everything.go"
-// piped into something else, or shell substitution trying to smuggle in a
-// second command).
-var dangerousSubstrings = []string{
-	"rm -rf", "rm -fr", "sudo ", "mkfs", "dd if=", "> /dev/", ":(){", "chmod -r 777",
-	"chown -r", "shutdown", "reboot", "curl ", "wget ", "$(", "`", "eval ",
-}
-
-func validateCommand(cmd string, allowed map[string]bool) error {
+// validateCommand does a minimal sanity check before a command is handed to
+// runShellCommand. There is no allowlist and no denylist here - run_command
+// executes whatever it's given, so this only guards against an empty
+// command string.
+func validateCommand(cmd string) error {
 	if strings.TrimSpace(cmd) == "" {
 		return fmt.Errorf("ต้องระบุ command")
-	}
-	lower := strings.ToLower(cmd)
-	for _, bad := range dangerousSubstrings {
-		if strings.Contains(lower, bad) {
-			return fmt.Errorf("คำสั่งถูกปฏิเสธ: มีรูปแบบที่ไม่อนุญาต (%q)", bad)
-		}
-	}
-	segments := splitCommandSegments(cmd)
-	if len(segments) == 0 {
-		return fmt.Errorf("ไม่สามารถแยกวิเคราะห์คำสั่งได้")
-	}
-	for _, seg := range segments {
-		bin := firstWord(seg)
-		if bin == "" || !allowed[bin] {
-			var allowedList []string
-			for b := range allowed {
-				allowedList = append(allowedList, b)
-			}
-			sort.Strings(allowedList)
-			return fmt.Errorf("คำสั่ง %q ไม่อยู่ใน allowlist ของโปรเจกต์นี้ (อนุญาตเฉพาะ: %s) - ใช้คำสั่ง build/test/lint ปกติของโปรเจกต์แทน", bin, strings.Join(allowedList, ", "))
-		}
 	}
 	return nil
 }
@@ -5290,9 +5435,9 @@ func runShellCommand(cmd string, timeout time.Duration) (output string, exitCode
 // Coding-mode tool implementations
 // ─────────────────────────────────────────────────────────────────
 
-func toolRunCommand(args map[string]interface{}, allowed map[string]bool, timeout time.Duration) (string, error) {
+func toolRunCommand(args map[string]interface{}, timeout time.Duration) (string, error) {
 	cmd, _ := args["command"].(string)
-	if err := validateCommand(cmd, allowed); err != nil {
+	if err := validateCommand(cmd); err != nil {
 		return "", err
 	}
 	out, exitCode, err := runShellCommand(cmd, timeout)
@@ -5306,21 +5451,39 @@ func toolRunCommand(args map[string]interface{}, allowed map[string]bool, timeou
 	return fmt.Sprintf("exit_code=%d (%s)\n%s", exitCode, status, out), nil
 }
 
+// toolAddTasks accepts each entry in "tasks" either as a plain string
+// (description only, backward compatible with the original schema) or as
+// an object {"description": ..., "acceptance_check": ...}. The
+// acceptance_check lets mark_task_done verify this specific task with a
+// narrow, task-scoped command (see runTaskAcceptanceCheck) instead of only
+// the shared build-only gate - the finer-grained decomposition this whole
+// mechanism exists for.
 func toolAddTasks(args map[string]interface{}, state *codingState) (string, error) {
 	raw, ok := args["tasks"].([]interface{})
 	if !ok || len(raw) == 0 {
-		return "", fmt.Errorf("ต้องระบุ tasks เป็น array ของข้อความอย่างน้อย 1 รายการ")
+		return "", fmt.Errorf("ต้องระบุ tasks เป็น array ของข้อความ (หรือ object {description, acceptance_check}) อย่างน้อย 1 รายการ")
 	}
-	var descriptions []string
+	var items []taskInput
 	for _, r := range raw {
-		if s, ok := r.(string); ok {
-			descriptions = append(descriptions, s)
+		switch v := r.(type) {
+		case string:
+			items = append(items, taskInput{Description: v})
+		case map[string]interface{}:
+			d, _ := v["description"].(string)
+			ac, _ := v["acceptance_check"].(string)
+			if strings.TrimSpace(d) != "" {
+				items = append(items, taskInput{Description: d, AcceptanceCheck: ac})
+			}
 		}
 	}
-	added := state.addTasks(descriptions)
+	added := state.addTaskItems(items)
 	if len(added) == 0 {
 		return "", fmt.Errorf("ไม่มี task ที่ถูกต้องถูกเพิ่ม")
 	}
+	// Re-planning (add_tasks) counts as responding to a stuck situation:
+	// clear any blocked tasks so they get another chance under the new
+	// plan instead of staying permanently blocked (see maxTaskFailStreak).
+	state.unblockAll()
 	if err := state.save(codingStateFile); err != nil {
 		return "", fmt.Errorf("บันทึก state ไม่ได้: %v", err)
 	}
@@ -5328,7 +5491,11 @@ func toolAddTasks(args map[string]interface{}, state *codingState) (string, erro
 	var b strings.Builder
 	fmt.Fprintf(&b, "ลงทะเบียน %d tasks แล้ว:\n", len(added))
 	for _, t := range added {
-		fmt.Fprintf(&b, "- %s: %s\n", t.ID, t.Description)
+		fmt.Fprintf(&b, "- %s: %s", t.ID, t.Description)
+		if t.AcceptanceCheck != "" {
+			fmt.Fprintf(&b, " (acceptance_check: %s)", t.AcceptanceCheck)
+		}
+		b.WriteString("\n")
 	}
 	return b.String(), nil
 }
@@ -5343,6 +5510,7 @@ func toolMarkTaskDone(args map[string]interface{}, state *codingState) (string, 
 	if err != nil {
 		return "", err
 	}
+	state.resetFail(id)
 	if err := state.save(codingStateFile); err != nil {
 		return "", fmt.Errorf("บันทึก state ไม่ได้: %v", err)
 	}
@@ -5356,15 +5524,83 @@ func toolMarkTaskDone(args map[string]interface{}, state *codingState) (string, 
 // never trusted purely on the model's say-so.
 // ─────────────────────────────────────────────────────────────────
 
-// runBuildOnly runs just the project's build command (never the full
-// build+test combo runVerification uses) as a fast, per-task sanity check
-// triggered by mark_task_done - see dispatchCodingToolCall. Deliberately
-// test-free: running the full test suite on every single task would be too
-// slow, especially on modest local-model hardware, whereas a compile-only
-// check is typically seconds. The full build+test gate still applies once,
-// independently, at report_complete via runVerification below - this is a
-// cheaper earlier checkpoint, not a replacement for it.
+// runLintCheck runs a per-toolchain static-analysis pass (go vet + gofmt,
+// cargo clippy, eslint, or a Python syntax-only compile pass) ahead of the
+// build/test gates. It's deliberately hand-written per toolchain rather than
+// a single generic shell command because "did it lint clean" isn't always a
+// plain exit-code check - notably gofmt -l lists misformatted files on
+// stdout but still exits 0, so that case needs its own handling. Failing
+// this is treated as equivalent to a build failure by both callers below
+// (runBuildOnly/runVerification), per an explicit decision that lint issues
+// should block progress just as hard as a broken compile - not merely be
+// reported. Returns (true, ...) whenever there's no lint command configured
+// for this toolchain (see detectProjectCommands - e.g. Node with no eslint
+// config found, or Make/C which has no generic linter here) so an
+// unconfigured project is never blocked on a check it has no way to
+// satisfy.
+func runLintCheck(cmds projectCommands, timeout time.Duration) (passed bool, report string) {
+	if cmds.LintCmd == "" {
+		return true, "(ไม่มี lint command สำหรับ toolchain นี้ - ข้าม lint gate)"
+	}
+	switch cmds.Label {
+	case "go":
+		out, exitCode, err := runShellCommand("go vet ./...", timeout)
+		if err != nil && exitCode == -1 {
+			return false, fmt.Sprintf("go vet error: %v\n%s", err, out)
+		}
+		if exitCode != 0 {
+			return false, fmt.Sprintf("go vet ล้มเหลว (exit_code=%d):\n%s", exitCode, out)
+		}
+		fmtOut, _, ferr := runShellCommand("gofmt -l .", timeout)
+		if ferr == nil && strings.TrimSpace(fmtOut) != "" {
+			return false, fmt.Sprintf("gofmt พบไฟล์ที่ format ไม่ตรงมาตรฐาน (รัน \"gofmt -w <ไฟล์>\" แล้วลองใหม่):\n%s", strings.TrimSpace(fmtOut))
+		}
+		return true, "go vet + gofmt ผ่าน"
+	case "rust":
+		out, exitCode, err := runShellCommand(cmds.LintCmd, timeout)
+		if err != nil && exitCode == -1 {
+			return false, fmt.Sprintf("cargo clippy error: %v\n%s", err, out)
+		}
+		if exitCode != 0 {
+			return false, fmt.Sprintf("cargo clippy ล้มเหลว (exit_code=%d):\n%s", exitCode, out)
+		}
+		return true, "cargo clippy ผ่าน"
+	case "node":
+		out, exitCode, err := runShellCommand(cmds.LintCmd, timeout)
+		if err != nil && exitCode == -1 {
+			return false, fmt.Sprintf("eslint error: %v\n%s", err, out)
+		}
+		if exitCode != 0 {
+			return false, fmt.Sprintf("eslint ล้มเหลว (exit_code=%d):\n%s", exitCode, out)
+		}
+		return true, "eslint ผ่าน"
+	case "python":
+		out, exitCode, err := runShellCommand(cmds.LintCmd, timeout)
+		if err != nil && exitCode == -1 {
+			return false, fmt.Sprintf("python syntax-check error: %v\n%s", err, out)
+		}
+		if exitCode != 0 {
+			return false, fmt.Sprintf("python compileall (syntax check) ล้มเหลว (exit_code=%d):\n%s", exitCode, out)
+		}
+		return true, "python compileall (syntax check) ผ่าน"
+	default:
+		return true, "(ไม่มี lint check ที่รองรับสำหรับ toolchain นี้)"
+	}
+}
+
+// runBuildOnly runs the lint gate (runLintCheck) followed by just the
+// project's build command (never the full build+test combo runVerification
+// uses) as a fast, per-task sanity check triggered by mark_task_done - see
+// dispatchCodingToolCall. Deliberately test-free: running the full test
+// suite on every single task would be too slow, especially on modest
+// local-model hardware, whereas lint + compile-only is typically seconds.
+// The full build+test gate still applies once, independently, at
+// report_complete via runVerification below - this is a cheaper earlier
+// checkpoint, not a replacement for it.
 func runBuildOnly(cmds projectCommands, timeout time.Duration) (passed bool, report string) {
+	if lp, lr := runLintCheck(cmds, timeout); !lp {
+		return false, "[lint] " + lr
+	}
 	if cmds.BuildCmd == "" {
 		return true, "(ไม่มีคำสั่ง build อัตโนมัติสำหรับโปรเจกต์นี้ - ข้าม light-check ก่อน mark_task_done)"
 	}
@@ -5378,7 +5614,34 @@ func runBuildOnly(cmds projectCommands, timeout time.Duration) (passed bool, rep
 	return true, fmt.Sprintf("คำสั่ง build-check (%s) ผ่าน", cmds.BuildCmd)
 }
 
+// runTaskAcceptanceCheck runs a task's own AcceptanceCheck command (set via
+// add_tasks) if it has one, in addition to the shared build-only gate above.
+// This is the finer-grained, per-task equivalent of runVerification: instead
+// of only confirming "the whole project still compiles", it confirms this
+// SPECIFIC task's own narrow test actually passes, which catches a
+// plausible-looking but wrong implementation that a build-only check would
+// happily let through.
+func runTaskAcceptanceCheck(task codingTask, timeout time.Duration) (passed bool, report string) {
+	if task.AcceptanceCheck == "" {
+		return true, "(task นี้ไม่มี acceptance_check เจาะจง - ใช้ผลจาก build-only gate ด้านบนเท่านั้น)"
+	}
+	if err := validateCommand(task.AcceptanceCheck); err != nil {
+		return false, fmt.Sprintf("acceptance_check %q ไม่ถูกต้อง: %v", task.AcceptanceCheck, err)
+	}
+	out, exitCode, err := runShellCommand(task.AcceptanceCheck, timeout)
+	if err != nil && exitCode == -1 {
+		return false, fmt.Sprintf("acceptance_check error: %v\n%s", err, out)
+	}
+	if exitCode != 0 {
+		return false, fmt.Sprintf("acceptance_check (%s) จบด้วย exit_code=%d:\n%s", task.AcceptanceCheck, exitCode, out)
+	}
+	return true, fmt.Sprintf("acceptance_check (%s) ผ่าน", task.AcceptanceCheck)
+}
+
 func runVerification(cmds projectCommands, timeout time.Duration) (passed bool, report string) {
+	if lp, lr := runLintCheck(cmds, timeout); !lp {
+		return false, "[lint] " + lr
+	}
 	var combined string
 	switch {
 	case cmds.BuildCmd != "" && cmds.TestCmd != "":
@@ -5388,7 +5651,7 @@ func runVerification(cmds projectCommands, timeout time.Duration) (passed bool, 
 	case cmds.TestCmd != "":
 		combined = cmds.TestCmd
 	default:
-		return true, "(ไม่พบคำสั่ง build/test อัตโนมัติสำหรับโปรเจกต์นี้ - ข้ามการ verify อัตโนมัติ ใช้ --build-cmd/--test-cmd เพื่อระบุเอง ถ้าต้องการให้ ola ตรวจสอบจริง)"
+		return true, "(ไม่พบคำสั่ง build/test อัตโนมัติสำหรับโปรเจกต์นี้ - ข้ามการ verify อัตโนมัติ)"
 	}
 	out, exitCode, err := runShellCommand(combined, timeout)
 	if err != nil && exitCode == -1 {
@@ -5477,13 +5740,35 @@ type codingRunContext struct {
 	reset     string
 	outFile   *os.File
 	state     *codingState
-	allowed   map[string]bool
 	cmdTO     time.Duration
 	cmds      projectCommands  // needed by mark_task_done's build-only light gate
 	searchCfg searchConfig     // web_search/web_fetch config, may be all-zero (disabled)
 	skillsCfg skillsConfig     // read_skill config, may be all-zero (disabled)
 	apiCfg    apiRequestConfig // api_request config, may be all-zero (disabled)
 	changes   []string         // recorded write/edit/task-done/api-mutating entries this session, for buildWorkSummary
+
+	// selfReviewEnabled toggles the self_review_requirements gate on
+	// report_complete (default true; --no-self-review disables it - see
+	// cmdCoding). selfReviewPassed is set true only by a fresh
+	// self_review_requirements(all_requirements_met=true) call, and is
+	// invalidated by any subsequent successful write_file/edit_file, so a
+	// stale review from before the latest edits can never wave
+	// report_complete through.
+	selfReviewEnabled bool
+	selfReviewPassed  bool
+
+	// reportAccepted is set within dispatchCodingToolCall's report_complete
+	// handling to say whether THIS call was actually accepted (as opposed
+	// to rejected for missing self-review) - the caller uses it (rather
+	// than just the tool name) to decide whether to run the full
+	// build/test verification.
+	reportAccepted bool
+
+	// editVerifyEnabled toggles the immediate lint+build-only check that
+	// runs right after every successful write_file/edit_file call (default
+	// true; --no-edit-verify disables it for projects with a very slow
+	// build).
+	editVerifyEnabled bool
 }
 
 func dispatchCodingToolCall(tc toolCall, rc *codingRunContext) (result string, isReportComplete bool) {
@@ -5493,19 +5778,53 @@ func dispatchCodingToolCall(tc toolCall, rc *codingRunContext) (result string, i
 			r, e := toolAddTasks(args, rc.state)
 			return r, e, true
 		case "mark_task_done":
+			taskID, _ := args["task_id"].(string)
+			task := rc.state.findTask(taskID)
+
+			// Stuck-detection: a task that's been rejected
+			// maxTaskFailStreak times in a row is blocked until the model
+			// explicitly reacts (add_tasks to split it, or ask_user to
+			// escalate) - see toolAddTasks/the ask_user case below for
+			// where the block gets cleared. This exists so a weak model
+			// can't retry the exact same failing approach forever.
+			if task != nil && task.Blocked {
+				return fmt.Sprintf(
+					"MARK_TASK_DONE ถูกบล็อก: task %s ถูกปฏิเสธซ้ำ %d ครั้งติดกันแล้ว - ต้องเรียก add_tasks เพื่อแตกงานนี้เป็น subtask ที่เล็กลง หรือ ask_user เพื่อขอความช่วยเหลือ ก่อนจะลอง mark_task_done กับ task นี้ได้อีกครั้ง",
+					taskID, task.FailCount), nil, true
+			}
+
+			reject := func(msg string) (string, error, bool) {
+				if task != nil {
+					if rc.state.bumpFail(taskID) {
+						msg += fmt.Sprintf("\n\n⚠ task %s ถูกปฏิเสธซ้ำ %d ครั้งติดกันแล้ว - ต้อง add_tasks แตกงานนี้ให้เล็กลง หรือ ask_user ก่อน ถึงจะลอง mark_task_done กับ task นี้ได้อีก", taskID, maxTaskFailStreak)
+					}
+					_ = rc.state.save(codingStateFile)
+					rc.state.writeProgressFile()
+				}
+				return msg, nil, true
+			}
+
 			// Fast, ola-enforced light gate: refuse to accept a task as
-			// done if the project doesn't even build right now. This is
-			// deliberately build-only (not the full test suite - see
-			// runBuildOnly) so it stays cheap enough to run on every single
-			// task, catching a broken change at the task that introduced
-			// it instead of only at the final report_complete after N more
-			// tasks have piled on top of it.
-			if rc.cmds.BuildCmd != "" {
-				passed, report := runBuildOnly(rc.cmds, rc.cmdTO)
-				if !passed {
-					return "MARK_TASK_DONE ถูกปฏิเสธ: build-check ก่อนปิด task ไม่ผ่าน - แก้ให้ build ผ่านก่อน แล้วค่อยเรียก mark_task_done ใหม่:\n" + report, nil, true
+			// done if the project doesn't lint/build cleanly right now.
+			// Deliberately test-suite-free at the project level (see
+			// runBuildOnly) so it stays cheap enough to run on every
+			// single task, catching a broken change at the task that
+			// introduced it instead of only at the final report_complete
+			// after N more tasks have piled on top of it.
+			if passed, report := runBuildOnly(rc.cmds, rc.cmdTO); !passed {
+				return reject("MARK_TASK_DONE ถูกปฏิเสธ: lint/build-check ก่อนปิด task ไม่ผ่าน - แก้ให้ผ่านก่อน แล้วค่อยเรียก mark_task_done ใหม่:\n" + report)
+			}
+
+			// Beyond the shared lint+build-only gate, a task that
+			// registered its own acceptance_check (via add_tasks) must
+			// also pass THAT specific, narrower check - the finer-grained
+			// decomposition this mechanism exists for.
+			if task != nil && task.AcceptanceCheck != "" {
+				if passed, report := runTaskAcceptanceCheck(*task, rc.cmdTO); !passed {
+					return reject("MARK_TASK_DONE ถูกปฏิเสธ: acceptance_check เฉพาะของ task นี้ไม่ผ่าน - แก้ให้ผ่านก่อน แล้วค่อยเรียก mark_task_done ใหม่:\n" + report)
 				}
 			}
+
 			r, e := toolMarkTaskDone(args, rc.state)
 			if e == nil {
 				entry := truncateWords("[TASK] "+r, maxNotificationWords)
@@ -5516,11 +5835,35 @@ func dispatchCodingToolCall(tc toolCall, rc *codingRunContext) (result string, i
 			}
 			return r, e, true
 		case "run_command":
-			r, e := toolRunCommand(args, rc.allowed, rc.cmdTO)
+			r, e := toolRunCommand(args, rc.cmdTO)
 			return r, e, true
+		case "self_review_requirements":
+			met, _ := args["all_requirements_met"].(bool)
+			var missing []string
+			if raw, ok := args["missing_items"].([]interface{}); ok {
+				for _, m := range raw {
+					if s, ok2 := m.(string); ok2 && strings.TrimSpace(s) != "" {
+						missing = append(missing, s)
+					}
+				}
+			}
+			if met && len(missing) == 0 {
+				rc.selfReviewPassed = true
+				return "self_review_requirements: ครบถ้วนตาม requirements แล้ว - พร้อมเรียก report_complete ได้ (ถ้าไม่มีการแก้ไฟล์เพิ่มหลังจากนี้)", nil, true
+			}
+			rc.selfReviewPassed = false
+			if len(missing) == 0 {
+				return "self_review_requirements: ระบุ all_requirements_met=false แต่ไม่ได้ระบุ missing_items - โปรดระบุรายการที่ยังขาดให้ชัดเจน", nil, true
+			}
+			return "self_review_requirements: ยังไม่ครบ - รายการที่ยังขาด:\n- " + strings.Join(missing, "\n- ") + "\nโปรด implement ให้ครบก่อน แล้วเรียก self_review_requirements ใหม่", nil, true
 		case "report_complete":
+			if rc.selfReviewEnabled && !rc.selfReviewPassed {
+				rc.reportAccepted = false
+				return "REPORT_COMPLETE ถูกปฏิเสธ: ต้องเรียก self_review_requirements (ทบทวน requirements อีกรอบ) แล้วได้ all_requirements_met=true แบบสด ๆ ก่อน (การแก้ไฟล์ใด ๆ หลัง self_review ครั้งก่อนทำให้ต้อง review ใหม่เสมอ) ola ถึงจะยอมรับ report_complete", nil, true
+			}
+			rc.reportAccepted = true
 			summary, _ := args["summary"].(string)
-			return "รับทราบคำขอ report_complete - ola กำลัง verify ด้วย build/test ของโปรเจกต์เองก่อนยืนยัน (summary ที่ระบุ: " + summary + ")", nil, true
+			return "รับทราบคำขอ report_complete - ola กำลัง verify ด้วย lint/build/test ของโปรเจกต์เองก่อนยืนยัน (summary ที่ระบุ: " + summary + ")", nil, true
 		case "web_search":
 			if !rc.searchCfg.searchEnabled() {
 				return "", nil, false
@@ -5560,11 +5903,14 @@ func dispatchCodingToolCall(tc toolCall, rc *codingRunContext) (result string, i
 		}
 	}
 	result = dispatchToolCall(tc, rc.ntfyTopic, rc.red, rc.reset, rc.outFile, extra, &rc.changes)
-	// ask_user in coding mode needs the extra ASSUMPTIONS.md logging that
-	// the generic base-tool switch in dispatchToolCall doesn't know about;
-	// dispatchToolCall already ran toolAskUser once above via the base
-	// switch, so intercept and log here rather than calling it twice.
-	if tc.Function.Name == "ask_user" {
+
+	switch tc.Function.Name {
+	case "ask_user":
+		// ask_user in coding mode needs the extra ASSUMPTIONS.md logging
+		// that the generic base-tool switch in dispatchToolCall doesn't
+		// know about; dispatchToolCall already ran toolAskUser once above
+		// via the base switch, so intercept and log here rather than
+		// calling it twice.
 		var args map[string]interface{}
 		_ = json.Unmarshal(tc.Function.Arguments, &args)
 		question, _ := args["question"].(string)
@@ -5573,8 +5919,38 @@ func dispatchCodingToolCall(tc toolCall, rc *codingRunContext) (result string, i
 		} else {
 			logDecision(question, result)
 		}
+		// Escalating to a human (or at least trying to) counts as
+		// responding to a stuck task, same as add_tasks re-planning -
+		// clear any blocked tasks so they get another chance.
+		rc.state.unblockAll()
+		_ = rc.state.save(codingStateFile)
+		rc.state.writeProgressFile()
+
+	case "write_file", "edit_file":
+		if !strings.HasPrefix(result, "ERROR:") {
+			// A self_review_requirements pass only reflects the code as it
+			// stood at that moment; any edit afterward can silently
+			// reintroduce a gap, so invalidate it - report_complete will
+			// require a fresh review before it's accepted again.
+			rc.selfReviewPassed = false
+
+			// Immediate lint+compile-check right after the edit, rather
+			// than waiting for the next mark_task_done/report_complete:
+			// gives a weak model the earliest possible signal that what it
+			// just wrote doesn't even compile, instead of piling more
+			// edits on top of a broken file for several more rounds first.
+			var editArgs map[string]interface{}
+			_ = json.Unmarshal(tc.Function.Arguments, &editArgs)
+			path, _ := editArgs["path"].(string)
+			if rc.editVerifyEnabled && isVerifiableEdit(path, rc.cmds.Label) {
+				if passed, report := runBuildOnly(rc.cmds, rc.cmdTO); !passed {
+					result += "\n\n[auto lint/build-check ทันทีหลังแก้ไฟล์] ✗ ล้มเหลว - แก้ไขก่อนทำงานต่อ:\n" + report
+				}
+			}
+		}
 	}
-	return result, tc.Function.Name == "report_complete"
+
+	return result, tc.Function.Name == "report_complete" && rc.reportAccepted
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -5590,20 +5966,45 @@ func codingUsage(fs *flag.FlagSet) func() {
 		fmt.Println("ของโปรเจกต์เอง วนแก้จนกว่าจะผ่านจริง แล้วจึงรายงานว่าสำเร็จ")
 		fmt.Println()
 		fmt.Println("Tool ที่เปิดใช้เสมอ (นอกเหนือจาก 8 ตัวของ ask): add_tasks, mark_task_done,")
-		fmt.Println("run_command (allowlisted ตาม toolchain ที่ตรวจพบ), report_complete")
-		fmt.Println("รวมถึง web_fetch (เปิดอัตโนมัติเสมอ), web_search, api_request และ read_skill แบบมีเงื่อนไข")
-		fmt.Println("(ดูหัวข้อ Web search, api_request และ Skills ใน 'ola ask -h' - กลไกเดียวกันทุกประการ)")
+		fmt.Println("run_command (ไม่มี allowlist - รันคำสั่งใดก็ได้), self_review_requirements,")
+		fmt.Println("report_complete รวมถึง web_fetch (เปิดอัตโนมัติเสมอ), web_search, api_request และ")
+		fmt.Println("read_skill แบบมีเงื่อนไข (ดูหัวข้อ Web search, api_request และ Skills ใน 'ola ask -h'")
+		fmt.Println("- กลไกเดียวกันทุกประการ)")
 		fmt.Println()
-		fmt.Println("mark_task_done มี build-only light gate ในตัว: ถ้าโปรเจกต์ build ไม่ผ่าน ola จะปฏิเสธ")
-		fmt.Println("ไม่ให้ปิด task นั้น (ป้อนผล build กลับให้โมเดลแก้ก่อน) เพื่อจับบั๊กตั้งแต่ task ที่ทำให้เกิด")
-		fmt.Println("แทนที่จะปล่อยให้สะสมไปเจอทีเดียวตอน report_complete - เบากว่า verify เต็มรูปแบบเพราะรัน")
-		fmt.Println("เฉพาะ build ไม่รวม test suite ทุกครั้งที่ปิด task สำเร็จจะส่ง ntfy.sh notification [TASK] ทันที")
-		fmt.Println("(ถ้าตั้ง -x/OLA_TOPIC ไว้) เว้นแต่เปิด -q/--quiet ซึ่งจะงดแจ้งเตือนระหว่างทางนี้ - ดูหัวข้อ")
-		fmt.Println("Quiet mode ใน 'ola ask -h'")
+		fmt.Println("คุณภาพงาน - ola บังคับหลายชั้นแทนที่จะเชื่อคำพูดโมเดลเพียงอย่างเดียว")
+		fmt.Println("(ปรับพฤติกรรมได้ด้วย flag ด้านล่าง แต่ default คือเข้มงวดที่สุด):")
 		fmt.Println()
-		fmt.Println("report_complete ไม่ได้จบ session ทันที - ola จะรันคำสั่ง build/test ของโปรเจกต์")
-		fmt.Println("เองอีกครั้งอย่างอิสระก่อน ถ้าไม่ผ่าน ผลลัพธ์ error จะถูกป้อนกลับเข้า conversation")
-		fmt.Println("และ loop จะทำงานต่อจนกว่าจะผ่านจริง หรือจนกว่าจะถึง cap ด้านล่าง")
+		fmt.Println("  1. ทุกครั้งที่ write_file/edit_file สำเร็จ ola รัน lint+build-only check ทันที")
+		fmt.Println("     (เร็ว ไม่รอ mark_task_done) แล้วแปะผลไว้ท้าย tool result ให้โมเดลเห็นทันที -")
+		fmt.Println("     ปิดด้วย --no-edit-verify (สำหรับโปรเจกต์ build ช้ามาก)")
+		fmt.Println("  2. mark_task_done มี gate ในตัว: รัน lint (go vet+gofmt / cargo clippy / eslint /")
+		fmt.Println("     python compileall แล้วแต่ toolchain) + build-only เสมอ ล้มเหลวถือว่าเทียบเท่า")
+		fmt.Println("     build fail (block เหมือนกัน) และถ้า task นั้นมี acceptance_check (จาก add_tasks)")
+		fmt.Println("     จะรันคำสั่งนั้นเพิ่มด้วย - ทั้งหมดต้องผ่านถึงจะปิด task ได้")
+		fmt.Println("  3. Stuck-detection: task เดียวถูกปฏิเสธซ้ำครบ 3 ครั้งติดกัน -> ola บล็อก")
+		fmt.Println("     mark_task_done กับ task นั้นทันที จนกว่าจะเรียก add_tasks (แตกเป็น subtask")
+		fmt.Println("     เล็กลง) หรือ ask_user (ขอความช่วยเหลือ) ก่อน - กันไม่ให้วนลองซ้ำวิธีเดิมไม่จบ")
+		fmt.Println("  4. ก่อน report_complete ต้องเรียก self_review_requirements(all_requirements_met=true)")
+		fmt.Println("     แบบสด ๆ ก่อนเสมอ (แก้ไฟล์เพิ่มหลังจากนั้นทำให้ต้อง review ใหม่) - ปิดด้วย")
+		fmt.Println("     --no-self-review ถ้ายอมรับความเสี่ยงที่ build/test ผ่านแต่ requirement ตกหล่น")
+		fmt.Println("  5. report_complete ไม่ได้จบ session ทันที - ola จะรัน lint+build+test ของโปรเจกต์")
+		fmt.Println("     เองอีกครั้งอย่างอิสระก่อน ถ้าไม่ผ่าน ผลลัพธ์ error จะถูกป้อนกลับเข้า conversation")
+		fmt.Println("     และ loop จะทำงานต่อจนกว่าจะผ่านจริง หรือจนกว่าจะถึง cap ด้านล่าง")
+		fmt.Println()
+		fmt.Println("ก่อนเริ่ม loop ola preflight-check ด้วยว่า binary ที่ toolchain ต้องใช้ (build/test/lint)")
+		fmt.Println("มีอยู่จริงใน PATH หรือไม่ - ถ้าขาดจะ error ทันทีแทนที่จะเสีย API call ไปกับ")
+		fmt.Println("session ที่รู้อยู่แล้วว่าจะพัง (ปิดด้วย --no-preflight) ดูตารางเครื่องมือที่ต้องติดตั้งต่อ")
+		fmt.Println("ภาษาด้านล่าง")
+		fmt.Println()
+		fmt.Println("ทุกครั้งที่ปิด task สำเร็จจะส่ง ntfy.sh notification [TASK] ทันที (ถ้าตั้ง -x/OLA_TOPIC ไว้)")
+		fmt.Println("เว้นแต่เปิด -q/--quiet ซึ่งจะงดแจ้งเตือนระหว่างทางนี้ - ดูหัวข้อ Quiet mode ใน 'ola ask -h'")
+		fmt.Println()
+		fmt.Println("Tool ที่ toolchain แต่ละภาษาต้องมีใน PATH ก่อนรัน (ola preflight-check ให้อัตโนมัติ):")
+		fmt.Println("  go       go, gofmt                    (lint: go vet + gofmt -l)")
+		fmt.Println("  node     npm/yarn/pnpm, npx, node     (lint: npx eslint . - เฉพาะถ้าเจอ eslint config)")
+		fmt.Println("  rust     cargo, rustc                 (lint: cargo clippy - ต้องมี component clippy)")
+		fmt.Println("  python   python3, pytest, pip         (lint: python3 -m compileall - syntax check เท่านั้น)")
+		fmt.Println("  make     make                         (ไม่มี lint อัตโนมัติ - ใช้ --lint-cmd ถ้าต้องการ)")
 		fmt.Println()
 		fmt.Println("State/output files ที่จะถูกสร้าง/อัปเดตใน current directory:")
 		fmt.Printf("  %-22s task checklist แบบ JSON (สำหรับ resume ข้ามการรัน)\n", codingStateFile)
@@ -5633,12 +6034,13 @@ func codingUsage(fs *flag.FlagSet) func() {
 		fmt.Println("                          ask_user กับตอนจบงาน (override $OLA_QUIET) - รายละเอียดเต็มดู 'ola ask -h' หัวข้อ Quiet mode")
 		fmt.Println("  -f, --requirements <f>  ไฟล์ requirements (default: requirements.md)")
 		fmt.Println("  --replan                ทิ้ง task state เดิม (.ola-coding-state.json) แล้ววางแผนใหม่")
-		fmt.Println("  --build-cmd <cmd>       ระบุคำสั่ง build เอง (override การตรวจจับอัตโนมัติ)")
-		fmt.Println("  --test-cmd <cmd>        ระบุคำสั่ง test เอง (override การตรวจจับอัตโนมัติ)")
-		fmt.Println("  --allow <bin1,bin2,...> เพิ่ม binary ให้ run_command เรียกได้ นอกเหนือจากที่ตรวจพบอัตโนมัติ")
+		fmt.Println("  --lint-cmd <cmd>        ระบุคำสั่ง lint เอง (override การตรวจจับอัตโนมัติ ใช้ตอน mark_task_done/report_complete)")
+		fmt.Println("  --no-self-review        ปิด gate self_review_requirements ก่อน report_complete (default: เปิด)")
+		fmt.Println("  --no-edit-verify        ปิด lint+build-check อัตโนมัติหลัง write_file/edit_file ทุกครั้ง (default: เปิด)")
+		fmt.Println("  --no-preflight          ข้ามการเช็คว่า binary ของ toolchain มีอยู่จริงใน PATH ก่อนเริ่ม (default: เช็ค)")
 		fmt.Println("  --max-iterations <n>    เพดานจำนวนรอบของ tool-calling loop (default: 300)")
 		fmt.Println("  --max-duration <dur>    เพดานเวลารวมของ session เช่น \"2h\", \"45m\" (default: 3h)")
-		fmt.Println("  --cmd-timeout <sec>     timeout ต่อการเรียก run_command/verify หนึ่งครั้ง (default: 120)")
+		fmt.Println("  --cmd-timeout <sec>     timeout ต่อการเรียก run_command/lint/verify หนึ่งครั้ง (default: 120)")
 		fmt.Println("  --ollama-search-key <k> override OLA_OLLAMA_SEARCH_API_KEY/$OLLAMA_API_KEY (เปิด web_search)")
 		fmt.Println("  --searxng-url <u>       override OLA_SEARXNG_API_BASE (เปิด web_search - ชนะ Ollama key ถ้าตั้งทั้งคู่)")
 		fmt.Println("  --no-web-search         ปิดทั้ง web_search และ web_fetch (web_fetch เปิดอัตโนมัติเสมอ - นี่คือทางเดียวที่ปิดได้)")
@@ -5660,10 +6062,11 @@ func codingUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  export OLA_OLLAMA_MODEL=qwen3.6:27b")
 		fmt.Println("  ola coding")
 		fmt.Println("  ola coding -f docs/requirements.md -x mytopic --max-duration 6h")
-		fmt.Println("  ola coding --build-cmd 'go build ./...' --test-cmd 'go test ./...' --allow golangci-lint")
+		fmt.Println("  ola coding --lint-cmd 'golangci-lint run'")
 		fmt.Println("  ola coding --skills-dir /mnt/skills/public,/mnt/skills/private")
 		fmt.Println("  ola coding --api-endpoints 'ollama=http://localhost:11434'")
 		fmt.Println("  ola coding -q -x mytopic --max-duration 6h  # รันแบบเงียบ, ntfy ได้แค่ ASK/จบงาน")
+		fmt.Println("  ola coding --no-edit-verify --cmd-timeout 300  # โปรเจกต์ build ช้ามาก ปิด per-edit check")
 	}
 }
 
@@ -5675,7 +6078,7 @@ func cmdCoding(args []string) int {
 	fs := flag.NewFlagSet("coding", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 
-	var model, ctxStr, outputFile, topic, reqFile, buildCmd, testCmd, allowList, maxDurStr string
+	var model, ctxStr, outputFile, topic, reqFile, maxDurStr string
 	var flagKey, flagNoThink, flagDryRun, flagHelp, flagReplan, flagQuiet bool
 	var maxIterations, cmdTimeoutSec int
 	var searxngURL string
@@ -5687,6 +6090,8 @@ func cmdCoding(args []string) int {
 	var flagAPIAllowDirectURL, flagAPIAllowMutating bool
 	var apiTimeoutSec int
 	var providerFlag, apiBaseFlag string
+	var lintCmd string
+	var flagNoSelfReview, flagNoEditVerify, flagNoPreflight bool
 
 	fs.StringVar(&model, "m", "", "")
 	fs.StringVar(&model, "model", "", "")
@@ -5710,12 +6115,13 @@ func cmdCoding(args []string) int {
 	fs.StringVar(&reqFile, "f", "requirements.md", "")
 	fs.StringVar(&reqFile, "requirements", "requirements.md", "")
 	fs.BoolVar(&flagReplan, "replan", false, "")
-	fs.StringVar(&buildCmd, "build-cmd", "", "")
-	fs.StringVar(&testCmd, "test-cmd", "", "")
-	fs.StringVar(&allowList, "allow", "", "")
+	fs.StringVar(&lintCmd, "lint-cmd", "", "")
 	fs.IntVar(&maxIterations, "max-iterations", defaultMaxCodingIterations, "")
 	fs.StringVar(&maxDurStr, "max-duration", defaultMaxCodingDuration.String(), "")
 	fs.IntVar(&cmdTimeoutSec, "cmd-timeout", defaultCmdTimeoutSec, "")
+	fs.BoolVar(&flagNoSelfReview, "no-self-review", false, "")
+	fs.BoolVar(&flagNoEditVerify, "no-edit-verify", false, "")
+	fs.BoolVar(&flagNoPreflight, "no-preflight", false, "")
 	fs.StringVar(&searxngURL, "searxng-url", "", "")
 	fs.StringVar(&ollamaSearchKey, "ollama-search-key", "", "")
 	fs.BoolVar(&flagNoWebSearch, "no-web-search", false, "")
@@ -5809,20 +6215,21 @@ func cmdCoding(args []string) int {
 
 	cwd, _ := os.Getwd()
 	cmds := detectProjectCommands(cwd)
-	if buildCmd != "" {
-		cmds.BuildCmd = buildCmd
-		cmds.AllowBins[firstWord(buildCmd)] = true
+	if lintCmd != "" {
+		cmds.LintCmd = lintCmd
 	}
-	if testCmd != "" {
-		cmds.TestCmd = testCmd
-		cmds.AllowBins[firstWord(testCmd)] = true
-	}
-	if allowList != "" {
-		for _, b := range strings.Split(allowList, ",") {
-			b = strings.TrimSpace(b)
-			if b != "" {
-				cmds.AllowBins[b] = true
-			}
+
+	// Preflight: confirm every binary this session's own build/test/lint
+	// gate might need to invoke is actually present in PATH before spending
+	// any API calls - a missing toolchain is far cheaper to catch here than
+	// several rounds into an unattended session (see preflightCheck's doc
+	// comment). --no-preflight skips this for cases where the detection is
+	// known to be noisy (e.g. a deliberately partial dev container).
+	if !flagNoPreflight {
+		if missing := preflightCheck(cmds); len(missing) > 0 {
+			fmt.Fprintf(os.Stderr, "error: ตรวจพบ toolchain %q แต่ขาด binary ต่อไปนี้ใน PATH: %s\n", cmds.Label, strings.Join(missing, ", "))
+			fmt.Fprintln(os.Stderr, "ติดตั้งให้ครบก่อนรัน หรือใช้ --lint-cmd ถ้า toolchain ถูกตรวจจับผิด หรือ --no-preflight เพื่อข้ามการเช็คนี้")
+			return 1
 		}
 	}
 
@@ -5919,7 +6326,9 @@ func cmdCoding(args []string) int {
 		fmt.Println(systemPrompt)
 		fmt.Println("── End system prompt ──")
 		fmt.Printf("── Requirements file: %s ──\n", reqFile)
-		fmt.Printf("── Detected toolchain: %s (build: %q test: %q) ──\n", cmds.Label, cmds.BuildCmd, cmds.TestCmd)
+		fmt.Printf("── Detected toolchain: %s (build: %q test: %q lint: %q) ──\n", cmds.Label, cmds.BuildCmd, cmds.TestCmd, cmds.LintCmd)
+		fmt.Printf("── Quality gates: self-review-before-report=%t, verify-after-every-edit=%t, lint-blocks-like-build-fail=true, max-task-fail-streak=%d ──\n",
+			!flagNoSelfReview, !flagNoEditVerify, maxTaskFailStreak)
 		fmt.Printf("── Sandbox root (current directory): %s ──\n", cwd)
 		if quietMode {
 			fmt.Println("── Quiet mode: enabled (-q/--quiet or $OLA_QUIET) - ไม่มีผลต่อ --dry-run นี้ ซึ่งแสดงรายละเอียดเต็มเสมอ ──")
@@ -5978,7 +6387,9 @@ func cmdCoding(args []string) int {
 	fmt.Fprintf(outFile, "# provider: %s\n", pcfg.Provider)
 	fmt.Fprintf(outFile, "# host: %s\n# model: %s\n# num_ctx: %d\n", host, model, ctx)
 	fmt.Fprintf(outFile, "# cwd (sandbox root): %s\n# requirements: %s\n", cwd, reqFile)
-	fmt.Fprintf(outFile, "# detected toolchain: %s (build: %q test: %q)\n", cmds.Label, cmds.BuildCmd, cmds.TestCmd)
+	fmt.Fprintf(outFile, "# detected toolchain: %s (build: %q test: %q lint: %q)\n", cmds.Label, cmds.BuildCmd, cmds.TestCmd, cmds.LintCmd)
+	fmt.Fprintf(outFile, "# quality gates: self-review-before-report=%t verify-after-every-edit=%t lint-blocks-like-build-fail=true max-task-fail-streak=%d\n",
+		!flagNoSelfReview, !flagNoEditVerify, maxTaskFailStreak)
 	for _, lt := range loadTimings {
 		fmt.Fprintf(outFile, "# load_time: %s\n", lt)
 	}
@@ -6023,8 +6434,10 @@ func cmdCoding(args []string) int {
 
 	rc := &codingRunContext{
 		ntfyTopic: ntfyTopic, red: cRed, reset: cReset, outFile: outFile,
-		state: state, allowed: cmds.AllowBins, cmdTO: time.Duration(cmdTimeoutSec) * time.Second,
+		state: state, cmdTO: time.Duration(cmdTimeoutSec) * time.Second,
 		cmds: cmds, searchCfg: searchCfg, skillsCfg: skillsCfg, apiCfg: apiCfg,
+		selfReviewEnabled: !flagNoSelfReview,
+		editVerifyEnabled: !flagNoEditVerify,
 	}
 
 	client := newHTTPClient()
