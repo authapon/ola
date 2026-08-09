@@ -313,6 +313,21 @@ the normal case and only reach for it when it actually applies.
   to reach the internet this session - say so plainly instead of guessing
   at "current" facts, prices, versions, or inventing URLs.
 
+# TOOL CALL RULES (check this before every read_file/write_file/edit_file/create_folder call)
+- ALWAYS include "path" - every one of these four tools requires it, no
+  exceptions. A call missing "path" fails outright and wastes a round trip.
+- write_file needs: path + content (both required every time).
+- edit_file needs: path + old_str + new_str (all three required every time).
+- create_folder needs: path (required every time).
+- Correctly shaped examples (path is always the first field):
+  read_file({"path": "main.go"})
+  write_file({"path": "hello.go", "content": "package main\n..."})
+  edit_file({"path": "main.go", "old_str": "foo()", "new_str": "bar()"})
+  create_folder({"path": "src/utils"})
+- If a tool call is rejected with an error, the error tells you exactly
+  which argument was missing or wrong - fix that specific thing and retry;
+  do not guess or repeat the same call unchanged.
+
 # PROACTIVE TIME/FRESHNESS TOOL USE
 Some requests need a tool call before you can answer correctly, even when
 the user never explicitly asks you to "check the time" or "search the
@@ -676,6 +691,52 @@ const maxAskVerifyRounds = 3
 // Built-in tool schema sent to Ollama on every request
 // ─────────────────────────────────────────────────────────────────
 
+// propEntry/orderedProps exist for exactly one reason: encoding/json sorts
+// map[string]interface{} keys alphabetically on Marshal (this is standard,
+// unconfigurable Go behavior - see the encoding/json docs). If a tool's
+// "properties" object were a plain map, the JSON schema actually sent to
+// the model would list its fields alphabetically - NOT in the order
+// written below - regardless of which field is most important or which
+// one is required. That silently buried "path" behind "content"/"old_str"/
+// "new_str" in write_file/edit_file's wire schema (content < path < reason,
+// new_str < old_str < path < reason alphabetically), which is a plausible
+// contributor to weaker/local models (e.g. small quantized ones) dropping
+// "path" specifically - it's exactly the tool this bit, and it's not the
+// first field an alphabetically-sorted schema puts in front of the model.
+// orderedProps preserves the declaration order below when marshaled, so
+// the model actually sees fields in the order they're listed here - the
+// most load-bearing/required field (almost always "path") is written
+// first in every tool below on purpose.
+type propEntry struct {
+	key string
+	val interface{}
+}
+
+type orderedProps []propEntry
+
+func (o orderedProps) MarshalJSON() ([]byte, error) {
+	var b bytes.Buffer
+	b.WriteByte('{')
+	for i, e := range o {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		kb, err := json.Marshal(e.key)
+		if err != nil {
+			return nil, err
+		}
+		vb, err := json.Marshal(e.val)
+		if err != nil {
+			return nil, err
+		}
+		b.Write(kb)
+		b.WriteByte(':')
+		b.Write(vb)
+	}
+	b.WriteByte('}')
+	return b.Bytes(), nil
+}
+
 var builtinTools = []ollamaTool{
 	{
 		Type: "function",
@@ -719,24 +780,30 @@ var builtinTools = []ollamaTool{
 		Type: "function",
 		Function: ollamaToolFunction{
 			Name:        "write_file",
-			Description: "Create a new file, or completely overwrite an existing one, with the given full content.",
+			Description: "Create a new file, or completely overwrite an existing one, with the given full content. REQUIRED every call: \"path\" and \"content\" - never omit \"path\".",
 			Parameters: map[string]interface{}{
 				"type": "object",
-				"properties": map[string]interface{}{
-					"path": map[string]interface{}{
+				"properties": orderedProps{
+					{"path", map[string]interface{}{
 						"type":        "string",
-						"description": "Path relative to the current directory.",
-					},
-					"content": map[string]interface{}{
+						"description": "REQUIRED, always include this. Path relative to the current directory, e.g. \"main.go\" or \"src/utils.go\". Never call write_file without it.",
+					}},
+					{"content", map[string]interface{}{
 						"type":        "string",
-						"description": "Full, final content of the file.",
-					},
-					"reason": map[string]interface{}{
+						"description": "REQUIRED. Full, final content of the file.",
+					}},
+					{"reason", map[string]interface{}{
 						"type":        "string",
-						"description": "Short (one sentence) explanation of what this file is/does and why you're writing it now. Surfaced directly to the human (e.g. in a push notification), so write it for that audience.",
-					},
+						"description": "Optional short (one sentence) explanation of what this file is/does and why you're writing it now. Surfaced directly to the human (e.g. in a push notification) when set, so write it for that audience.",
+					}},
 				},
-				"required": []string{"path", "content", "reason"},
+				// "reason" deliberately left out of "required": the handler
+				// never enforces it (a missing reason just omits itself from
+				// the human-facing notification) - keeping it out of this
+				// list means it doesn't compete for a weaker model's
+				// attention against "path"/"content", which the handler
+				// does enforce and which a dropped value actually breaks.
+				"required": []string{"path", "content"},
 			},
 		},
 	},
@@ -744,28 +811,30 @@ var builtinTools = []ollamaTool{
 		Type: "function",
 		Function: ollamaToolFunction{
 			Name:        "edit_file",
-			Description: "Replace one exact, unique occurrence of old_str with new_str in an existing file. old_str must match the current file content exactly and must be unique in the file.",
+			Description: "Replace one exact, unique occurrence of old_str with new_str in an existing file. old_str must match the current file content exactly and must be unique in the file. REQUIRED every call: \"path\", \"old_str\", and \"new_str\" - never omit \"path\".",
 			Parameters: map[string]interface{}{
 				"type": "object",
-				"properties": map[string]interface{}{
-					"path": map[string]interface{}{
+				"properties": orderedProps{
+					{"path", map[string]interface{}{
 						"type":        "string",
-						"description": "Path relative to the current directory.",
-					},
-					"old_str": map[string]interface{}{
+						"description": "REQUIRED, always include this. Path relative to the current directory, e.g. \"main.go\". Never call edit_file without it.",
+					}},
+					{"old_str", map[string]interface{}{
 						"type":        "string",
-						"description": "Exact text to find; must appear exactly once in the file.",
-					},
-					"new_str": map[string]interface{}{
+						"description": "REQUIRED. Exact text to find; must appear exactly once in the file.",
+					}},
+					{"new_str", map[string]interface{}{
 						"type":        "string",
-						"description": "Text to replace old_str with.",
-					},
-					"reason": map[string]interface{}{
+						"description": "REQUIRED. Text to replace old_str with.",
+					}},
+					{"reason", map[string]interface{}{
 						"type":        "string",
-						"description": "Short (one sentence) explanation of what this specific change does and why. Surfaced directly to the human (e.g. in a push notification), so write it for that audience.",
-					},
+						"description": "Optional short (one sentence) explanation of what this specific change does and why. Surfaced directly to the human (e.g. in a push notification) when set, so write it for that audience.",
+					}},
 				},
-				"required": []string{"path", "old_str", "new_str", "reason"},
+				// same reasoning as write_file above: "reason" is not
+				// enforced by the handler, so it stays out of "required".
+				"required": []string{"path", "old_str", "new_str"},
 			},
 		},
 	},
@@ -773,18 +842,18 @@ var builtinTools = []ollamaTool{
 		Type: "function",
 		Function: ollamaToolFunction{
 			Name:        "create_folder",
-			Description: "Create a directory relative to the current directory, including any missing parent directories (like \"mkdir -p\"). A no-op success if the directory already exists; fails if that path already exists as a file.",
+			Description: "Create a directory relative to the current directory, including any missing parent directories (like \"mkdir -p\"). A no-op success if the directory already exists; fails if that path already exists as a file. REQUIRED every call: \"path\".",
 			Parameters: map[string]interface{}{
 				"type": "object",
-				"properties": map[string]interface{}{
-					"path": map[string]interface{}{
+				"properties": orderedProps{
+					{"path", map[string]interface{}{
 						"type":        "string",
-						"description": "Path relative to the current directory.",
-					},
-					"reason": map[string]interface{}{
+						"description": "REQUIRED, always include this. Path relative to the current directory.",
+					}},
+					{"reason", map[string]interface{}{
 						"type":        "string",
 						"description": "Optional short explanation of what this folder is for. Surfaced directly to the human (e.g. in a push notification) when set.",
-					},
+					}},
 				},
 				"required": []string{"path"},
 			},
@@ -794,19 +863,19 @@ var builtinTools = []ollamaTool{
 		Type: "function",
 		Function: ollamaToolFunction{
 			Name:        "ask_user",
-			Description: "Ask the human a direct question and wait for their answer. Only for genuine ambiguity or before destructive/hard-to-reverse changes - do not overuse.",
+			Description: "Ask the human a direct question and wait for their answer. Only for genuine ambiguity or before destructive/hard-to-reverse changes - do not overuse. REQUIRED every call: \"question\".",
 			Parameters: map[string]interface{}{
 				"type": "object",
-				"properties": map[string]interface{}{
-					"question": map[string]interface{}{
+				"properties": orderedProps{
+					{"question", map[string]interface{}{
 						"type":        "string",
-						"description": "The question to ask the user.",
-					},
-					"options": map[string]interface{}{
+						"description": "REQUIRED, always include this. The question to ask the user.",
+					}},
+					{"options", map[string]interface{}{
 						"type":        "array",
 						"items":       map[string]interface{}{"type": "string"},
 						"description": "Optional short list of choices to present to the user.",
-					},
+					}},
 				},
 				"required": []string{"question"},
 			},
@@ -2257,6 +2326,9 @@ func sandboxedPathIn(root, rel string) (string, error) {
 
 func toolReadFile(args map[string]interface{}) (string, error) {
 	path, _ := args["path"].(string)
+	if path == "" {
+		return "", fmt.Errorf("missing required argument \"path\" - read_file needs a non-empty relative path, e.g. {\"path\": \"main.go\"}")
+	}
 	full, err := sandboxedPath(path)
 	if err != nil {
 		return "", err
@@ -2562,8 +2634,17 @@ func buildDirectoryTree(root string) (string, bool, int) {
 func toolWriteFile(args map[string]interface{}) (string, error) {
 	path, _ := args["path"].(string)
 	content, hasContent := args["content"].(string)
+	// Check "path" before "content": both are required, but reporting
+	// whichever is missing FIRST here means a call missing both only ever
+	// gets told about content, fixes that, retries, and only then finds out
+	// path was also missing - two wasted rounds instead of one. Listing
+	// "path" first also matches its position as the first (and most
+	// commonly dropped) field in write_file's own schema.
+	if path == "" {
+		return "", fmt.Errorf("missing required argument \"path\" - write_file needs both \"path\" and \"content\" every call, e.g. {\"path\": \"main.go\", \"content\": \"...\"}")
+	}
 	if !hasContent {
-		return "", fmt.Errorf("ต้องระบุ content")
+		return "", fmt.Errorf("missing required argument \"content\" - write_file needs both \"path\" (%q) and \"content\" every call", path)
 	}
 	full, err := sandboxedPath(path)
 	if err != nil {
@@ -2585,10 +2666,10 @@ func toolEditFile(args map[string]interface{}) (string, error) {
 	oldStr, _ := args["old_str"].(string)
 	newStr, _ := args["new_str"].(string)
 	if path == "" {
-		return "", fmt.Errorf("ต้องระบุ path")
+		return "", fmt.Errorf("missing required argument \"path\" - edit_file needs \"path\", \"old_str\", and \"new_str\" every call, e.g. {\"path\": \"main.go\", \"old_str\": \"...\", \"new_str\": \"...\"}")
 	}
 	if oldStr == "" {
-		return "", fmt.Errorf("ต้องระบุ old_str")
+		return "", fmt.Errorf("missing required argument \"old_str\" - edit_file needs both \"old_str\" (exact text to find) and \"new_str\" together with \"path\" (%q) every call", path)
 	}
 	full, err := sandboxedPath(path)
 	if err != nil {
@@ -2623,7 +2704,7 @@ func toolEditFile(args map[string]interface{}) (string, error) {
 func toolCreateFolder(args map[string]interface{}) (string, error) {
 	path, _ := args["path"].(string)
 	if path == "" {
-		return "", fmt.Errorf("ต้องระบุ path")
+		return "", fmt.Errorf("missing required argument \"path\" - create_folder needs a non-empty relative path, e.g. {\"path\": \"src/utils\"}")
 	}
 	full, err := sandboxedPath(path)
 	if err != nil {
@@ -2816,7 +2897,7 @@ func toolDelay(args map[string]interface{}) (string, error) {
 // duplicating that plumbing.
 func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.File, extra func(name string, args map[string]interface{}) (string, error, bool), changeLog ...*[]string) string {
 	var args map[string]interface{}
-	_ = json.Unmarshal(tc.Function.Arguments, &args)
+	unmarshalErr := json.Unmarshal(tc.Function.Arguments, &args)
 
 	argsPreview, _ := json.Marshal(args)
 	qprintf("%s🔧 tool_call: %s(%s)%s\n", red, tc.Function.Name, string(argsPreview), reset)
@@ -2825,49 +2906,59 @@ func dispatchToolCall(tc toolCall, ntfyTopic, red, reset string, outFile *os.Fil
 	loadStart := time.Now()
 	var result string
 	var err error
-	switch tc.Function.Name {
-	case "read_file":
-		result, err = toolReadFile(args)
-	case "search_files":
-		result, err = toolSearchFiles(args)
-	case "write_file":
-		result, err = toolWriteFile(args)
-		if err == nil {
-			recordChange(changeLog, formatFileChangeNotification("WRITE", args))
-			if ntfyTopic != "" && !quietMode {
-				sendNotification(ntfyTopic, formatFileChangeNotification("WRITE", args))
+	// A weaker model can emit tool-call arguments that aren't valid JSON at
+	// all (unescaped quote, trailing comma, etc.). Left unchecked, args
+	// silently stays nil and every field-level check below would report
+	// "missing" - which doesn't tell the model its actual mistake was JSON
+	// syntax, not a forgotten field. Catching that distinctly here gives it
+	// a fixable signal on the very next retry instead of a confusing loop.
+	if unmarshalErr != nil {
+		err = fmt.Errorf("your %q call's arguments were not valid JSON (%v) - re-emit the call with syntactically valid JSON matching its schema (all keys/strings double-quoted, no trailing commas)", tc.Function.Name, unmarshalErr)
+	} else {
+		switch tc.Function.Name {
+		case "read_file":
+			result, err = toolReadFile(args)
+		case "search_files":
+			result, err = toolSearchFiles(args)
+		case "write_file":
+			result, err = toolWriteFile(args)
+			if err == nil {
+				recordChange(changeLog, formatFileChangeNotification("WRITE", args))
+				if ntfyTopic != "" && !quietMode {
+					sendNotification(ntfyTopic, formatFileChangeNotification("WRITE", args))
+				}
 			}
-		}
-	case "edit_file":
-		result, err = toolEditFile(args)
-		if err == nil {
-			recordChange(changeLog, formatFileChangeNotification("EDIT", args))
-			if ntfyTopic != "" && !quietMode {
-				sendNotification(ntfyTopic, formatFileChangeNotification("EDIT", args))
+		case "edit_file":
+			result, err = toolEditFile(args)
+			if err == nil {
+				recordChange(changeLog, formatFileChangeNotification("EDIT", args))
+				if ntfyTopic != "" && !quietMode {
+					sendNotification(ntfyTopic, formatFileChangeNotification("EDIT", args))
+				}
 			}
-		}
-	case "create_folder":
-		result, err = toolCreateFolder(args)
-		if err == nil {
-			recordChange(changeLog, formatFileChangeNotification("MKDIR", args))
-			if ntfyTopic != "" && !quietMode {
-				sendNotification(ntfyTopic, formatFileChangeNotification("MKDIR", args))
+		case "create_folder":
+			result, err = toolCreateFolder(args)
+			if err == nil {
+				recordChange(changeLog, formatFileChangeNotification("MKDIR", args))
+				if ntfyTopic != "" && !quietMode {
+					sendNotification(ntfyTopic, formatFileChangeNotification("MKDIR", args))
+				}
 			}
-		}
-	case "ask_user":
-		result, err = toolAskUser(args, ntfyTopic, red, reset)
-	case "get_current_time":
-		result, err = toolGetCurrentTime(args)
-	case "delay":
-		result, err = toolDelay(args)
-	default:
-		if extra != nil {
-			if r, e, handled := extra(tc.Function.Name, args); handled {
-				result, err = r, e
-				break
+		case "ask_user":
+			result, err = toolAskUser(args, ntfyTopic, red, reset)
+		case "get_current_time":
+			result, err = toolGetCurrentTime(args)
+		case "delay":
+			result, err = toolDelay(args)
+		default:
+			if extra != nil {
+				if r, e, handled := extra(tc.Function.Name, args); handled {
+					result, err = r, e
+					break
+				}
 			}
+			err = fmt.Errorf("ไม่รู้จัก tool: %s", tc.Function.Name)
 		}
-		err = fmt.Errorf("ไม่รู้จัก tool: %s", tc.Function.Name)
 	}
 	loadElapsed := time.Since(loadStart)
 
@@ -3584,30 +3675,33 @@ var scpCopyTool = ollamaTool{
 			"ที่อนุญาตของแต่ละฝั่งเท่านั้น (ออกนอกขอบเขตที่ตั้งค่าไว้ไม่ได้) เรียก tool นี้ได้ทันทีไม่ต้องขอ confirm จากผู้ใช้ก่อน",
 		Parameters: map[string]interface{}{
 			"type": "object",
-			"properties": map[string]interface{}{
-				"direction": map[string]interface{}{
+			"properties": orderedProps{
+				{"direction", map[string]interface{}{
 					"type":        "string",
 					"enum":        []string{"upload", "download"},
-					"description": "upload: local_path -> remote host, download: remote host -> local_path",
-				},
-				"remote_alias": map[string]interface{}{
+					"description": "REQUIRED. upload: local_path -> remote host, download: remote host -> local_path",
+				}},
+				{"remote_alias", map[string]interface{}{
 					"type":        "string",
-					"description": "ชื่อ alias ของ remote host ที่ตั้งค่าไว้ล่วงหน้าเท่านั้น (ผิดชื่อจะได้ error พร้อมรายชื่อที่อนุญาตจริง)",
-				},
-				"local_path": map[string]interface{}{
+					"description": "REQUIRED. ชื่อ alias ของ remote host ที่ตั้งค่าไว้ล่วงหน้าเท่านั้น (ผิดชื่อจะได้ error พร้อมรายชื่อที่อนุญาตจริง)",
+				}},
+				{"local_path", map[string]interface{}{
 					"type":        "string",
-					"description": "path สัมพัทธ์ภายใต้ local sandbox (default: current directory, หรือ --scp-local-dir/OLA_SCP_LOCAL_DIR ถ้าตั้งไว้)",
-				},
-				"remote_path": map[string]interface{}{
+					"description": "REQUIRED. path สัมพัทธ์ภายใต้ local sandbox (default: current directory, หรือ --scp-local-dir/OLA_SCP_LOCAL_DIR ถ้าตั้งไว้)",
+				}},
+				{"remote_path", map[string]interface{}{
 					"type":        "string",
-					"description": "path สัมพัทธ์ภายใต้ remote root ที่ตั้งค่าไว้สำหรับ alias นี้ใน OLA_SCP_HOSTS",
-				},
-				"reason": map[string]interface{}{
+					"description": "REQUIRED. path สัมพัทธ์ภายใต้ remote root ที่ตั้งค่าไว้สำหรับ alias นี้ใน OLA_SCP_HOSTS",
+				}},
+				{"reason", map[string]interface{}{
 					"type":        "string",
-					"description": "อธิบายสั้นๆ ว่าทำไมถึง copy ไฟล์นี้ - surfaced ให้ผู้ใช้เห็นตรงๆ ผ่าน notification/log เขียนสำหรับคนอ่าน",
-				},
+					"description": "Optional. อธิบายสั้นๆ ว่าทำไมถึง copy ไฟล์นี้ - surfaced ให้ผู้ใช้เห็นตรงๆ ผ่าน notification/log เขียนสำหรับคนอ่าน เมื่อระบุ",
+				}},
 			},
-			"required": []string{"direction", "remote_alias", "local_path", "remote_path", "reason"},
+			// "reason" not enforced by toolSCPCopy - kept out of "required"
+			// so it doesn't compete for attention against the four fields
+			// that are actually load-bearing (see write_file's comment above).
+			"required": []string{"direction", "remote_alias", "local_path", "remote_path"},
 		},
 	},
 }
@@ -3972,16 +4066,16 @@ var webSearchTool = ollamaTool{
 			"get_current_time ก่อนเพื่อรู้วันที่จริง แล้วค่อยตั้งคำค้นจากวันที่นั้น",
 		Parameters: map[string]interface{}{
 			"type": "object",
-			"properties": map[string]interface{}{
-				"queries": map[string]interface{}{
+			"properties": orderedProps{
+				{"queries", map[string]interface{}{
 					"type":        "array",
 					"items":       map[string]interface{}{"type": "string"},
-					"description": "รายการคำค้น อย่างน้อย 1 รายการ ระบุหลายคำค้นพร้อมกันได้เพื่อค้นแบบขนาน",
-				},
-				"max_results": map[string]interface{}{
+					"description": "REQUIRED. รายการคำค้น อย่างน้อย 1 รายการ ระบุหลายคำค้นพร้อมกันได้เพื่อค้นแบบขนาน",
+				}},
+				{"max_results", map[string]interface{}{
 					"type":        "integer",
-					"description": fmt.Sprintf("จำนวนผลลัพธ์สูงสุดต่อคำค้น (default: %d)", defaultSearchMaxResults),
-				},
+					"description": fmt.Sprintf("Optional. จำนวนผลลัพธ์สูงสุดต่อคำค้น (default: %d)", defaultSearchMaxResults),
+				}},
 			},
 			"required": []string{"queries"},
 		},
@@ -4879,17 +4973,17 @@ var readSkillTool = ollamaTool{
 			"(--skills-dir/OLA_SKILLS_DIR) and at least one skill was found in it.",
 		Parameters: map[string]interface{}{
 			"type": "object",
-			"properties": map[string]interface{}{
-				"skill": map[string]interface{}{
+			"properties": orderedProps{
+				{"skill", map[string]interface{}{
 					"type":        "string",
-					"description": "Exact skill name as listed in AVAILABLE SKILLS.",
-				},
-				"file": map[string]interface{}{
+					"description": "REQUIRED, always include this. Exact skill name as listed in AVAILABLE SKILLS.",
+				}},
+				{"file", map[string]interface{}{
 					"type": "string",
 					"description": "Optional path to a companion file, relative to that skill's own folder and using forward " +
 						"slashes (e.g. \"references/core-syntax.md\"), to read it instead of SKILL.md itself. Use one of the " +
 						"exact paths returned by a prior call to this skill without \"file\".",
-				},
+				}},
 			},
 			"required": []string{"skill"},
 		},
@@ -5230,6 +5324,25 @@ requirements is actually built and actually works.
   say so plainly instead of guessing at "current" facts, library versions,
   or API details, or inventing URLs.
 
+# TOOL CALL RULES (check this before every read_file/write_file/edit_file/create_folder/mark_task_done call)
+- ALWAYS include "path" - read_file/write_file/edit_file/create_folder all
+  require it, no exceptions. A call missing "path" fails outright and
+  wastes a round trip you don't get back in a long unattended run.
+- write_file needs: path + content (both required every time).
+- edit_file needs: path + old_str + new_str (all three required every time).
+- create_folder needs: path (required every time).
+- mark_task_done needs: task_id (the exact "T<n>" id add_tasks gave you -
+  required every time).
+- Correctly shaped examples (path is always the first field):
+  read_file({"path": "main.go"})
+  write_file({"path": "hello.go", "content": "package main\n..."})
+  edit_file({"path": "main.go", "old_str": "foo()", "new_str": "bar()"})
+  create_folder({"path": "src/utils"})
+  mark_task_done({"task_id": "T3"})
+- If a tool call is rejected with an error, the error tells you exactly
+  which argument was missing or wrong - fix that specific thing and retry;
+  do not guess or repeat the same call unchanged.
+
 # PROACTIVE TIME/FRESHNESS TOOL USE
 Some parts of a requirements document depend on "now" or on information
 that may have changed since your training data, even when the requirements
@@ -5340,25 +5453,25 @@ var codingExtraTools = []ollamaTool{
 			Description: "Register the implementation checklist for this session, at feature-area granularity, one entry per concrete unit of work. Call once, early. Each task SHOULD include an acceptance_check: a concrete command (e.g. \"go test ./internal/auth/...\") that specifically verifies THIS task, not just that the whole project still builds - this is what lets mark_task_done judge each task narrowly instead of only checking a generic build. Omit acceptance_check only for tasks with no sensible narrow test (e.g. \"set up project scaffolding\"). Can also be called again later to split a task that's stuck (see mark_task_done).",
 			Parameters: map[string]interface{}{
 				"type": "object",
-				"properties": map[string]interface{}{
-					"tasks": map[string]interface{}{
+				"properties": orderedProps{
+					{"tasks", map[string]interface{}{
 						"type": "array",
 						"items": map[string]interface{}{
 							"type": "object",
-							"properties": map[string]interface{}{
-								"description": map[string]interface{}{
+							"properties": orderedProps{
+								{"description", map[string]interface{}{
 									"type":        "string",
-									"description": "Short description of this concrete unit of work.",
-								},
-								"acceptance_check": map[string]interface{}{
+									"description": "REQUIRED. Short description of this concrete unit of work.",
+								}},
+								{"acceptance_check", map[string]interface{}{
 									"type":        "string",
 									"description": "Optional: a specific, narrow command that verifies this task alone (e.g. \"go test ./pkg/auth/...\"). Must use a binary available to run_command.",
-								},
+								}},
 							},
 							"required": []string{"description"},
 						},
-						"description": "One entry per concrete task. A plain string is also accepted as shorthand for {\"description\": \"...\"} with no acceptance_check.",
-					},
+						"description": "REQUIRED. One entry per concrete task. A plain string is also accepted as shorthand for {\"description\": \"...\"} with no acceptance_check.",
+					}},
 				},
 				"required": []string{"tasks"},
 			},
@@ -5371,15 +5484,15 @@ var codingExtraTools = []ollamaTool{
 			Description: "Mark a previously registered task (by its task_id, e.g. \"T3\") as completed. ola runs a lint + build-only check (plus the task's own acceptance_check, if it has one) before accepting this. If the same task is rejected 3 times in a row, it becomes blocked and must be split further via add_tasks, or escalated via ask_user, before it can be retried.",
 			Parameters: map[string]interface{}{
 				"type": "object",
-				"properties": map[string]interface{}{
-					"task_id": map[string]interface{}{
+				"properties": orderedProps{
+					{"task_id", map[string]interface{}{
 						"type":        "string",
-						"description": "The task_id as given back by add_tasks, e.g. \"T3\".",
-					},
-					"note": map[string]interface{}{
+						"description": "REQUIRED, always include this. The task_id as given back by add_tasks, e.g. \"T3\".",
+					}},
+					{"note", map[string]interface{}{
 						"type":        "string",
 						"description": "Optional short note on what was actually done.",
-					},
+					}},
 				},
 				"required": []string{"task_id"},
 			},
@@ -7479,45 +7592,51 @@ var apiRequestTool = ollamaTool{
 			"none (ไม่มี body) response ที่ไม่ใช่ 2xx จะไม่ถือเป็น error - จะคืน status code และเนื้อหากลับมาให้ตัดสินใจเอง",
 		Parameters: map[string]interface{}{
 			"type": "object",
-			"properties": map[string]interface{}{
-				"endpoint": map[string]interface{}{
+			// Nothing is in "required" below because endpoint/url are
+			// mutually-exclusive alternatives enforced at runtime, not by
+			// JSON schema - but destination selection (endpoint/path/url)
+			// is still ordered first since it's conceptually the most
+			// load-bearing part of the call, ahead of secondary details
+			// like headers/body.
+			"properties": orderedProps{
+				{"endpoint", map[string]interface{}{
 					"type":        "string",
 					"description": "ชื่อ alias ของ endpoint ที่ config ไว้ (ระบุอย่างใดอย่างหนึ่งกับ url เท่านั้น)",
-				},
-				"path": map[string]interface{}{
+				}},
+				{"path", map[string]interface{}{
 					"type":        "string",
 					"description": "path ต่อท้าย base URL ของ endpoint เช่น \"/api/tags\" (ใช้คู่กับ endpoint เท่านั้น)",
-				},
-				"url": map[string]interface{}{
+				}},
+				{"url", map[string]interface{}{
 					"type":        "string",
 					"description": "URL ปลายทางแบบเต็ม http/https (ใช้ได้เฉพาะเมื่อเปิด --api-allow-direct-url - ระบุอย่างใดอย่างหนึ่งกับ endpoint เท่านั้น)",
-				},
-				"method": map[string]interface{}{
+				}},
+				{"method", map[string]interface{}{
 					"type":        "string",
 					"enum":        []string{"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"},
 					"description": "default: GET",
-				},
-				"query": map[string]interface{}{
+				}},
+				{"query", map[string]interface{}{
 					"type":        "object",
 					"description": "query string params เพิ่มเติม (key:value เป็น string หรือ ตัวเลข/บูลีน)",
-				},
-				"headers": map[string]interface{}{
+				}},
+				{"headers", map[string]interface{}{
 					"type":        "object",
 					"description": "header เพิ่มเติม (key:value เป็น string) - header ที่สงวนไว้ (Host, Authorization, Content-Length, Transfer-Encoding, Connection) จะถูกข้ามเสมอ",
-				},
-				"body_type": map[string]interface{}{
+				}},
+				{"body_type", map[string]interface{}{
 					"type":        "string",
 					"enum":        []string{"json", "form", "multipart", "text", "binary", "none"},
 					"description": "default: none",
-				},
-				"body": map[string]interface{}{
+				}},
+				{"body", map[string]interface{}{
 					"description": "เนื้อหา body ตาม body_type: json→object/array ใดๆ, form/multipart→object ของ field:value string, text→string ดิบ, binary→string base64, none→ไม่ต้องใส่",
-				},
-				"multipart_files": map[string]interface{}{
+				}},
+				{"multipart_files", map[string]interface{}{
 					"type":        "array",
 					"items":       map[string]interface{}{"type": "string"},
 					"description": "รายการ path ไฟล์ในเครื่อง (ต้องอยู่ใต้ current directory) ที่จะแนบเป็น multipart file field - ใช้ได้เฉพาะ body_type=multipart",
-				},
+				}},
 			},
 			"required": []string{},
 		},
