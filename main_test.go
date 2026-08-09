@@ -44,27 +44,156 @@ import (
 // coding_test.go
 // ======================================================================
 
-func TestValidateCommandAllowsAnyBinary(t *testing.T) {
+func TestValidateCommandAllowsOrdinaryBuildTestCommands(t *testing.T) {
 	if err := validateCommand("go build ./..."); err != nil {
 		t.Fatalf("expected command to pass, got error: %v", err)
 	}
 	if err := validateCommand("go build ./... && go test ./..."); err != nil {
 		t.Fatalf("expected chained commands to pass, got error: %v", err)
 	}
-	// run_command has no allowlist or denylist: anything non-empty passes
-	// validateCommand - it's the model's/operator's own responsibility, not
-	// ola's, to decide what's safe to run.
-	if err := validateCommand("rm -rf /tmp/some-dir"); err != nil {
-		t.Fatalf("expected unrestricted command to pass, got error: %v", err)
+	if err := validateCommand("go test ./... -run TestFoo -v"); err != nil {
+		t.Fatalf("expected command to pass, got error: %v", err)
 	}
-	if err := validateCommand("curl http://example.com"); err != nil {
-		t.Fatalf("expected unrestricted command to pass, got error: %v", err)
+	// A URL's "://" must not be mistaken for a local absolute path (see
+	// absolutePathPattern's doc comment) - otherwise run_command would be
+	// unusable for anything that fetches a dependency or clones a repo.
+	if err := validateCommand("curl -fsSL https://example.com/install.sh"); err != nil {
+		t.Fatalf("expected a command referencing a URL to pass, got error: %v", err)
+	}
+	if err := validateCommand("go get github.com/some/module"); err != nil {
+		t.Fatalf("expected command to pass, got error: %v", err)
 	}
 }
 
 func TestValidateCommandRejectsEmpty(t *testing.T) {
 	if err := validateCommand("   "); err == nil {
 		t.Fatal("expected empty command to be rejected")
+	}
+}
+
+// TestValidateCommandRejectsDenylistedCommands confirms run_command refuses
+// a short list of filesystem-destructive/host-wide commands outright,
+// unconditionally, in both "ask" and "coding" - see blockedCommandWords.
+func TestValidateCommandRejectsDenylistedCommands(t *testing.T) {
+	denied := []string{
+		"rm -rf /tmp/some-dir",
+		"rm file.txt",
+		"rmdir emptydir",
+		"dd if=/dev/zero of=/dev/sda",
+		"shred -u secret.txt",
+		"mkswap /dev/sdb1",
+		"mkfs.ext4 /dev/sdb1",
+		"shutdown -h now",
+		"reboot",
+		"poweroff",
+		"mount /dev/sdb1 /mnt",
+		"umount /mnt",
+		"sudo apt-get install foo",
+		"su root",
+		"passwd",
+		"useradd bob",
+		"iptables -F",
+		"killall node",
+		"pkill -f server",
+		"crontab -r",
+	}
+	for _, cmd := range denied {
+		if err := validateCommand(cmd); err == nil {
+			t.Fatalf("expected %q to be rejected by the denylist, but it passed", cmd)
+		}
+	}
+}
+
+// TestValidateCommandAllowsPlainKill confirms plain "kill" (stopping a pid
+// this session started, e.g. a dev server) is NOT denylisted, unlike
+// "killall"/"pkill" which act by name across the whole host - see
+// blockedCommandWords' doc comment for the reasoning.
+func TestValidateCommandAllowsPlainKill(t *testing.T) {
+	if err := validateCommand("kill 12345"); err != nil {
+		t.Fatalf("expected plain kill to be allowed, got error: %v", err)
+	}
+}
+
+// TestValidateCommandRejectsDenylistedCommandWhenChained confirms the
+// denylist check applies to every "&&"/"||"/";"/"|"-separated segment of
+// the command, not just the first one - a chained
+// "go build ./... && rm -rf ." must still be caught even though
+// "go build ./..." alone is fine.
+func TestValidateCommandRejectsDenylistedCommandWhenChained(t *testing.T) {
+	chained := []string{
+		"go build ./... && rm -rf .",
+		"echo hi; sudo reboot",
+		"go test ./... || killall go",
+		"go build ./... | tee build.log && shutdown -h now",
+	}
+	for _, cmd := range chained {
+		if err := validateCommand(cmd); err == nil {
+			t.Fatalf("expected chained command %q to be rejected because of its denylisted segment", cmd)
+		}
+	}
+}
+
+// TestValidateCommandSkipsLeadingEnvAssignments confirms a denylisted
+// command isn't missed just because it's prefixed with "VAR=value" shell
+// environment assignments, and that ordinary env-prefixed commands still
+// pass.
+func TestValidateCommandSkipsLeadingEnvAssignments(t *testing.T) {
+	if err := validateCommand("FOO=1 BAR=2 rm -rf ."); err == nil {
+		t.Fatal("expected env-prefixed rm to still be rejected")
+	}
+	if err := validateCommand("CGO_ENABLED=0 go build ./..."); err != nil {
+		t.Fatalf("expected env-prefixed allowed command to pass, got error: %v", err)
+	}
+}
+
+// TestValidateCommandRejectsParentDirectoryTraversal confirms any ".." path
+// segment in the command is rejected, since it could walk the command
+// outside the working directory - while Go's "./..." recursive-package
+// ellipsis (extremely common in this tool's own build/test commands) must
+// NOT be mistaken for it.
+func TestValidateCommandRejectsParentDirectoryTraversal(t *testing.T) {
+	traversals := []string{
+		"cat ../../etc/passwd",
+		"cd ..",
+		"ls ..",
+		"cat ./../secret.txt",
+	}
+	for _, cmd := range traversals {
+		if err := validateCommand(cmd); err == nil {
+			t.Fatalf("expected %q to be rejected for walking outside the working directory", cmd)
+		}
+	}
+	if err := validateCommand("go build ./..."); err != nil {
+		t.Fatalf(`expected "./..." to NOT be treated as parent traversal, got error: %v`, err)
+	}
+	if err := validateCommand("go vet ./... && gofmt -l ."); err != nil {
+		t.Fatalf(`expected "./..." chained with other commands to still pass, got error: %v`, err)
+	}
+}
+
+// TestValidateCommandRejectsAbsolutePathOutsideWorkingDirectory confirms an
+// absolute path pointing outside the current directory is rejected, while
+// one that resolves inside it (or a standard I/O device path like
+// /dev/null) is allowed.
+func TestValidateCommandRejectsAbsolutePathOutsideWorkingDirectory(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	if err := validateCommand("cat /etc/passwd"); err == nil {
+		t.Fatal("expected an absolute path outside the working directory to be rejected")
+	}
+	if err := validateCommand("go build -o /tmp/out ./..."); err == nil {
+		t.Fatal("expected an absolute output path outside the working directory to be rejected")
+	}
+	if err := validateCommand("echo hi > /dev/null 2>&1"); err != nil {
+		t.Fatalf("expected /dev/null redirection to be allowed, got error: %v", err)
+	}
+	if err := validateCommand("cat " + filepath.Join(dir, "notes.txt")); err != nil {
+		t.Fatalf("expected an absolute path inside the working directory to be allowed, got error: %v", err)
 	}
 }
 
@@ -3435,8 +3564,8 @@ func TestDispatchToolCallReadSkillViaExtra(t *testing.T) {
 // read_skill is somehow called without skills actually being configured
 // (e.g. an "extra" wired the same way ask/coding do, but skillsCfg is
 // empty), it falls through to "unknown tool" instead of a confusing
-// success/failure from an empty skill list - matching how run_command/
-// web_search behave when their own feature isn't enabled.
+// success/failure from an empty skill list - matching how web_search
+// behaves when its own feature isn't enabled.
 func TestDispatchToolCallReadSkillUnavailableWhenDisabled(t *testing.T) {
 	var skillsCfg skillsConfig // zero value: disabled
 
@@ -3533,7 +3662,7 @@ func TestCmdAskReadSkillEndToEnd(t *testing.T) {
 // TestCmdAskWithoutSkillsDirNeverOffersReadSkill confirms a completely
 // ordinary session (no --skills-dir/OLA_SKILLS_DIR at all) never even
 // advertises read_skill - skills must stay entirely invisible/inert unless
-// explicitly configured, same principle as run_command/web_search.
+// explicitly configured, same principle as web_search/web_fetch.
 func TestCmdAskWithoutSkillsDirNeverOffersReadSkill(t *testing.T) {
 	workDir := t.TempDir()
 	origWD, _ := os.Getwd()
@@ -3728,11 +3857,13 @@ func main() {
 //  4. gives another plain final answer - expecting verify to now pass and
 //     the session to end successfully
 //
-// This exercises the new "ask" auto-verify gate end-to-end: conditional
-// run_command tool exposure, filesChanged tracking, the independent
-// build/test re-check after a plain final answer (never trusting the
-// model's own claim that a change works), and clean loop termination once
-// verification actually passes.
+// This exercises the "ask" auto-verify gate end-to-end: filesChanged
+// tracking, the independent build/test re-check after a plain final
+// answer (never trusting the model's own claim that a change works), and
+// clean loop termination once verification actually passes. run_command
+// itself is always in the tool list regardless of this gate (see
+// runCommandTool) - what's being exercised here is ola's own automatic
+// re-check, not whether the model could call run_command at all.
 // TestCmdAskVerifyDisabledForNonCodeFileEdit is the regression test for the
 // "vibe coding" bug: editing a plain-text/doc file inside a directory that
 // happens to have a detected toolchain (here: a go.mod) must NOT trigger
@@ -3802,6 +3933,111 @@ func TestCmdAskVerifyDisabledForNonCodeFileEdit(t *testing.T) {
 	}
 	if !strings.Contains(string(log), "[verify-skip]") {
 		t.Fatalf("expected a '[verify-skip] ...' note explaining why verify was skipped, got:\n%s", log)
+	}
+}
+
+// TestCmdAskRunCommandAlwaysAvailable confirms run_command is offered to
+// the model, and actually executes, in a plain directory with no detected
+// build/test toolchain at all (no go.mod/package.json/etc.) - the core
+// behavior this test locks in: run_command is unconditional, unlike ola's
+// own auto-verify pass (see TestCmdAskAutoVerifyLoop) which stays gated
+// behind a detected toolchain.
+func TestCmdAskRunCommandAlwaysAvailable(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	var round int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&round, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		switch n {
+		case 1:
+			fmt.Fprint(w, streamLine("", "run_command", `{"command":"echo hello"}`, true))
+		default:
+			fmt.Fprint(w, streamLine("รันคำสั่งเรียบร้อยครับ", "", "", true))
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdAsk([]string{"-m", "mock-model", "-o", "ask-runcmd.log", "run echo hello for me"})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdAsk to exit 0, got %d", exitCode)
+	}
+	if got := atomic.LoadInt32(&round); got != 2 {
+		t.Fatalf("expected exactly 2 rounds (run_command, final answer), got %d", got)
+	}
+
+	log, err := os.ReadFile("ask-runcmd.log")
+	if err != nil {
+		t.Fatalf("expected output log to exist: %v", err)
+	}
+	if !strings.Contains(string(log), "[tool_call] run_command") {
+		t.Fatalf("expected a run_command tool_call entry in the log even without a detected toolchain, got:\n%s", log)
+	}
+	if strings.Contains(string(log), "ไม่รู้จัก tool") {
+		t.Fatalf("expected run_command to be recognized (not \"unknown tool\") without a detected toolchain, got:\n%s", log)
+	}
+	if !strings.Contains(string(log), "exit_code=0") {
+		t.Fatalf("expected run_command to actually execute and report a successful exit code, got:\n%s", log)
+	}
+}
+
+// TestCmdAskRunCommandRejectsDenylistedCommand confirms a denylisted
+// command (e.g. rm) is refused - the error is fed back to the model as a
+// tool result instead of either running it or the tool being unavailable.
+func TestCmdAskRunCommandRejectsDenylistedCommand(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+	if err := os.WriteFile("keep.txt", []byte("do not delete me\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var round int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&round, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		switch n {
+		case 1:
+			fmt.Fprint(w, streamLine("", "run_command", `{"command":"rm -rf ."}`, true))
+		default:
+			fmt.Fprint(w, streamLine("ขอโทษครับ ทำไม่ได้", "", "", true))
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdAsk([]string{"-m", "mock-model", "-o", "ask-runcmd-denied.log", "delete everything here"})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdAsk to exit 0, got %d", exitCode)
+	}
+
+	if _, err := os.Stat("keep.txt"); err != nil {
+		t.Fatalf("expected keep.txt to survive the denylisted rm attempt: %v", err)
+	}
+
+	log, err := os.ReadFile("ask-runcmd-denied.log")
+	if err != nil {
+		t.Fatalf("expected output log to exist: %v", err)
+	}
+	if !strings.Contains(string(log), "ปฏิเสธคำสั่งนี้") {
+		t.Fatalf("expected the denylist rejection message to be fed back to the model, got:\n%s", log)
 	}
 }
 
@@ -4143,7 +4379,8 @@ func TestCmdAskSCPCopyEndToEnd(t *testing.T) {
 // TestCmdAskSCPCopyNotOfferedWithoutConfig confirms a plain session (no
 // --scp-hosts/OLA_SCP_HOSTS) never even sees scp_copy in its tool list -
 // the same "only offer what's actually configured" principle web_search/
-// skills/run_command already follow.
+// skills already follow (run_command is the one tool that's always on
+// regardless - see runCommandTool).
 func TestCmdAskSCPCopyNotOfferedWithoutConfig(t *testing.T) {
 	dir := t.TempDir()
 	origWD, _ := os.Getwd()

@@ -1,6 +1,6 @@
 # ola
 
-**ola** เป็น CLI (คำสั่งเดียว, ไบนารีเดียว, เขียนด้วย Go ล้วน ไม่พึ่งพา `curl`/`jq`/`perl`/`base64` ภายนอก) สำหรับคุยกับ LLM ผ่าน Ollama (หรือ endpoint แบบ OpenAI-compatible ใดก็ได้) พร้อม **tool calling ที่เปิดใช้งานเสมอ** — โมเดลไม่ได้แค่ตอบข้อความ แต่ *อ่าน/เขียน/แก้ไฟล์จริงบนดิสก์*, ค้นเว็บ, เรียก API, โอนไฟล์ข้าม host, และถามคุณกลับเมื่อจำเป็น ทั้งหมดนี้ sandbox อยู่ใน current directory ที่คุณรัน `ola` เท่านั้น
+**ola** เป็น CLI (คำสั่งเดียว, ไบนารีเดียว, เขียนด้วย Go ล้วน ไม่พึ่งพา `curl`/`jq`/`perl`/`base64` ภายนอก) สำหรับคุยกับ LLM ผ่าน Ollama (หรือ endpoint แบบ OpenAI-compatible ใดก็ได้) พร้อม **tool calling ที่เปิดใช้งานเสมอ** — โมเดลไม่ได้แค่ตอบข้อความ แต่ *อ่าน/เขียน/แก้ไฟล์จริงบนดิสก์*, รันคำสั่ง shell, ค้นเว็บ, เรียก API, โอนไฟล์ข้าม host, และถามคุณกลับเมื่อจำเป็น ทั้งหมดนี้ sandbox อยู่ใน current directory ที่คุณรัน `ola` เท่านั้น
 
 โปรเจกต์นี้มีสองคำสั่งย่อย:
 
@@ -166,7 +166,7 @@ Usage: ola ask [options] <prompt> [files...]
        ola ask [options] -f <prompt-file> [files...]
 ```
 
-### Tool พื้นฐาน 8 ตัว (มีเสมอ ไม่มีเงื่อนไข)
+### Tool พื้นฐาน 9 ตัว (มีเสมอ ไม่มีเงื่อนไข)
 
 | Tool | หน้าที่ |
 |---|---|
@@ -178,18 +178,27 @@ Usage: ola ask [options] <prompt> [files...]
 | `ask_user` | หยุดรอถามผู้ใช้ผ่าน stdin |
 | `get_current_time` | เวลาจริงจากระบบ ระบุ IANA timezone ได้ |
 | `delay` | หยุดรอตามระยะเวลารูปแบบ `XdXhXmXs` (สูงสุด 24 ชม./ครั้ง) |
+| `run_command` | รันคำสั่ง shell ใด ๆ จาก current directory — เปิดเสมอ ไม่ขึ้นกับ toolchain หรือ flag ใด ๆ แต่ทุกคำสั่งต้องผ่าน denylist และขอบเขต working-directory-only ก่อน (ดู [กลไก run_command](#กลไก-run_command-เปิดเสมอ)) |
 
 ### Tool แบบมีเงื่อนไข (เปิดเมื่อ config ตรงเงื่อนไขเท่านั้น)
 
-- **`run_command`** — เปิดอัตโนมัติเมื่อเจอ toolchain ที่รู้จักใน current directory (`go.mod`, `package.json`, `Cargo.toml`, `pyproject.toml`/`requirements.txt`/`setup.py`, `Makefile`) และไม่ได้ปิดด้วย `-V/--no-verify`
 - **`web_search`** / **`web_fetch`** — `web_fetch` เปิดเสมอ, `web_search` เปิดเมื่อ config backend ใดบ้างหนึ่ง (ดู [Web search](#web-search--web-fetch))
 - **`read_skill`** — เปิดเมื่อตั้ง `--skills-dir`/`OLA_SKILLS_DIR` (ดู [Skills](#skills-system))
 - **`scp_copy`** — เปิดเมื่อตั้ง `--scp-hosts`/`OLA_SCP_HOSTS`
 - **`api_request`** — เปิดเมื่อตั้ง `--api-endpoints`/`OLA_API_ENDPOINTS` หรือ `--api-allow-direct-url`
 
-### กลไก Verify (เปิดอัตโนมัติ)
+### กลไก `run_command` (เปิดเสมอ)
 
-ถ้า current directory มี toolchain ที่รู้จัก ola จะเพิ่ม tool `run_command` ให้โมเดิลใช้ build/test เองระหว่างทาง **และ**ถ้าโมเดิลแก้ไฟล์ (`write_file`/`edit_file`) ในเซสชันนี้ ก่อนตอบจบ ola จะรัน build/test ของโปรเจกต์เองอีกครั้งอย่างอิสระ (ไม่เชื่อคำโมเดิลเปล่า ๆ) ถ้าไม่ผ่านจะป้อนผลลัพธ์กลับให้โมเดิลแก้ต่อ **สูงสุด 3 รอบ** ก่อนหยุดให้ผู้ใช้ตรวจสอบเอง — trigger เฉพาะเมื่อไฟล์ที่แก้เป็น source file ของ toolchain จริง ๆ (แก้ `.md`/`.txt` ไม่ trigger) ปิดทั้งหมดได้ด้วย `-V/--no-verify`
+`run_command` อยู่ในรายการ tool เสมอ ไม่ว่า current directory จะมี toolchain ที่รู้จักหรือไม่ และไม่ขึ้นกับ `-V/--no-verify` — flag นั้นคุมเฉพาะกลไก auto-verify ด้านล่าง ไม่ใช่ตัว `run_command` เอง ทุกคำสั่งที่โมเดิลส่งเข้ามาต้องผ่าน 2 ชั้นตรวจสอบก่อนรันจริงทุกครั้ง:
+
+1. **Denylist** — คำสั่งที่ทำลายไฟล์ระบบหรือมีผลกว้างระดับ host ถูกปฏิเสธเสมอ: `rm`, `rmdir`, `dd`, `shred`, `wipefs`, `mkswap`, `fdisk`, `parted`, `format`, `mkfs*`, `shutdown`, `reboot`, `poweroff`, `halt`, `init`, `mount`, `umount`, `systemctl`, `service`, `sudo`, `su`, `doas`, `passwd`, `useradd`/`userdel`/`usermod`, `groupadd`/`groupdel`, `visudo`, `iptables`/`ip6tables`, `ufw`, `firewall-cmd`, `killall`, `pkill`, `crontab` — ตรวจทุก segment ที่คั่นด้วย `&&`/`||`/`;`/`|` ไม่ใช่แค่คำสั่งแรก (เช่น `go build ./... && rm -rf .` ก็ถูกบล็อก) `kill` เฉย ๆ (ไม่ใช่ `killall`/`pkill`) ยังใช้ได้ปกติ เพราะเป็นการหยุด process ที่ session นี้เองสั่งรันไว้
+2. **ขอบเขต working directory** — ห้ามอ้างอิง absolute path ที่อยู่นอก current directory (ยกเว้น `/dev/null`/`/dev/zero`/`/dev/stdin`/`/dev/stdout`/`/dev/stderr`/`/dev/urandom`/`/dev/random` ซึ่งเป็น I/O target มาตรฐาน) และห้ามใช้ `..` หลุดออกนอก directory — URL อย่าง `https://...` ไม่นับเป็น absolute path จึงยังเรียก `curl`/`git clone`/`go get` ได้ตามปกติ
+
+ทั้งสองชั้นเป็นการตรวจ **แบบ text/regex เท่านั้น ไม่ใช่ sandbox จริง** (มองทะลุ command substitution `$(...)`/`` `...` `` หรือ script ที่ถูกเรียกโดยชื่อไม่ได้) — ออกแบบมาเพื่อกันความผิดพลาดที่พบบ่อยและเสียหายมาก (`rm -rf` พลาด, absolute path หลุด, `cd ..` หลงทาง) ไม่ใช่การการันตีความปลอดภัยสมบูรณ์ต่ออินพุตที่จงใจหลบเลี่ยง
+
+### กลไก Auto-verify หลังแก้โค้ด (เปิดอัตโนมัติ, ปิดได้ด้วย `-V/--no-verify`)
+
+แยกจากเรื่อง `run_command` ด้านบนโดยสิ้นเชิง (`run_command` เปิดเสมอไม่ว่า flag นี้จะเป็นอย่างไร) — ถ้า current directory มี toolchain ที่รู้จัก (`go.mod`, `package.json`, `Cargo.toml`, `pyproject.toml`/`requirements.txt`/`setup.py`, `Makefile`) **และ**โมเดิลแก้ไฟล์ (`write_file`/`edit_file`) ในเซสชันนี้ ก่อนตอบจบ ola จะรัน build/test ของโปรเจกต์เองอีกครั้งอย่างอิสระ (ไม่เชื่อคำโมเดิลเปล่า ๆ) ถ้าไม่ผ่านจะป้อนผลลัพธ์กลับให้โมเดิลแก้ต่อ **สูงสุด 3 รอบ** ก่อนหยุดให้ผู้ใช้ตรวจสอบเอง — trigger เฉพาะเมื่อไฟล์ที่แก้เป็น source file ของ toolchain จริง ๆ (แก้ `.md`/`.txt` ไม่ trigger) ถ้าไม่มี toolchain ที่รู้จัก หรือใช้ `-V/--no-verify` จะไม่มี auto-verify รอบนี้เลย (โมเดิลยังเรียก `run_command` เองได้ตามปกติ เพียงแต่ ola จะไม่ auto-verify ซ้ำให้)
 
 ### ตัวเลือกทั้งหมด
 
@@ -207,7 +216,7 @@ Usage: ola ask [options] <prompt> [files...]
   -r, --raw             ไม่ใส่ separator ระหว่างไฟล์แนบ
   -f, --prompt-file <f> อ่าน prompt จากไฟล์แทนพิมพ์เป็น argument
   -n, --dry-run         แสดง JSON payload รอบแรก + system prompt โดยไม่เรียก API จริง
-  -V, --no-verify       ปิดการ verify อัตโนมัติทั้งหมด
+  -V, --no-verify       ปิด auto-verify หลังแก้โค้ด (ไม่มีผลต่อ run_command เอง — เปิดใช้งานเสมอไม่ว่าจะตั้ง flag นี้หรือไม่)
       --cmd-timeout <sec>       timeout ต่อ run_command หนึ่งครั้ง (default: 60)
       --ollama-search-key <k>  เปิด web_search ผ่าน Ollama hosted API
       --searxng-url <u>        เปิด web_search ผ่าน SearXNG (ชนะ Ollama key ถ้าตั้งคู่กัน)
@@ -279,9 +288,9 @@ Usage: ola coding [options]
 
 คำสั่งย่อยสำหรับรันแบบ **ไม่มีคนเฝ้า**: ไม่มี prompt จาก user โดยตรง แต่อ่านไฟล์ requirements (default `requirements.md`) แล้ววางแผนเป็น task checklist → implement → เรียก build/test ของโปรเจกต์เอง → วนแก้จนกว่าจะผ่านจริง → รายงานผล
 
-### Tool เพิ่มเติม (นอกเหนือจาก 8 ตัวของ `ask`)
+### Tool เพิ่มเติม (นอกเหนือจาก 9 ตัวของ `ask` ซึ่งรวม `run_command` อยู่แล้ว)
 
-`add_tasks`, `mark_task_done`, `run_command` (ไม่มี allowlist), `self_review_requirements`, `report_complete` — รวมถึง `web_fetch`/`web_search`/`api_request`/`read_skill` แบบมีเงื่อนไขเหมือน `ask` ทุกประการ
+`add_tasks`, `mark_task_done`, `self_review_requirements`, `report_complete` — รวมถึง `web_fetch`/`web_search`/`api_request`/`read_skill` แบบมีเงื่อนไขเหมือน `ask` ทุกประการ `run_command` ใช้กฎเดียวกับที่อธิบายไว้ใน [กลไก run_command](#กลไก-run_command-เปิดเสมอ) ทุกประการ — denylist + working-directory-only เหมือนกันทั้งสองคำสั่งย่อย
 
 ### กลไกคุมคุณภาพ 5 ชั้น (default เข้มงวดที่สุด ปรับได้ด้วย flag)
 
@@ -620,7 +629,7 @@ go test -run TestCodingQuietMode -v ./...
 
 ## ข้อจำกัด/สิ่งที่ควรรู้
 
-- **ไม่มี binary allowlist สำหรับ `run_command`** — มันรันคำสั่ง shell ใด ๆ ที่โมเดิลขอได้ ใช้ให้เหมาะกับความไว้ใจที่มีต่อโมเดิล/งานที่ทำ
+- **`run_command` ไม่ใช่ sandbox จริง** — denylist และขอบเขต working-directory-only (ดู [กลไก run_command](#กลไก-run_command-เปิดเสมอ)) เป็นการตรวจแบบ text/regex เท่านั้น ป้องกันความผิดพลาดที่พบบ่อยและเสียหายมาก ไม่ใช่การรับประกันความปลอดภัยสมบูรณ์ต่ออินพุตที่จงใจหลบเลี่ยง (เช่น command substitution หรือ script ที่ถูกเรียกโดยชื่อ) — ใช้ให้เหมาะกับความไว้ใจที่มีต่อโมเดิล/งานที่ทำ
 - **`ask_user` ต้องมี stdin เป็น terminal จริง** — ใช้กับ script/cron/pipe (non-interactive) ไม่ได้ ถ้าโมเดิลเรียกจะได้ error แทน (ดี สำหรับ `ola coding` ที่ตั้งใจรันแบบไม่มีคนเฝ้า เพราะมันจะเลือก assumption เองแทนการค้างรอ)
 - **Tool-calling loop มีเพดาน** — `ola ask` สูงสุด 25 รอบ, `ola coding` สูงสุด 300 รอบ (`--max-iterations`) หรือ 3 ชม. (`--max-duration`) แล้วแต่อันไหนถึงก่อน
 - **System prompt แก้จากภายนอกไม่ได้** — ไม่มี `-s/--system` อีกต่อไป ปรับพฤติกรรมได้ผ่าน flag/env ที่มีให้เท่านั้น (หรือแก้ constant ในซอร์สแล้ว build ใหม่)
