@@ -930,6 +930,119 @@ trailer
 }
 
 // ─────────────────────────────────────────────────────────────────
+// PDF discoverability: buildDirectoryTree/search_files/read_file must
+// treat .pdf as "binary but listed" (via alwaysListExts), not "invisible"
+// - otherwise the model has no way to find out a PDF exists at all before
+// calling read_pdf on it.
+// ─────────────────────────────────────────────────────────────────
+
+// TestBuildDirectoryTreeIncludesPDFButNotOtherBinaries confirms a .pdf
+// shows up by name in the auto-injected directory tree despite being
+// binary (so the model can discover it exists and call read_pdf), while a
+// genuinely uninteresting binary like a .png stays excluded exactly as
+// before - alwaysListExts is a narrow, deliberate exception, not a general
+// loosening of the binary filter.
+func TestBuildDirectoryTreeIncludesPDFButNotOtherBinaries(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "report.pdf"), []byte("%PDF-1.4\n...\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "photo.png"), []byte{0x89, 0x50, 0x4E, 0x47}, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	tree, _, _ := buildDirectoryTree(dir)
+	if !strings.Contains(tree, "report.pdf") {
+		t.Fatalf("expected the directory tree to list report.pdf, got:\n%s", tree)
+	}
+	if !strings.Contains(tree, "main.go") {
+		t.Fatalf("expected the directory tree to list main.go, got:\n%s", tree)
+	}
+	if strings.Contains(tree, "photo.png") {
+		t.Fatalf("expected photo.png to stay excluded (only .pdf is special-cased), got:\n%s", tree)
+	}
+}
+
+// TestSearchFilesFindsPDFByPattern confirms an exact "*.pdf" pattern
+// search actually finds a PDF file - before this fix, looksBinaryFile
+// silently excluded it and search_files would report no match even when
+// the file plainly existed.
+func TestSearchFilesFindsPDFByPattern(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+	if err := os.WriteFile("invoice.pdf", []byte("%PDF-1.4\n...\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := toolSearchFiles(map[string]interface{}{"pattern": "*.pdf"})
+	if err != nil {
+		t.Fatalf("expected search_files to succeed, got error: %v", err)
+	}
+	if !strings.Contains(result, "invoice.pdf") {
+		t.Fatalf("expected search_files to find invoice.pdf, got: %q", result)
+	}
+}
+
+// TestSearchFilesDoesNotGrepPDFContent confirms a PDF that matches the
+// filename pattern is still listed, but its raw bytes are never grepped as
+// if they were text lines when a query is also given - grepping binary
+// content would just scan garbage, not real matches.
+func TestSearchFilesDoesNotGrepPDFContent(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+	// The query string is deliberately embedded in the "PDF" bytes - if
+	// search_files grepped it anyway, this would show up as a false hit.
+	if err := os.WriteFile("invoice.pdf", []byte("%PDF-1.4\nTOTAL_DUE\n...\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := toolSearchFiles(map[string]interface{}{"pattern": "*.pdf", "query": "TOTAL_DUE"})
+	if err != nil {
+		t.Fatalf("expected search_files to succeed, got error: %v", err)
+	}
+	if strings.Contains(result, "invoice.pdf:") {
+		t.Fatalf("expected invoice.pdf's content to NOT be grepped (no \"invoice.pdf:N:\" grep-hit line), got: %q", result)
+	}
+	if !strings.Contains(result, "1 ไฟล์") && !strings.Contains(result, "invoice.pdf") {
+		t.Fatalf("expected the result to still acknowledge the matching filename, got: %q", result)
+	}
+}
+
+// TestToolReadFileRejectsPDFWithHelpfulRedirect confirms calling read_file
+// on a .pdf fails fast with a message pointing at read_pdf, instead of
+// dumping the file's raw binary bytes back as if they were text.
+func TestToolReadFileRejectsPDFWithHelpfulRedirect(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+	if err := os.WriteFile("doc.pdf", []byte("%PDF-1.4\n...\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := toolReadFile(map[string]interface{}{"path": "doc.pdf"})
+	if err == nil {
+		t.Fatal("expected read_file to refuse a .pdf path")
+	}
+	if !strings.Contains(err.Error(), "read_pdf") {
+		t.Fatalf("expected the error to point at read_pdf, got: %v", err)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
 // read_pdf tool (toolReadPDF, readPDFFollowUpMessage)
 // ─────────────────────────────────────────────────────────────────
 
@@ -1078,6 +1191,48 @@ func TestReadPDFFollowUpMessageNoOpForOtherToolsOrErrors(t *testing.T) {
 // attached via [files...] at all (the whole point of this tool - see
 // toolReadPDF/readPDFFollowUpMessage), then confirms the NEXT request round
 // actually carries the rendered page images in its message history.
+// TestCmdAskFirstRequestDirectoryTreeIncludesPDF confirms the exact
+// scenario reported: when no [files...] are attached and ola auto-injects
+// the directory tree into the very first request, a .pdf sitting in the
+// current directory shows up in that tree from round 1 - the model does
+// not need an extra search_files round just to find out it exists before
+// it can call read_pdf on it.
+func TestCmdAskFirstRequestDirectoryTreeIncludesPDF(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+	if err := os.WriteFile("invoice.pdf", []byte("%PDF-1.4\n...\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var firstRequestBody string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		if firstRequestBody == "" {
+			body, _ := io.ReadAll(r.Body)
+			firstRequestBody = string(body)
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("มีไฟล์ invoice.pdf ครับ", "", "", true))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdAsk([]string{"-m", "mock-model", "-o", "ask-tree-pdf.log", "โฟลเดอร์นี้มีไฟล์อะไรบ้าง"})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdAsk to exit 0, got %d", exitCode)
+	}
+	if !strings.Contains(firstRequestBody, "invoice.pdf") {
+		t.Fatalf("expected invoice.pdf to appear in the very first request's auto-injected directory tree, got body: %s", firstRequestBody)
+	}
+}
+
 func TestCmdAskReadPDFToolCallAttachesImagesToFollowUpRequest(t *testing.T) {
 	installFakePDFToPPM(t)
 	dir := t.TempDir()

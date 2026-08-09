@@ -358,7 +358,9 @@ what didn't fit). Never assume a file's content, structure, or the
 correctness of a change from its name alone - read it first. If there is no
 directory tree and no attached file content either, call search_files to
 see what actually exists before guessing a path; never invent a filename
-you have not confirmed.
+you have not confirmed. A ".pdf" entry in the tree (or in search_files
+results) is real and was not skipped - open it with read_pdf, not
+read_file (read_file will refuse a .pdf and tell you the same thing).
 
 # SANDBOXING
 All paths are relative to the current working directory ola was started in.
@@ -1388,6 +1390,8 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  - ยกเว้นไฟล์ที่เป็น binary/executable ด้วย: เช็คจาก permission bit ที่ executable ได้ (ครอบคลุม")
 		fmt.Println("    binary ที่ compile แล้วแต่ไม่มีนามสกุล เช่นตัว ola เอง), นามสกุลที่รู้จักว่าเป็น binary")
 		fmt.Println("    (.png .zip .so .exe ฯลฯ), และ fallback ด้วยการเช็ค NUL byte ใน 512 byte แรกของไฟล์")
+		fmt.Println("    (ยกเว้น .pdf: ยังคงแสดงชื่อไฟล์อยู่แม้เป็น binary เพราะมี tool read_pdf อ่านได้ - ดูหัวข้อ")
+		fmt.Println("    กลไกอ่าน PDF - เนื้อหาไม่ถูก grep เป็นข้อความเหมือนไฟล์ binary อื่น)")
 		fmt.Println("  - ถ้าระบุ [files...] มาเอง (แม้แค่ไฟล์เดียว) จะไม่แปะ directory tree ให้ ถือว่าคุณรู้ scope ที่ต้องการแล้ว")
 		fmt.Println()
 		fmt.Println("หมายเหตุ:")
@@ -2264,6 +2268,12 @@ func toolReadFile(args map[string]interface{}) (string, error) {
 	if info.IsDir() {
 		return "", fmt.Errorf("%s เป็น directory ไม่ใช่ไฟล์", path)
 	}
+	// PDFs are binary (see alwaysListExts) - read_file dumping their raw
+	// bytes as "text" would just be garbage and waste context, so redirect
+	// to the tool that actually handles them instead of doing that.
+	if strings.ToLower(filepath.Ext(path)) == ".pdf" {
+		return "", fmt.Errorf("%s เป็นไฟล์ PDF (binary format) - ใช้ tool read_pdf แทน read_file", path)
+	}
 	data, err := os.ReadFile(full)
 	if err != nil {
 		return "", fmt.Errorf("อ่านไฟล์ %s ไม่ได้: %v", path, err)
@@ -2322,8 +2332,25 @@ var binarySkipExts = map[string]bool{
 	".db": true, ".sqlite": true, ".sqlite3": true,
 }
 
-// looksBinaryFile decides whether a file should be excluded from
-// listings/search as binary or executable content:
+// alwaysListExts are binary extensions (still true under looksBinaryFile -
+// they are NOT readable as text and must never be grepped or dumped
+// through read_file) that ola nonetheless keeps visible in the
+// auto-injected directory tree and in search_files' filename matching,
+// because there's a dedicated tool that can actually read them despite
+// being binary: currently just .pdf, via read_pdf. Without this override,
+// a PDF sitting in the project directory would be invisible to the model
+// in both places - the auto-generated tree silently omits it and
+// search_files silently reports "no match" even for an exact "*.pdf"
+// pattern - so the model would only ever find it if the user happened to
+// name the file explicitly. See buildDirectoryTree/toolSearchFiles for
+// where this is applied, and toolReadFile for the complementary guard
+// that redirects a mistaken read_file call on a .pdf to read_pdf instead.
+var alwaysListExts = map[string]bool{".pdf": true}
+
+// looksBinaryFile decides whether a file is unreadable as text (not
+// whether it should be excluded from a listing - callers that want a file
+// like a .pdf to still show up by name despite being binary should check
+// alwaysListExts themselves; see buildDirectoryTree/toolSearchFiles):
 //  1. Any executable permission bit set (covers compiled Go/Rust/C binaries,
 //     which very often have no file extension on Linux at all - e.g. the
 //     "ola" binary itself).
@@ -2395,7 +2422,15 @@ func toolSearchFiles(args map[string]interface{}) (string, error) {
 		if !ok {
 			return nil
 		}
-		if looksBinaryFile(p, info) {
+		// binary gates both "list this filename at all" and "grep its
+		// content below" - but alwaysListExts (currently just .pdf, via
+		// read_pdf) overrides ONLY the listing half: the filename still
+		// shows up in matches so the model can find it (e.g. an exact
+		// "*.pdf" pattern search), but its content is never grepped as
+		// text, since that would just scan raw binary bytes for a query
+		// match and produce noise, not real hits.
+		binary := looksBinaryFile(p, info)
+		if binary && !alwaysListExts[strings.ToLower(filepath.Ext(info.Name()))] {
 			return nil
 		}
 		rel, relErr := filepath.Rel(cwd, p)
@@ -2403,7 +2438,7 @@ func toolSearchFiles(args map[string]interface{}) (string, error) {
 			rel = p
 		}
 		matches = append(matches, rel)
-		if query != "" {
+		if query != "" && !binary {
 			data, readErr := os.ReadFile(p)
 			if readErr == nil {
 				for i, line := range strings.Split(string(data), "\n") {
@@ -2461,9 +2496,12 @@ type treeEntry struct {
 
 // buildDirectoryTree walks root recursively (every level, not just the top),
 // skipping directories in skipDirNames and omitting binary/executable files
-// (via looksBinaryFile), and renders the result as an indented tree. It
-// returns the rendered text, whether it was truncated by maxTreeEntries, and
-// the total entry count actually included.
+// (via looksBinaryFile) - except extensions in alwaysListExts (currently
+// just .pdf, readable via read_pdf despite being binary), which stay
+// listed by name so the model can discover they exist at all - and renders
+// the result as an indented tree. It returns the rendered text, whether it
+// was truncated by maxTreeEntries, and the total entry count actually
+// included.
 func buildDirectoryTree(root string) (string, bool, int) {
 	var entries []treeEntry
 	truncated := false
@@ -2490,7 +2528,7 @@ func buildDirectoryTree(root string) (string, bool, int) {
 			}
 			return nil
 		}
-		if looksBinaryFile(p, info) {
+		if looksBinaryFile(p, info) && !alwaysListExts[strings.ToLower(filepath.Ext(info.Name()))] {
 			return nil
 		}
 		entries = append(entries, treeEntry{relPath: rel, isDir: false})
@@ -5232,7 +5270,9 @@ guessing:
 
 # WORKFLOW
 1. Read the requirements file and look over the repository (search_files /
-   read_file, and the auto-generated directory tree if present).
+   read_file, and the auto-generated directory tree if present). A ".pdf"
+   entry in either (e.g. a spec or design doc) is real, not omitted - open
+   it with read_pdf, not read_file.
 2. If genuinely ambiguous requirements would change your implementation
    approach, ask_user once per open question - don't guess silently on
    decisions that are hard to reverse later, but don't ask about things you

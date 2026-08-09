@@ -82,7 +82,7 @@ ola ask "สรุปไฟล์นี้ให้หน่อย" README.md
 ola ask -m qwen3.6:27b "review โค้ดนี้ให้หน่อย" main.py
 ```
 
-ถ้าไม่แนบไฟล์ใด ๆ เลย ola จะสแกน current directory ทั้งหมด (recursive, ยกเว้น `.git`/`node_modules`/`vendor`/build artifact ต่าง ๆ) แล้วแปะ directory tree เข้า prompt แรกให้อัตโนมัติ โมเดิลจะเห็น scope ของโปรเจกต์ทันทีโดยไม่ต้องเสีย tool-call รอบแรกไปกับการ `search_files('*')` สำรวจเปล่า ๆ:
+ถ้าไม่แนบไฟล์ใด ๆ เลย ola จะสแกน current directory ทั้งหมด (recursive, ยกเว้น `.git`/`node_modules`/`vendor`/build artifact ต่าง ๆ และไฟล์ binary ส่วนใหญ่ — แต่ `.pdf` ยังโผล่ในรายชื่อ เพราะมี tool `read_pdf` อ่านได้ ดู [กลไกอ่าน PDF](#กลไกอ่าน-pdf)) แล้วแปะ directory tree เข้า prompt แรกให้อัตโนมัติ โมเดิลจะเห็น scope ของโปรเจกต์ทันทีโดยไม่ต้องเสีย tool-call รอบแรกไปกับการ `search_files('*')` สำรวจเปล่า ๆ:
 
 ```bash
 cd ~/projects/my-api
@@ -252,6 +252,8 @@ Usage: ola ask [options] <prompt> [files...]
 
 1. **แนบผ่าน `[files...]` ตอนเริ่มเซสชัน** (ดูหัวข้อด้านบน) — เหมาะกับไฟล์ที่รู้อยู่แล้วว่าต้องใช้ตั้งแต่ต้น
 2. **tool `read_pdf(path)`** — โมเดิลเรียกได้เอง**ระหว่าง**เซสชัน สำหรับไฟล์ PDF ที่เพิ่งเจอระหว่างทำงาน (เช่นจาก `search_files`, จาก directory listing, หรือผู้ใช้แค่พิมพ์ชื่อไฟล์มาเฉย ๆ โดยไม่ได้แนบ) อยู่ใน [Tool พื้นฐาน 10 ตัว](#tool-พื้นฐาน-10-ตัว-มีเสมอ-ไม่มีเงื่อนไข) เสมอ ไม่ต้องตั้งค่าอะไรเพิ่ม path ที่รับเป็น relative กับ current directory และ sandbox เดียวกับ `read_file`/`write_file` (path ที่หลุดออกนอก current directory จะถูกปฏิเสธ) ผลลัพธ์ของ `read_pdf` ตัว string จะบอกแค่จำนวนหน้าที่แปลงได้ — **ภาพจริงจะมาในข้อความถัดไป** (ola แทรก message แบบ `role: "user"` ต่อท้ายให้อัตโนมัติ ไม่ได้แนบอยู่ใน tool result โดยตรง เพราะ tool-result message ไม่ใช่ที่ที่รับประกันว่าภาพจะไปถึงโมเดลได้ในทุก provider)
+
+`.pdf` ยังคงเป็น binary ในสายตาของ `looksBinaryFile` (ไม่ถูกอ่านเป็นข้อความหรือ grep เนื้อหา) แต่**ถูกยกเว้นไว้ให้ยังแสดงชื่อไฟล์**ทั้งใน directory tree ที่แปะเข้า prompt แรกอัตโนมัติ และผลลัพธ์ของ `search_files` (ไม่เหมือนไฟล์ binary อื่นอย่าง `.png`/`.zip` ที่ถูกซ่อนไปเลย) — เพื่อให้โมเดิลรู้ว่ามี PDF อยู่ตั้งแต่ต้น ไม่ต้องเดาหรือให้ผู้ใช้บอกชื่อไฟล์ก่อนถึงจะเรียก `read_pdf` ได้ ถ้าโมเดิลพลาดเรียก `read_file` กับไฟล์ `.pdf` เข้า จะได้ error แนะนำให้ไปใช้ `read_pdf` แทนทันที
 
 `ola` ไม่มีตัวอ่าน PDF ในตัว (Go standard library ไม่มี) จึงเรียกโปรแกรมภายนอก **`pdftoppm`** (จาก poppler-utils) มาแปลงแต่ละหน้าของ PDF เป็นภาพ PNG ก่อนแนบเข้า request แบบเดียวกับไฟล์รูปทั่วไป — เหตุผลที่เลือกแปลงเป็น **ภาพ** แทนการดึงข้อความ (text extraction):
 
