@@ -47,8 +47,14 @@
 //	                 sudo, mount, ...) is always rejected, and the command
 //	                 may only reference paths inside the current directory
 //	                 (no absolute paths elsewhere, no ".." walking upward)
+//	read_pdf       - render every page of a PDF (path relative to the
+//	                 current directory) to an image and send them in a
+//	                 follow-up message, unconditionally - not limited to
+//	                 PDFs attached via [files...] at session start; the
+//	                 model can call this on any PDF it comes across mid-
+//	                 session (depends on the external pdftoppm binary)
 //
-// Beyond those nine, several more tools are added conditionally, only when
+// Beyond those ten, several more tools are added conditionally, only when
 // the feature they belong to is actually configured for the session (see
 // "ola ask -h" for the exact conditions of each): web_search/web_fetch
 // (network access), read_skill
@@ -77,8 +83,8 @@
 // "coding" (see coding.go) is a longer-running, requirements-file-driven
 // loop meant to run unattended: instead of a prompt, it reads a
 // requirements.md-style file and works through an implement/verify/fix
-// cycle on its own, using the same nine base tools above (including
-// run_command) plus four more (add_tasks, mark_task_done,
+// cycle on its own, using the same ten base tools above (including
+// run_command and read_pdf) plus four more (add_tasks, mark_task_done,
 // self_review_requirements, report_complete). It has its own
 // system prompt, its own (much higher) iteration cap plus a wall-clock
 // timeout, and a verification gate: report_complete does not end the
@@ -278,6 +284,18 @@ the normal case and only reach for it when it actually applies.
   disk, no ".." walking upward. A rejected call returns an error explaining
   which rule it hit; adjust the command and retry within those bounds
   rather than looking for a way around them.
+- read_pdf(path): always present, in every session. Renders every page of
+  the PDF at path (relative to the current directory, same sandbox as
+  read_file) into an image and sends them to you as a separate message
+  right after this tool's own result - not through this tool's text result
+  itself. Use this whenever you encounter a PDF path during the task (from
+  search_files, a directory listing, or the user just naming a file) that
+  was not already attached to this session - you do not need the user to
+  attach it themselves. Works even on a scanned PDF with no embedded text
+  layer, since you are reading the rendered page images directly rather
+  than extracted text. Page count is capped per session (see the tool
+  result if a document was truncated); depends on the external pdftoppm
+  binary being installed - a clear error comes back if it is not.
 - web_search(queries, max_results?): ONLY present when ola has a web
   search backend configured for this session (opt-in) - either Ollama's
   hosted Web Search API or a local SearXNG instance. Accepts a list, not
@@ -835,6 +853,7 @@ var builtinTools = []ollamaTool{
 		},
 	},
 	runCommandTool, // shared schema, defined below - always on for both "ask" and "coding"
+	readPDFTool,    // shared schema, defined below - always on for both "ask" and "coding"
 }
 
 // runCommandTool is the "run_command" tool schema shared by "ask" and
@@ -962,6 +981,148 @@ func convertPDFToImages(path string, maxPages, dpi int) (pages []string, truncat
 	return pages, len(pages) >= maxPages, nil
 }
 
+// readPDFTool is the "read_pdf" tool schema - unlike the [files...]
+// attachment path above (which only runs once, upfront, for PDFs named on
+// the command line), this lets the model itself trigger the same
+// PDF-to-images conversion at any point mid-session for a PDF it finds
+// along the way (e.g. one turned up by search_files, or one the user
+// mentioned by path without attaching it) - it does not require the file
+// to have been passed as a [files...] argument at all. Shared between
+// "ask" and "coding" the same way runCommandTool is (always in the tool
+// list, part of builtinTools - see toolReadPDF and how its result's images
+// get attached to the resulting tool-role message in cmdAsk/cmdCoding).
+var readPDFTool = ollamaTool{
+	Type: "function",
+	Function: ollamaToolFunction{
+		Name:        "read_pdf",
+		Description: "อ่านไฟล์ PDF จาก path ที่ระบุ (relative กับ current directory, sandbox เดียวกับ read_file) แล้วแปลงแต่ละหน้าเป็นภาพส่งเข้ามาให้ตัวเองอ่านต่อในรอบถัดไป (แบบเดียวกับไฟล์รูปที่แนบ) ใช้เมื่อเจอ path ของไฟล์ PDF ระหว่างทำงาน (เช่นจาก search_files หรือผู้ใช้พิมพ์ชื่อไฟล์มาเฉยๆ โดยไม่ได้แนบไฟล์นั้นมาตอนเริ่มเซสชัน) ใช้ได้แม้เป็น PDF ที่สแกนมา (ไม่มี text layer) เพราะอ่านจากภาพโดยตรง แต่ต้องมีความสามารถ vision ถึงจะใช้ประโยชน์จากภาพที่ได้ - จำกัดจำนวนหน้า/ความละเอียดตาม --pdf-max-pages/--pdf-dpi ของเซสชันนี้",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"path": map[string]interface{}{
+					"type":        "string",
+					"description": "Path ของไฟล์ PDF relative กับ current directory",
+				},
+			},
+			"required": []string{"path"},
+		},
+	},
+}
+
+// readPDFResult is what toolReadPDF stashes into the lastReadPDF
+// side-channel below: the rendered page images plus enough context (path,
+// whether maxPages truncated the document) for the caller to build a
+// sensible synthetic message around them, without needing to re-parse the
+// tool call's raw JSON arguments a second time.
+type readPDFResult struct {
+	Path      string
+	Images    []string
+	Truncated bool
+}
+
+// lastReadPDF is a small side-channel, same shape/reasoning as
+// lastWebSearchItems above: toolReadPDF stashes its result here, and the
+// caller (cmdAsk/cmdCoding's tool-calling loop) pops it right after
+// dispatch - deliberately NOT threaded through the shared extraTools(name,
+// args) (string, error, bool) callback shape, since that shape is shared
+// across every tool dispatched that way and changing it would ripple into
+// every caller for the benefit of exactly this one tool.
+//
+// The images themselves are NOT attached directly onto the role:"tool"
+// result message. Two real backend-compatibility concerns rule that out:
+// (1) OpenAI's chat-completions format (see toOpenAIMessage) only ever
+// gives a tool message a plain string content - there's no documented,
+// widely-supported way to attach the multi-part image content OpenAI-
+// compatible vision requests otherwise use - and (2) even against
+// Ollama's own native /api/chat, images are only ever verified to work
+// attached to a plain user-role message (the same way [files...]
+// attachments already send them - see cmdAsk's imageFiles/pdfFiles
+// handling), not a tool-result message. So instead, the caller appends
+// pages as a SEPARATE, synthetic role:"user" message right after the
+// tool-result message - the one shape guaranteed to work identically on
+// both providers and match how every other image already reaches the
+// model in this codebase.
+var (
+	lastReadPDFMu     sync.Mutex
+	lastReadPDFResult *readPDFResult
+)
+
+func setLastReadPDFResult(r readPDFResult) {
+	lastReadPDFMu.Lock()
+	lastReadPDFResult = &r
+	lastReadPDFMu.Unlock()
+}
+
+// popLastReadPDF returns and clears the most recently completed
+// toolReadPDF call's result, or nil if read_pdf was never invoked (or
+// failed) since the last pop. Callers should only call this immediately
+// after a "read_pdf" dispatch, the same way popLastWebSearchItems is only
+// meaningful right after a web_search dispatch.
+func popLastReadPDF() *readPDFResult {
+	lastReadPDFMu.Lock()
+	defer lastReadPDFMu.Unlock()
+	r := lastReadPDFResult
+	lastReadPDFResult = nil
+	return r
+}
+
+// toolReadPDF implements "read_pdf": resolve path within the same sandbox
+// read_file/write_file use, convert it to page images via
+// convertPDFToImages, and stash the result via setLastReadPDFResult for
+// the caller to turn into a synthetic image-bearing message (see
+// lastReadPDF's doc comment for why it isn't attached directly to this
+// call's own tool-result message). The string return value is only a
+// short human/model-facing status line - the actual page content reaches
+// the model through that follow-up message, not this string.
+func toolReadPDF(args map[string]interface{}, maxPages, dpi int) (string, error) {
+	path, _ := args["path"].(string)
+	full, err := sandboxedPath(path)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(full)
+	if err != nil {
+		return "", fmt.Errorf("ไม่พบไฟล์: %s", path)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("%s เป็น directory ไม่ใช่ไฟล์", path)
+	}
+
+	pages, truncated, err := convertPDFToImages(full, maxPages, dpi)
+	if err != nil {
+		return "", fmt.Errorf("อ่าน PDF %s ไม่สำเร็จ: %v", path, err)
+	}
+
+	setLastReadPDFResult(readPDFResult{Path: path, Images: pages, Truncated: truncated})
+
+	result := fmt.Sprintf("อ่าน PDF %s สำเร็จ: แปลงเป็นภาพ %d หน้า - ภาพจะถูกแนบมาในข้อความถัดไป", path, len(pages))
+	if truncated {
+		result += fmt.Sprintf(" (แปลงเฉพาะ %d หน้าแรก จำกัดด้วย --pdf-max-pages เอกสารอาจมีหน้าเพิ่มเติมที่ไม่ได้แปลง)", maxPages)
+	}
+	return result, nil
+}
+
+// readPDFFollowUpMessage builds the synthetic role:"user" message that
+// carries a successful read_pdf call's rendered pages - see lastReadPDF's
+// doc comment for why this is a separate message rather than images
+// attached to the tool-result message itself. Returns ok=false (nothing
+// to append) when read_pdf wasn't the tool just dispatched, it failed, or
+// somehow produced zero pages.
+func readPDFFollowUpMessage(toolName, result string) (msg ollamaMessage, ok bool) {
+	if toolName != "read_pdf" || strings.HasPrefix(result, "ERROR:") {
+		return ollamaMessage{}, false
+	}
+	r := popLastReadPDF()
+	if r == nil || len(r.Images) == 0 {
+		return ollamaMessage{}, false
+	}
+	note := fmt.Sprintf("ภาพที่แปลงจาก PDF %s (%d หน้า) ตามที่ read_pdf เพิ่งอ่านไป", r.Path, len(r.Images))
+	if r.Truncated {
+		note += " (แปลงเฉพาะหน้าแรกบางส่วนเท่านั้น - ดูรายละเอียดใน tool result ด้านบน)"
+	}
+	return ollamaMessage{Role: "user", Content: note, Images: r.Images}, true
+}
+
 func askUsage(fs *flag.FlagSet) func() {
 	return func() {
 		fmt.Println("Usage: ola ask [options] <prompt> [files...]")
@@ -970,7 +1131,8 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("เรียก Ollama ผ่าน HTTP API (/api/chat) พร้อม streaming + thinking + timing")
 		fmt.Println("และ built-in tool calling ที่เปิดใช้งานเสมอ (ไม่มี flag ปิด/เปิด):")
 		fmt.Println("  read_file, search_files, write_file, edit_file, create_folder, ask_user, get_current_time, delay,")
-		fmt.Println("  run_command (รันคำสั่งใดก็ได้ ยกเว้นที่อยู่ใน denylist - ดูหัวข้อ run_command ด้านล่าง)")
+		fmt.Println("  run_command (รันคำสั่งใดก็ได้ ยกเว้นที่อยู่ใน denylist - ดูหัวข้อ run_command ด้านล่าง),")
+		fmt.Println("  read_pdf (อ่าน PDF จาก path ใดก็ได้ระหว่างทำงาน แปลงเป็นภาพส่งกลับมาให้ - ดูหัวข้อ กลไกอ่าน PDF ด้านล่าง)")
 		fmt.Println("  รวมถึง web_fetch (เปิดอัตโนมัติเสมอ) และ web_search / scp_copy / api_request / read_skill แบบมีเงื่อนไข")
 		fmt.Println("  (ดูหัวข้อ Web search, scp_copy, api_request, Skills ด้านล่าง)")
 		fmt.Println()
@@ -1005,6 +1167,14 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  ทั้งสองชั้นเป็นการตรวจแบบ text/regex เท่านั้น ไม่ใช่ sandbox จริง (ไม่เห็นทะลุ command")
 		fmt.Println("  substitution $(...)/`...` หรือ script ที่ถูกเรียกโดยชื่อ) - ป้องกันความผิดพลาดที่พบบ่อยและ")
 		fmt.Println("  เสียหายมาก ไม่ใช่การการันตีความปลอดภัยสมบูรณ์ต่ออินพุตที่จงใจหลบเลี่ยง")
+		fmt.Println()
+		fmt.Println("read_pdf (เปิดใช้งานเสมอ ไม่มีเงื่อนไข):")
+		fmt.Println("  tool ให้โมเดิลเรียกเองระหว่างเซสชัน (path ใดก็ได้ภายใต้ current directory sandbox เดียวกับ")
+		fmt.Println("  read_file) - คนละเรื่องกับการแนบไฟล์ PDF ผ่าน [files...] ตอนเริ่มเซสชัน (ดูหัวข้อ กลไกอ่าน PDF")
+		fmt.Println("  ด้านล่าง) ใช้เมื่อโมเดิลเจอ path ของ PDF ระหว่างทำงาน (เช่นจาก search_files) โดยไม่ต้องให้ผู้ใช้")
+		fmt.Println("  แนบไฟล์นั้นมาก่อน กลไกแปลงเป็นภาพ, --pdf-max-pages/--pdf-dpi, และ dependency (pdftoppm/")
+		fmt.Println("  poppler-utils) เหมือนกันทุกประการกับการแนบผ่าน [files...] - ภาพที่ได้จะถูกส่งเป็นข้อความถัดไป")
+		fmt.Println("  ให้โมเดิลอ่าน ไม่ได้อยู่ใน tool result string โดยตรง")
 		fmt.Println()
 		fmt.Println("Auto-verify หลังแก้โค้ด (เปิดอัตโนมัติ, ปิดได้ด้วย --no-verify):")
 		fmt.Println("  แยกจากเรื่อง run_command ด้านบนโดยสิ้นเชิง (run_command เปิดเสมอไม่ว่า flag นี้จะเป็นอย่างไร)")
@@ -1532,18 +1702,21 @@ func cmdAsk(args []string) int {
 	// convertPDFToImages's doc comment for why (works even on scanned PDFs
 	// with no embedded text layer, at the cost of depending on the external
 	// pdftoppm binary). --pdf-max-pages/--pdf-dpi follow the same
-	// flag > env > default precedence as every other ola setting.
+	// flag > env > default precedence as every other ola setting, resolved
+	// unconditionally (not just when pdfFiles is non-empty) since the
+	// read_pdf tool below needs them too, regardless of whether any PDF was
+	// attached upfront on the command line.
+	if pdfMaxPages <= 0 {
+		pdfMaxPages = envInt("OLA_PDF_MAX_PAGES", defaultPDFMaxPages)
+	}
+	if pdfDPI <= 0 {
+		pdfDPI = envInt("OLA_PDF_DPI", defaultPDFDPI)
+	}
 	// convertedPDFPages is declared here (rather than inside the if-block
 	// below) so the dry-run summary further down can report it even though
 	// dry-run and the actual conversion are the same code path.
 	var convertedPDFPages int
 	if len(pdfFiles) > 0 {
-		if pdfMaxPages <= 0 {
-			pdfMaxPages = envInt("OLA_PDF_MAX_PAGES", defaultPDFMaxPages)
-		}
-		if pdfDPI <= 0 {
-			pdfDPI = envInt("OLA_PDF_DPI", defaultPDFDPI)
-		}
 		pdfLoadStart := time.Now()
 		for _, f := range pdfFiles {
 			pages, truncated, err := convertPDFToImages(f, pdfMaxPages, pdfDPI)
@@ -1836,18 +2009,22 @@ func cmdAsk(args []string) int {
 	// leaving it to a caller to notice afterwards which tool just ran.
 	var sessionChanges []string // recorded write_file/edit_file/scp_copy entries this session, for buildWorkSummary
 
-	// extraTools handles run_command (always enabled - see the tools slice
-	// above), plus web_search, web_fetch, and scp_copy, each of those three
-	// only when actually enabled/advertised - and dispatchToolCall falls
-	// back to it for any tool name it doesn't recognize among the base
-	// eight. A tool name reaching here that isn't actually enabled means it
-	// was never advertised to the model in the first place (see the tools
-	// slice above), so it falls through to "unknown tool" instead of
-	// silently running something the user opted out of.
+	// extraTools handles run_command and read_pdf (both always enabled -
+	// see the tools slice above), plus web_search, web_fetch, and scp_copy,
+	// each of those three only when actually enabled/advertised - and
+	// dispatchToolCall falls back to it for any tool name it doesn't
+	// recognize among the base eight. A tool name reaching here that isn't
+	// actually enabled means it was never advertised to the model in the
+	// first place (see the tools slice above), so it falls through to
+	// "unknown tool" instead of silently running something the user opted
+	// out of.
 	extraTools := func(name string, args map[string]interface{}) (string, error, bool) {
 		switch name {
 		case "run_command":
 			r, e := toolRunCommand(args, cmdTimeout)
+			return r, e, true
+		case "read_pdf":
+			r, e := toolReadPDF(args, pdfMaxPages, pdfDPI)
 			return r, e, true
 		case "web_search":
 			if !searchCfg.searchEnabled() {
@@ -2003,6 +2180,14 @@ func cmdAsk(args []string) int {
 				Name:       tc.Function.Name,
 				ToolCallID: tc.ID,
 			})
+			// read_pdf's rendered page images ride a separate synthetic
+			// role:"user" message appended right here, rather than being
+			// attached to the tool-result message above - see
+			// readPDFFollowUpMessage's doc comment for why.
+			if followUp, ok := readPDFFollowUpMessage(tc.Function.Name, result); ok {
+				messages = append(messages, followUp)
+				fmt.Fprintf(outFile, "[tool_call] read_pdf follow-up: %d page image(s) attached as a user message\n", len(followUp.Images))
+			}
 		}
 	}
 
@@ -4984,6 +5169,14 @@ requirements is actually built and actually works.
   subdirectories - no absolute path elsewhere on disk, no ".." walking
   upward. Use it liberally within those bounds while implementing, to catch
   problems early instead of discovering them all at once at the end.
+- read_pdf(path): always available. Renders every page of the PDF at path
+  (relative to the current directory) into an image and sends them to you
+  as a separate message right after this tool's own result. Use this
+  whenever the requirements reference a PDF, or you find one in the repo
+  (e.g. a spec or design doc) while working - you do not need it attached
+  to the session beforehand. Works even on a scanned PDF with no embedded
+  text layer. Depends on the external pdftoppm binary being installed - a
+  clear error comes back if it is not.
 - web_search(queries, max_results?): ONLY present when ola has a local
   SearXNG search backend configured for this session (opt-in). Accepts a
   list, not just one item - independent queries run in parallel
@@ -6102,17 +6295,18 @@ func toolAskUserCoding(args map[string]interface{}, ntfyTopic, red, reset string
 // ─────────────────────────────────────────────────────────────────
 
 type codingRunContext struct {
-	ntfyTopic string
-	red       string
-	reset     string
-	outFile   *os.File
-	state     *codingState
-	cmdTO     time.Duration
-	cmds      projectCommands  // needed by mark_task_done's build-only light gate
-	searchCfg searchConfig     // web_search/web_fetch config, may be all-zero (disabled)
-	skillsCfg skillsConfig     // read_skill config, may be all-zero (disabled)
-	apiCfg    apiRequestConfig // api_request config, may be all-zero (disabled)
-	changes   []string         // recorded write/edit/task-done/api-mutating entries this session, for buildWorkSummary
+	ntfyTopic           string
+	red                 string
+	reset               string
+	outFile             *os.File
+	state               *codingState
+	cmdTO               time.Duration
+	cmds                projectCommands  // needed by mark_task_done's build-only light gate
+	searchCfg           searchConfig     // web_search/web_fetch config, may be all-zero (disabled)
+	skillsCfg           skillsConfig     // read_skill config, may be all-zero (disabled)
+	apiCfg              apiRequestConfig // api_request config, may be all-zero (disabled)
+	changes             []string         // recorded write/edit/task-done/api-mutating entries this session, for buildWorkSummary
+	pdfMaxPages, pdfDPI int              // read_pdf's per-call limits - see toolReadPDF/cmdCoding
 
 	// selfReviewEnabled toggles the self_review_requirements gate on
 	// report_complete (default true; --no-self-review disables it - see
@@ -6203,6 +6397,9 @@ func dispatchCodingToolCall(tc toolCall, rc *codingRunContext) (result string, i
 			return r, e, true
 		case "run_command":
 			r, e := toolRunCommand(args, rc.cmdTO)
+			return r, e, true
+		case "read_pdf":
+			r, e := toolReadPDF(args, rc.pdfMaxPages, rc.pdfDPI)
 			return r, e, true
 		case "self_review_requirements":
 			met, _ := args["all_requirements_met"].(bool)
@@ -6332,10 +6529,10 @@ func codingUsage(fs *flag.FlagSet) func() {
 		fmt.Println("(default: requirements.md), วางแผนเป็น task checklist, implement, เรียก build/test")
 		fmt.Println("ของโปรเจกต์เอง วนแก้จนกว่าจะผ่านจริง แล้วจึงรายงานว่าสำเร็จ")
 		fmt.Println()
-		fmt.Println("Tool ที่เปิดใช้เสมอ (นอกเหนือจาก 9 ตัวของ ask ซึ่งรวม run_command อยู่แล้ว): add_tasks,")
-		fmt.Println("mark_task_done, self_review_requirements, report_complete รวมถึง web_fetch")
+		fmt.Println("Tool ที่เปิดใช้เสมอ (นอกเหนือจาก 10 ตัวของ ask ซึ่งรวม run_command และ read_pdf อยู่แล้ว):")
+		fmt.Println("add_tasks, mark_task_done, self_review_requirements, report_complete รวมถึง web_fetch")
 		fmt.Println("(เปิดอัตโนมัติเสมอ), web_search, api_request และ read_skill แบบมีเงื่อนไข")
-		fmt.Println("(ดูหัวข้อ run_command, Web search, api_request และ Skills ใน 'ola ask -h' - กลไกเดียวกันทุกประการ)")
+		fmt.Println("(ดูหัวข้อ run_command, read_pdf, Web search, api_request และ Skills ใน 'ola ask -h' - กลไกเดียวกันทุกประการ)")
 		fmt.Println()
 		fmt.Println("คุณภาพงาน - ola บังคับหลายชั้นแทนที่จะเชื่อคำพูดโมเดลเพียงอย่างเดียว")
 		fmt.Println("(ปรับพฤติกรรมได้ด้วย flag ด้านล่าง แต่ default คือเข้มงวดที่สุด):")
@@ -6421,6 +6618,8 @@ func codingUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  --api-allow-direct-url  override OLA_API_ALLOW_DIRECT_URL - เปิดโหมดระบุ URL ตรงใน api_request")
 		fmt.Println("  --api-allow-mutating    override OLA_API_ALLOW_MUTATING - อนุญาต POST/PUT/PATCH/DELETE ใน api_request")
 		fmt.Println("  --api-timeout <sec>     override OLA_API_REQUEST_TIMEOUT_SEC")
+		fmt.Println("  --pdf-max-pages <n>     override OLA_PDF_MAX_PAGES - จำนวนหน้าแรกสูงสุดที่ read_pdf แปลงต่อไฟล์ (default: 20)")
+		fmt.Println("  --pdf-dpi <n>           override OLA_PDF_DPI - ความละเอียดตอน read_pdf แปลงหน้าเป็นภาพ (default: 150)")
 		fmt.Println("  -n, --dry-run           แสดง JSON payload ของ request รอบแรกโดยไม่เรียก API จริง")
 		fmt.Println("  -h, --help              แสดงข้อความนี้")
 		fmt.Println()
@@ -6458,6 +6657,7 @@ func cmdCoding(args []string) int {
 	var providerFlag, apiBaseFlag string
 	var lintCmd string
 	var flagNoSelfReview, flagNoEditVerify, flagNoPreflight bool
+	var pdfMaxPages, pdfDPI int
 
 	fs.StringVar(&model, "m", "", "")
 	fs.StringVar(&model, "model", "", "")
@@ -6501,6 +6701,8 @@ func cmdCoding(args []string) int {
 	fs.BoolVar(&flagAPIAllowDirectURL, "api-allow-direct-url", false, "")
 	fs.BoolVar(&flagAPIAllowMutating, "api-allow-mutating", false, "")
 	fs.IntVar(&apiTimeoutSec, "api-timeout", 0, "")
+	fs.IntVar(&pdfMaxPages, "pdf-max-pages", 0, "")
+	fs.IntVar(&pdfDPI, "pdf-dpi", 0, "")
 	fs.BoolVar(&flagHelp, "h", false, "")
 	fs.BoolVar(&flagHelp, "help", false, "")
 
@@ -6619,6 +6821,17 @@ func cmdCoding(args []string) int {
 	apiCfg, apiWarnings := resolveAPIRequestConfig(apiEndpoints, flagAPIAllowDirectURL, flagAPIAllowMutating, apiTimeoutSec, 0, 0)
 	for _, w := range apiWarnings {
 		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
+
+	// read_pdf is always in the tool list (part of builtinTools, same as
+	// "ask" - see cmdAsk's own resolution of these two for the full
+	// rationale), so --pdf-max-pages/--pdf-dpi are resolved here
+	// unconditionally too, not gated behind any config check.
+	if pdfMaxPages <= 0 {
+		pdfMaxPages = envInt("OLA_PDF_MAX_PAGES", defaultPDFMaxPages)
+	}
+	if pdfDPI <= 0 {
+		pdfDPI = envInt("OLA_PDF_DPI", defaultPDFDPI)
 	}
 
 	// Load or reset task state.
@@ -6804,6 +7017,8 @@ func cmdCoding(args []string) int {
 		cmds: cmds, searchCfg: searchCfg, skillsCfg: skillsCfg, apiCfg: apiCfg,
 		selfReviewEnabled: !flagNoSelfReview,
 		editVerifyEnabled: !flagNoEditVerify,
+		pdfMaxPages:       pdfMaxPages,
+		pdfDPI:            pdfDPI,
 	}
 
 	client := newHTTPClient()
@@ -6861,6 +7076,14 @@ func cmdCoding(args []string) int {
 		for _, tc := range outcome.ToolCalls {
 			result, isReport := dispatchCodingToolCall(tc, rc)
 			messages = append(messages, ollamaMessage{Role: "tool", Content: result, Name: tc.Function.Name, ToolCallID: tc.ID})
+			// read_pdf's rendered page images ride a separate synthetic
+			// role:"user" message appended right here, rather than being
+			// attached to the tool-result message above - see
+			// readPDFFollowUpMessage's doc comment for why.
+			if followUp, ok := readPDFFollowUpMessage(tc.Function.Name, result); ok {
+				messages = append(messages, followUp)
+				fmt.Fprintf(rc.outFile, "[tool_call] read_pdf follow-up: %d page image(s) attached as a user message\n", len(followUp.Images))
+			}
 			if isReport {
 				verifyRequested = true
 				var args map[string]interface{}

@@ -929,6 +929,300 @@ trailer
 	}
 }
 
+// ─────────────────────────────────────────────────────────────────
+// read_pdf tool (toolReadPDF, readPDFFollowUpMessage)
+// ─────────────────────────────────────────────────────────────────
+
+// TestToolReadPDFSuccessStashesResultForFollowUp confirms toolReadPDF (a)
+// returns a success string naming the page count and (b) stashes a
+// matching readPDFResult for the caller to pop via popLastReadPDF - the
+// side-channel readPDFFollowUpMessage relies on.
+func TestToolReadPDFSuccessStashesResultForFollowUp(t *testing.T) {
+	installFakePDFToPPM(t)
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	if err := os.WriteFile("doc.pdf", []byte("2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	args := map[string]interface{}{"path": "doc.pdf"}
+	result, err := toolReadPDF(args, 10, 150)
+	if err != nil {
+		t.Fatalf("expected toolReadPDF to succeed, got error: %v", err)
+	}
+	if !strings.Contains(result, "2 หน้า") {
+		t.Fatalf("expected the result to mention 2 pages, got: %s", result)
+	}
+
+	r := popLastReadPDF()
+	if r == nil {
+		t.Fatal("expected a stashed readPDFResult after a successful toolReadPDF call")
+	}
+	if r.Path != "doc.pdf" {
+		t.Fatalf("expected stashed Path to be %q, got %q", "doc.pdf", r.Path)
+	}
+	if len(r.Images) != 2 {
+		t.Fatalf("expected 2 stashed images, got %d", len(r.Images))
+	}
+	if r.Truncated {
+		t.Fatal("expected Truncated=false when the doc has fewer pages than maxPages")
+	}
+
+	// popLastReadPDF clears the side-channel, so a second pop must be nil.
+	if popLastReadPDF() != nil {
+		t.Fatal("expected popLastReadPDF to return nil once already popped")
+	}
+}
+
+// TestToolReadPDFRejectsPathOutsideSandbox confirms read_pdf shares the
+// same read_file/write_file sandbox - a path escaping the current
+// directory via ".." must be rejected before ever reaching pdftoppm.
+func TestToolReadPDFRejectsPathOutsideSandbox(t *testing.T) {
+	installFakePDFToPPM(t)
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	args := map[string]interface{}{"path": "../outside.pdf"}
+	if _, err := toolReadPDF(args, 10, 150); err == nil {
+		t.Fatal("expected a path escaping the sandbox to be rejected")
+	}
+	if popLastReadPDF() != nil {
+		t.Fatal("expected no stashed result after a rejected/failed call")
+	}
+}
+
+// TestToolReadPDFRejectsMissingFile confirms a clear error (not a panic or
+// a silent empty result) when the given path doesn't exist.
+func TestToolReadPDFRejectsMissingFile(t *testing.T) {
+	installFakePDFToPPM(t)
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	args := map[string]interface{}{"path": "does-not-exist.pdf"}
+	if _, err := toolReadPDF(args, 10, 150); err == nil {
+		t.Fatal("expected an error for a nonexistent path")
+	}
+}
+
+// TestReadPDFFollowUpMessageCarriesImagesAsUserMessage confirms
+// readPDFFollowUpMessage turns a successful read_pdf result into a
+// role:"user" message carrying the rendered images - the shape verified
+// (elsewhere, for the OpenAI-compat path) to actually reach the model,
+// unlike attaching images directly to the tool-result message itself (see
+// lastReadPDF's doc comment for why that's avoided).
+func TestReadPDFFollowUpMessageCarriesImagesAsUserMessage(t *testing.T) {
+	installFakePDFToPPM(t)
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+	if err := os.WriteFile("doc.pdf", []byte("2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := toolReadPDF(map[string]interface{}{"path": "doc.pdf"}, 10, 150)
+	if err != nil {
+		t.Fatalf("expected toolReadPDF to succeed, got error: %v", err)
+	}
+
+	msg, ok := readPDFFollowUpMessage("read_pdf", result)
+	if !ok {
+		t.Fatal("expected readPDFFollowUpMessage to produce a follow-up message")
+	}
+	if msg.Role != "user" {
+		t.Fatalf("expected the follow-up message's role to be \"user\", got %q", msg.Role)
+	}
+	if len(msg.Images) != 2 {
+		t.Fatalf("expected 2 images on the follow-up message, got %d", len(msg.Images))
+	}
+	if !strings.Contains(msg.Content, "doc.pdf") {
+		t.Fatalf("expected the follow-up message's content to reference doc.pdf, got: %s", msg.Content)
+	}
+}
+
+// TestReadPDFFollowUpMessageNoOpForOtherToolsOrErrors confirms
+// readPDFFollowUpMessage only ever fires right after a successful
+// "read_pdf" call - never for a different tool's result, and never for a
+// read_pdf call that itself failed (an "ERROR: ..." result).
+func TestReadPDFFollowUpMessageNoOpForOtherToolsOrErrors(t *testing.T) {
+	if _, ok := readPDFFollowUpMessage("read_file", "some file content"); ok {
+		t.Fatal("expected no follow-up message for a tool other than read_pdf")
+	}
+	if _, ok := readPDFFollowUpMessage("read_pdf", "ERROR: something went wrong"); ok {
+		t.Fatal("expected no follow-up message when the read_pdf call itself errored")
+	}
+	// Nothing was stashed by either call above (toolReadPDF never ran), so
+	// even a bare "read_pdf" name with a non-ERROR string must still no-op.
+	if _, ok := readPDFFollowUpMessage("read_pdf", "unrelated success text"); ok {
+		t.Fatal("expected no follow-up message when nothing was actually stashed via toolReadPDF")
+	}
+}
+
+// TestCmdAskReadPDFToolCallAttachesImagesToFollowUpRequest drives cmdAsk
+// through a scripted mock model that calls read_pdf on a PDF that was NOT
+// attached via [files...] at all (the whole point of this tool - see
+// toolReadPDF/readPDFFollowUpMessage), then confirms the NEXT request round
+// actually carries the rendered page images in its message history.
+func TestCmdAskReadPDFToolCallAttachesImagesToFollowUpRequest(t *testing.T) {
+	installFakePDFToPPM(t)
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+	if err := os.WriteFile("report.pdf", []byte("2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var round int32
+	var secondRoundBody string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&round, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		switch n {
+		case 1:
+			fmt.Fprint(w, streamLine("", "read_pdf", `{"path":"report.pdf"}`, true))
+		case 2:
+			body, _ := io.ReadAll(r.Body)
+			secondRoundBody = string(body)
+			fmt.Fprint(w, streamLine("อ่านแล้วครับ", "", "", true))
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdAsk([]string{"-m", "mock-model", "-o", "ask-read-pdf.log", "อ่านไฟล์ report.pdf ให้หน่อย"})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdAsk to exit 0, got %d", exitCode)
+	}
+	if got := atomic.LoadInt32(&round); got != 2 {
+		t.Fatalf("expected exactly 2 rounds (read_pdf call, final answer), got %d", got)
+	}
+
+	var req struct {
+		Messages []struct {
+			Role   string   `json:"role"`
+			Images []string `json:"images"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(secondRoundBody), &req); err != nil {
+		t.Fatalf("expected a valid JSON request body, got error %v, body: %s", err, secondRoundBody)
+	}
+
+	var found bool
+	for _, m := range req.Messages {
+		if m.Role == "user" && len(m.Images) == 2 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected the follow-up request to include a user message with 2 images from read_pdf, got messages: %+v", req.Messages)
+	}
+
+	log, err := os.ReadFile("ask-read-pdf.log")
+	if err != nil {
+		t.Fatalf("expected output log to exist: %v", err)
+	}
+	if !strings.Contains(string(log), "[tool_call] read_pdf") {
+		t.Fatalf("expected a read_pdf tool_call entry in the log, got:\n%s", log)
+	}
+}
+
+// TestCmdCodingReadPDFToolCallAttachesImagesToFollowUpRequest is
+// TestCmdAskReadPDFToolCallAttachesImagesToFollowUpRequest's counterpart
+// for "coding" - confirms read_pdf is wired through cmdCoding's own
+// tool-calling loop identically (dispatchCodingToolCall + the follow-up
+// message logic), not just cmdAsk's.
+func TestCmdCodingReadPDFToolCallAttachesImagesToFollowUpRequest(t *testing.T) {
+	installFakePDFToPPM(t)
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+	if err := os.WriteFile("requirements.md", []byte("# ทดสอบ\nอ่านไฟล์ spec.pdf แล้วสรุปให้หน่อย\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("spec.pdf", []byte("1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var round int32
+	var secondRoundBody string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&round, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		switch n {
+		case 1:
+			fmt.Fprint(w, streamLine("", "read_pdf", `{"path":"spec.pdf"}`, true))
+		case 2:
+			body, _ := io.ReadAll(r.Body)
+			secondRoundBody = string(body)
+			// A plain final answer with no tool call ends cmdCoding's loop
+			// immediately (see its own doc comment) - no need to drive a
+			// full plan/report_complete cycle just to exercise read_pdf.
+			fmt.Fprint(w, streamLine("อ่าน spec แล้วครับ", "", "", true))
+		default:
+			t.Errorf("unexpected extra round %d", n)
+			fmt.Fprint(w, streamLine("unexpected", "", "", true))
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdCoding([]string{"-m", "mock-model", "-o", "coding-read-pdf.log"})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdCoding to exit 0, got %d", exitCode)
+	}
+	if got := atomic.LoadInt32(&round); got != 2 {
+		t.Fatalf("expected exactly 2 rounds (read_pdf call, plain final answer), got %d", got)
+	}
+
+	var req struct {
+		Messages []struct {
+			Role   string   `json:"role"`
+			Images []string `json:"images"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(secondRoundBody), &req); err != nil {
+		t.Fatalf("expected a valid JSON request body, got error %v, body: %s", err, secondRoundBody)
+	}
+	var found bool
+	for _, m := range req.Messages {
+		if m.Role == "user" && len(m.Images) == 1 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected the follow-up request to include a user message with 1 image from read_pdf, got messages: %+v", req.Messages)
+	}
+}
+
 func TestToolAddTasksAndMarkTaskDoneArgs(t *testing.T) {
 	t.Cleanup(func() {
 		_ = os.Remove(codingStateFile)
