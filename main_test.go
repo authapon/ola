@@ -16,6 +16,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -735,6 +736,196 @@ func TestRunShellCommandTimeout(t *testing.T) {
 	}
 	if exitCode != -1 {
 		t.Fatalf("expected exitCode -1 on timeout, got %d", exitCode)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// PDF attachment support (convertPDFToImages)
+// ─────────────────────────────────────────────────────────────────
+
+// fakePDFToPPMScript stands in for the real `pdftoppm` binary in tests, so
+// the test suite doesn't depend on poppler-utils actually being installed
+// on the machine running it - the same reasoning/pattern as
+// installFakeSCP below faking `scp` for scp_copy's own tests. It hardcodes
+// the exact fixed argument shape convertPDFToImages always invokes it
+// with ("-png" "-r" <dpi> "-f" "1" "-l" <maxPages> <path> <prefix>, i.e.
+// positions $7/$8/$9), reads a fake "page count" from the first line of
+// the input file (a plain text stand-in for a real PDF in these tests -
+// convertPDFToImages itself never inspects PDF content, so this is enough
+// to exercise its own globbing/sorting/truncation logic), and writes that
+// many (capped at the "-l" limit) dummy "<prefix>-<n>.png" files.
+const fakePDFToPPMScript = `#!/bin/sh
+limit="$7"
+input="$8"
+prefix="$9"
+total=$(head -n 1 "$input")
+n=$total
+if [ "$limit" -lt "$total" ]; then
+  n=$limit
+fi
+i=1
+while [ "$i" -le "$n" ]; do
+  printf 'FAKE-PNG-PAGE-%s' "$i" > "${prefix}-${i}.png"
+  i=$((i+1))
+done
+`
+
+// installFakePDFToPPM writes fakePDFToPPMScript as an executable
+// "pdftoppm" and prepends its directory to PATH for the duration of the
+// test, so exec.LookPath/exec.CommandContext inside convertPDFToImages
+// picks it up instead of any real pdftoppm installed on the machine.
+func installFakePDFToPPM(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake pdftoppm shell script requires a POSIX shell")
+	}
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "pdftoppm")
+	if err := os.WriteFile(scriptPath, []byte(fakePDFToPPMScript), 0755); err != nil {
+		t.Fatal(err)
+	}
+	origPath := os.Getenv("PATH")
+	os.Setenv("PATH", dir+string(os.PathListSeparator)+origPath)
+	t.Cleanup(func() { os.Setenv("PATH", origPath) })
+}
+
+// fakePDFFile writes a plain-text stand-in "PDF" (see fakePDFToPPMScript's
+// doc comment) whose first line is the page count the fake pdftoppm should
+// report, and returns its path.
+func fakePDFFile(t *testing.T, dir string, pages int) string {
+	t.Helper()
+	path := filepath.Join(dir, "doc.pdf")
+	if err := os.WriteFile(path, []byte(fmt.Sprintf("%d\n", pages)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestConvertPDFToImagesReturnsPagesInOrder(t *testing.T) {
+	installFakePDFToPPM(t)
+	dir := t.TempDir()
+	path := fakePDFFile(t, dir, 3)
+
+	pages, truncated, err := convertPDFToImages(path, 10, 150)
+	if err != nil {
+		t.Fatalf("expected conversion to succeed, got error: %v", err)
+	}
+	if truncated {
+		t.Fatal("expected truncated=false when page count is under maxPages")
+	}
+	if len(pages) != 3 {
+		t.Fatalf("expected 3 pages, got %d", len(pages))
+	}
+	for i, want := range []string{"FAKE-PNG-PAGE-1", "FAKE-PNG-PAGE-2", "FAKE-PNG-PAGE-3"} {
+		got, err := base64.StdEncoding.DecodeString(pages[i])
+		if err != nil {
+			t.Fatalf("page %d did not decode as base64: %v", i, err)
+		}
+		if string(got) != want {
+			t.Fatalf("page %d: expected %q, got %q (pages returned out of order?)", i, want, string(got))
+		}
+	}
+}
+
+func TestConvertPDFToImagesTruncatesAtMaxPages(t *testing.T) {
+	installFakePDFToPPM(t)
+	dir := t.TempDir()
+	path := fakePDFFile(t, dir, 5)
+
+	pages, truncated, err := convertPDFToImages(path, 2, 150)
+	if err != nil {
+		t.Fatalf("expected conversion to succeed, got error: %v", err)
+	}
+	if !truncated {
+		t.Fatal("expected truncated=true when the document has more pages than maxPages")
+	}
+	if len(pages) != 2 {
+		t.Fatalf("expected exactly 2 pages (maxPages), got %d", len(pages))
+	}
+}
+
+func TestConvertPDFToImagesMissingBinary(t *testing.T) {
+	// Point PATH somewhere with no pdftoppm at all, so exec.LookPath fails
+	// the same way it would on a machine without poppler-utils installed.
+	origPath := os.Getenv("PATH")
+	os.Setenv("PATH", t.TempDir())
+	t.Cleanup(func() { os.Setenv("PATH", origPath) })
+
+	_, _, err := convertPDFToImages("whatever.pdf", 10, 150)
+	if err == nil {
+		t.Fatal("expected an error when pdftoppm is not installed")
+	}
+	if !strings.Contains(err.Error(), "pdftoppm") || !strings.Contains(err.Error(), "poppler-utils") {
+		t.Fatalf("expected the error to name pdftoppm/poppler-utils so the user knows what to install, got: %v", err)
+	}
+}
+
+// TestConvertPDFToImagesRealBinary is a genuine smoke test against the
+// actual system pdftoppm (skipped if poppler-utils isn't installed on the
+// machine running the tests) - confirms convertPDFToImages works against a
+// real, minimal, hand-written PDF, not just the fake script above. Poppler
+// tolerates a missing/simplified xref table via its own reconstruction
+// fallback, which is why this minimal a PDF is enough for the test.
+func TestConvertPDFToImagesRealBinary(t *testing.T) {
+	if _, err := exec.LookPath("pdftoppm"); err != nil {
+		t.Skip("pdftoppm (poppler-utils) not installed - skipping real-binary smoke test")
+	}
+	const minimalTwoPagePDF = `%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+5 0 obj
+<< /Length 44 >>
+stream
+BT /F1 24 Tf 20 100 Td (Page One) Tj ET
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 7 0 R >>
+endobj
+7 0 obj
+<< /Length 44 >>
+stream
+BT /F1 24 Tf 20 100 Td (Page Two) Tj ET
+endstream
+endobj
+trailer
+<< /Size 8 /Root 1 0 R >>
+%%EOF
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "real.pdf")
+	if err := os.WriteFile(path, []byte(minimalTwoPagePDF), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	pages, truncated, err := convertPDFToImages(path, 10, 72)
+	if err != nil {
+		t.Fatalf("expected the real pdftoppm to convert this minimal PDF, got error: %v", err)
+	}
+	if truncated {
+		t.Fatal("expected truncated=false for a 2-page doc under maxPages=10")
+	}
+	if len(pages) != 2 {
+		t.Fatalf("expected 2 rendered pages, got %d", len(pages))
+	}
+	for i, p := range pages {
+		data, err := base64.StdEncoding.DecodeString(p)
+		if err != nil {
+			t.Fatalf("page %d did not decode as base64: %v", i, err)
+		}
+		if !bytes.HasPrefix(data, []byte("\x89PNG")) {
+			t.Fatalf("page %d does not look like a PNG (missing PNG magic bytes)", i)
+		}
 	}
 }
 
@@ -4082,6 +4273,109 @@ func TestCmdAskPromptFile(t *testing.T) {
 	}
 	if !strings.Contains(gotBody, "เนื้อหาไฟล์แนบ") {
 		t.Fatalf("expected attached.txt's content to be attached since -f leaves all positionals as attachments, got: %s", gotBody)
+	}
+}
+
+func TestCmdAskAttachesPDFAsImages(t *testing.T) {
+	installFakePDFToPPM(t)
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	pdfPath := fakePDFFile(t, dir, 3)
+
+	var gotBody string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("อ่าน PDF แล้วครับ", "", "", true))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdAsk([]string{"-m", "mock-model", "-o", "ask-pdf.log", "สรุปไฟล์ PDF นี้ให้หน่อย", pdfPath})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdAsk to exit 0, got %d", exitCode)
+	}
+
+	var req struct {
+		Messages []struct {
+			Role    string   `json:"role"`
+			Content string   `json:"content"`
+			Images  []string `json:"images"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(gotBody), &req); err != nil {
+		t.Fatalf("expected a valid JSON request body, got error %v, body: %s", err, gotBody)
+	}
+	if len(req.Messages) < 2 {
+		t.Fatalf("expected at least a system + user message, got %d", len(req.Messages))
+	}
+	userMsg := req.Messages[len(req.Messages)-1]
+	if len(userMsg.Images) != 3 {
+		t.Fatalf("expected 3 page images from the 3-page fake PDF, got %d", len(userMsg.Images))
+	}
+	for i, want := range []string{"FAKE-PNG-PAGE-1", "FAKE-PNG-PAGE-2", "FAKE-PNG-PAGE-3"} {
+		got, err := base64.StdEncoding.DecodeString(userMsg.Images[i])
+		if err != nil {
+			t.Fatalf("image %d did not decode as base64: %v", i, err)
+		}
+		if string(got) != want {
+			t.Fatalf("image %d: expected %q, got %q", i, want, string(got))
+		}
+	}
+	if !strings.Contains(userMsg.Content, "แนบเป็นภาพ 3 หน้า") {
+		t.Fatalf("expected the prompt content to note the PDF was attached as 3 page images, got: %s", userMsg.Content)
+	}
+	if !strings.Contains(userMsg.Content, "สรุปไฟล์ PDF นี้ให้หน่อย") {
+		t.Fatalf("expected the original prompt text to still be present, got: %s", userMsg.Content)
+	}
+}
+
+// TestCmdAskPDFConversionFailureIsNonFatal confirms a PDF that fails to
+// convert (here: no pdftoppm on PATH at all) produces a warning and is
+// simply skipped, rather than aborting the whole session - the same
+// leniency already given to a missing/unreadable text attachment.
+func TestCmdAskPDFConversionFailureIsNonFatal(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	// No installFakePDFToPPM here - pdftoppm intentionally stays whatever
+	// is (or isn't) on the real PATH, isolated via a redirect to a PATH
+	// with nothing in it, so the missing-binary error path is exercised
+	// even on a machine that happens to have real poppler-utils installed.
+	origPath := os.Getenv("PATH")
+	os.Setenv("PATH", t.TempDir())
+	defer os.Setenv("PATH", origPath)
+
+	pdfPath := fakePDFFile(t, dir, 1)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("รับทราบครับ", "", "", true))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	os.Setenv("OLA_OLLAMA_API_BASE", srv.URL)
+	defer os.Unsetenv("OLA_OLLAMA_API_BASE")
+
+	exitCode := cmdAsk([]string{"-m", "mock-model", "-o", "ask-pdf-fail.log", "สรุปไฟล์นี้ให้หน่อย", pdfPath})
+	if exitCode != 0 {
+		t.Fatalf("expected cmdAsk to still exit 0 despite the failed PDF conversion, got %d", exitCode)
 	}
 }
 

@@ -181,6 +181,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -618,6 +619,15 @@ var imageExts = map[string]bool{
 	".jpg": true, ".jpeg": true, ".png": true, ".webp": true, ".gif": true,
 }
 
+// pdfExts marks a "ask"-attached file as a PDF, routed through
+// convertPDFToImages (rendered to page images, sent alongside imageFiles)
+// rather than through imageExts (already-an-image, sent as-is) or plain
+// text attachment (read as UTF-8 and appended to the prompt - a PDF's raw
+// bytes are not text, so dumping them into the prompt would just be
+// garbage). See convertPDFToImages's doc comment for the full design
+// rationale.
+var pdfExts = map[string]bool{".pdf": true}
+
 // maxToolIterations bounds the tool-calling loop so a model that keeps
 // requesting tools indefinitely can't hang ola forever. It is intentionally
 // not exposed as a flag; if this is ever hit in practice it's a sign the
@@ -856,6 +866,102 @@ var runCommandTool = ollamaTool{
 	},
 }
 
+// ─────────────────────────────────────────────────────────────────
+// PDF attachment support ("ask"'s [files...] only - see cmdAsk)
+// ─────────────────────────────────────────────────────────────────
+
+const (
+	// defaultPDFMaxPages caps how many pages of a single attached PDF get
+	// rendered to images. Local vision models commonly struggle past a
+	// handful of images in one request, and request payload size grows
+	// roughly linearly with page count - without this cap, attaching a
+	// 300-page manual would try to send 300 full-resolution page images in
+	// a single request.
+	defaultPDFMaxPages = 20
+
+	// defaultPDFDPI is the rasterization resolution passed to pdftoppm.
+	// 150 is a reasonable trade-off between body-text legibility and
+	// image/payload size - raise it with --pdf-dpi for dense/small-print
+	// pages, or lower it to fit more pages into a tight context budget.
+	defaultPDFDPI = 150
+
+	// pdfConvertTimeoutSec bounds a single pdftoppm invocation (one call
+	// per attached PDF, covering up to maxPages pages). Fixed rather than
+	// exposed as a flag - same reasoning as maxToolIterations: if this is
+	// ever hit in practice it's a sign the PDF/page-count/DPI combination
+	// needs attention, not something to tune per-run.
+	pdfConvertTimeoutSec = 60
+)
+
+// convertPDFToImages rasterizes up to maxPages pages of the PDF at path
+// into base64-encoded PNG images (in page order), via the external
+// `pdftoppm` binary (part of poppler-utils, the same package `pdftotext`
+// ships in). This is the same design choice already made for scp_copy
+// (shelling out to the system `scp` binary rather than adding a Go
+// dependency): it keeps the ola binary itself dependency-free at the cost
+// of requiring poppler-utils to be installed for this one feature - if
+// pdftoppm isn't found, this returns a clear error rather than a cryptic
+// exec failure.
+//
+// Rendering to images (rather than extracting embedded text) is
+// deliberate: it also works on a scanned PDF with no text layer at all,
+// as long as the model itself can read images (the model's vision support
+// isn't checked here - like the existing image-attachment path, the
+// images are simply sent and it's up to Ollama/the model to handle them).
+//
+// truncated reports whether maxPages was actually reached, meaning the
+// source PDF may have had further, unconverted pages - the caller surfaces
+// that as a caveat in the prompt, the same way the auto-generated
+// directory tree notes when it was cut off at maxTreeEntries.
+func convertPDFToImages(path string, maxPages, dpi int) (pages []string, truncated bool, err error) {
+	if _, lookErr := exec.LookPath("pdftoppm"); lookErr != nil {
+		return nil, false, fmt.Errorf("ไม่พบโปรแกรม pdftoppm ในเครื่อง (ต้องติดตั้ง poppler-utils ก่อนถึงจะแนบไฟล์ PDF ได้)")
+	}
+
+	tmpDir, mkErr := os.MkdirTemp("", "ola-pdf-")
+	if mkErr != nil {
+		return nil, false, fmt.Errorf("สร้าง temp directory สำหรับแปลง PDF ไม่ได้: %v", mkErr)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	prefix := filepath.Join(tmpDir, "page")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(pdfConvertTimeoutSec)*time.Second)
+	defer cancel()
+	// -f 1 -l maxPages renders only the pages we'll actually use, rather
+	// than rasterizing (and discarding) every page of a huge document.
+	cmd := exec.CommandContext(ctx, "pdftoppm", "-png", "-r", strconv.Itoa(dpi), "-f", "1", "-l", strconv.Itoa(maxPages), path, prefix)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if runErr := cmd.Run(); runErr != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, false, fmt.Errorf("แปลง PDF %s หมดเวลา (เกิน %ds)", path, pdfConvertTimeoutSec)
+		}
+		return nil, false, fmt.Errorf("แปลง PDF %s ไม่สำเร็จ: %v (%s)", path, runErr, strings.TrimSpace(stderr.String()))
+	}
+
+	matches, globErr := filepath.Glob(prefix + "-*.png")
+	if globErr != nil {
+		return nil, false, fmt.Errorf("อ่านผลลัพธ์การแปลง PDF ไม่ได้: %v", globErr)
+	}
+	if len(matches) == 0 {
+		return nil, false, fmt.Errorf("แปลง PDF %s แล้วไม่ได้หน้าใดเลย (ไฟล์อาจเสียหาย, เข้ารหัสไว้, หรือไม่มีหน้า)", path)
+	}
+	// pdftoppm zero-pads page numbers to a uniform width across the whole
+	// batch (e.g. page-01.png..page-12.png), so a plain lexicographic sort
+	// is already the correct page order - no numeric parsing needed.
+	sort.Strings(matches)
+
+	for _, m := range matches {
+		data, readErr := os.ReadFile(m)
+		if readErr != nil {
+			return nil, false, fmt.Errorf("อ่านภาพหน้า PDF ที่แปลงแล้วไม่ได้: %v", readErr)
+		}
+		pages = append(pages, base64.StdEncoding.EncodeToString(data))
+	}
+
+	return pages, len(pages) >= maxPages, nil
+}
+
 func askUsage(fs *flag.FlagSet) func() {
 	return func() {
 		fmt.Println("Usage: ola ask [options] <prompt> [files...]")
@@ -1028,6 +1134,8 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  OLA_API_ALLOW_DIRECT_URL  เปิดโหมดระบุ URL ตรง (override ด้วย --api-allow-direct-url, default: ปิด)")
 		fmt.Println("  OLA_API_ALLOW_MUTATING    อนุญาต method POST/PUT/PATCH/DELETE (override ด้วย --api-allow-mutating, default: ปิด)")
 		fmt.Println("  OLA_API_REQUEST_TIMEOUT_SEC  timeout ต่อการเรียก API หนึ่งครั้ง วินาที (override ด้วย --api-timeout, default: 30)")
+		fmt.Println("  OLA_PDF_MAX_PAGES         จำนวนหน้าแรกสูงสุดที่แปลงเป็นภาพต่อไฟล์ PDF (override ด้วย --pdf-max-pages, default: 20)")
+		fmt.Println("  OLA_PDF_DPI               ความละเอียดตอนแปลงหน้า PDF เป็นภาพ (override ด้วย --pdf-dpi, default: 150)")
 		fmt.Println()
 		fmt.Println("Provider (เลือก backend ด้วย -P/--provider หรือ $OLA_PROVIDER, default: \"ollama\"):")
 		fmt.Println("  \"ollama\" (default) - พฤติกรรมเดิมของ ola ทุกอย่าง ไม่มีอะไรเปลี่ยน: คุยกับ Ollama's native")
@@ -1083,10 +1191,17 @@ func askUsage(fs *flag.FlagSet) func() {
 		fmt.Println("      --api-allow-direct-url  override OLA_API_ALLOW_DIRECT_URL - เปิดโหมดระบุ URL ตรงใน api_request")
 		fmt.Println("      --api-allow-mutating    override OLA_API_ALLOW_MUTATING - อนุญาต POST/PUT/PATCH/DELETE ใน api_request")
 		fmt.Println("      --api-timeout <sec>     override OLA_API_REQUEST_TIMEOUT_SEC")
+		fmt.Println("      --pdf-max-pages <n>  override OLA_PDF_MAX_PAGES - จำนวนหน้าแรกสูงสุดที่แปลงเป็นภาพต่อไฟล์ PDF (default: 20)")
+		fmt.Println("      --pdf-dpi <n>        override OLA_PDF_DPI - ความละเอียดตอนแปลง PDF เป็นภาพ (default: 150)")
 		fmt.Println("  -h, --help           แสดงข้อความนี้")
 		fmt.Println()
 		fmt.Println("ไฟล์แนบ ([files...]):")
 		fmt.Println("  - ไฟล์นามสกุล .jpg .jpeg .png .webp .gif จะถูกอ่านและแนบเป็น base64 ใน field \"images\" ของ user message")
+		fmt.Println("  - ไฟล์นามสกุล .pdf จะถูกแปลงเป็นภาพทีละหน้า (ผ่าน pdftoppm - ต้องติดตั้ง poppler-utils เอง) แล้วแนบเป็น")
+		fmt.Println("    \"images\" แบบเดียวกับรูป - ใช้ได้แม้เป็น PDF ที่สแกนมา (ไม่มี text layer) เพราะโมเดลอ่านจากภาพโดยตรง")
+		fmt.Println("    แต่โมเดลที่ใช้ต้องรองรับ vision ด้วย จำกัดไว้ที่ --pdf-max-pages หน้าแรกต่อไฟล์ (default: 20,")
+		fmt.Println("    override ด้วย OLA_PDF_MAX_PAGES) ที่ความละเอียด --pdf-dpi (default: 150, override ด้วย OLA_PDF_DPI)")
+		fmt.Println("    ถ้าไม่พบ pdftoppm ในเครื่อง หรือแปลงไม่สำเร็จ จะแสดง warning แล้วข้ามไฟล์นั้นไป ไม่หยุดทั้งเซสชัน")
 		fmt.Println("  - ไฟล์นามสกุลอื่นทั้งหมดจะถูกอ่านเป็นข้อความและต่อท้ายเข้าไปใน content ของ prompt โดยตรง")
 		fmt.Println("  - ไฟล์ที่ไม่พบจะแสดง warning และถูกข้ามไป ไม่ทำให้โปรแกรมหยุดทำงาน")
 		fmt.Println("  - นี่คนละเรื่องกับ tool ask_user/read_file/write_file/edit_file ด้านบน: ไฟล์ที่แนบตรงนี้คือ")
@@ -1151,6 +1266,7 @@ func cmdAsk(args []string) int {
 	var scpTimeoutSec int
 	var scpMaxBytes int64
 	var providerFlag, apiBaseFlag string
+	var pdfMaxPages, pdfDPI int
 
 	fs.StringVar(&model, "m", "", "")
 	fs.StringVar(&model, "model", "", "")
@@ -1198,6 +1314,8 @@ func cmdAsk(args []string) int {
 	fs.BoolVar(&flagAPIAllowDirectURL, "api-allow-direct-url", false, "")
 	fs.BoolVar(&flagAPIAllowMutating, "api-allow-mutating", false, "")
 	fs.IntVar(&apiTimeoutSec, "api-timeout", 0, "")
+	fs.IntVar(&pdfMaxPages, "pdf-max-pages", 0, "")
+	fs.IntVar(&pdfDPI, "pdf-dpi", 0, "")
 	fs.BoolVar(&flagHelp, "h", false, "")
 	fs.BoolVar(&flagHelp, "help", false, "")
 
@@ -1304,17 +1422,20 @@ func cmdAsk(args []string) int {
 		files = rest[1:]
 	}
 
-	// Separate image / text files
-	var imageFiles, textFiles []string
+	// Separate image / PDF / text files
+	var imageFiles, pdfFiles, textFiles []string
 	for _, f := range files {
 		if _, err := os.Stat(f); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: ไม่พบไฟล์ %s\n", f)
 			continue
 		}
 		ext := strings.ToLower(filepath.Ext(f))
-		if imageExts[ext] {
+		switch {
+		case imageExts[ext]:
 			imageFiles = append(imageFiles, f)
-		} else {
+		case pdfExts[ext]:
+			pdfFiles = append(pdfFiles, f)
+		default:
 			textFiles = append(textFiles, f)
 		}
 	}
@@ -1404,6 +1525,41 @@ func cmdAsk(args []string) int {
 			userMsg.Images = append(userMsg.Images, base64.StdEncoding.EncodeToString(data))
 		}
 		logLoad(fmt.Sprintf("attached image files (%d)", len(imageFiles)), time.Since(imageLoadStart))
+	}
+
+	// PDF attachments are rasterized to page images (via convertPDFToImages)
+	// and sent the same way as imageFiles above, rather than as text - see
+	// convertPDFToImages's doc comment for why (works even on scanned PDFs
+	// with no embedded text layer, at the cost of depending on the external
+	// pdftoppm binary). --pdf-max-pages/--pdf-dpi follow the same
+	// flag > env > default precedence as every other ola setting.
+	// convertedPDFPages is declared here (rather than inside the if-block
+	// below) so the dry-run summary further down can report it even though
+	// dry-run and the actual conversion are the same code path.
+	var convertedPDFPages int
+	if len(pdfFiles) > 0 {
+		if pdfMaxPages <= 0 {
+			pdfMaxPages = envInt("OLA_PDF_MAX_PAGES", defaultPDFMaxPages)
+		}
+		if pdfDPI <= 0 {
+			pdfDPI = envInt("OLA_PDF_DPI", defaultPDFDPI)
+		}
+		pdfLoadStart := time.Now()
+		for _, f := range pdfFiles {
+			pages, truncated, err := convertPDFToImages(f, pdfMaxPages, pdfDPI)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "warning: แปลงไฟล์ PDF %s เป็นภาพไม่ได้: %v\n", f, err)
+				continue
+			}
+			userMsg.Images = append(userMsg.Images, pages...)
+			convertedPDFPages += len(pages)
+			content += fmt.Sprintf("\n\n--- %s: แนบเป็นภาพ %d หน้า ---", f, len(pages))
+			if truncated {
+				content += fmt.Sprintf("\n(แปลงเฉพาะ %d หน้าแรก จำกัดด้วย --pdf-max-pages - เอกสารอาจมีหน้าเพิ่มเติมที่ไม่ได้แนบ)", pdfMaxPages)
+			}
+		}
+		userMsg.Content = content
+		logLoad(fmt.Sprintf("attached PDF files (%d file(s), %d page image(s), %d dpi)", len(pdfFiles), convertedPDFPages, pdfDPI), time.Since(pdfLoadStart))
 	}
 
 	// web_search stays opt-in, following the same "only offer what can
@@ -1520,6 +1676,10 @@ func cmdAsk(args []string) int {
 		fmt.Printf("── Output file: %s ──\n", outputFile)
 		fmt.Printf("── Sandbox root (current directory): %s ──\n", cwd)
 		fmt.Printf("── Directory tree in prompt: %s ──\n", treeNote)
+		if len(pdfFiles) > 0 {
+			fmt.Printf("── PDF attachments: %d file(s) → %d page image(s) rendered at %d dpi (--pdf-max-pages %d) ──\n",
+				len(pdfFiles), convertedPDFPages, pdfDPI, pdfMaxPages)
+		}
 		if quietMode {
 			fmt.Println("── Quiet mode: enabled (-q/--quiet or $OLA_QUIET) - ไม่มีผลต่อ --dry-run นี้ ซึ่งแสดงรายละเอียดเต็มเสมอ ──")
 		} else {

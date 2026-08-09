@@ -48,7 +48,7 @@
 
 ## การติดตั้ง
 
-**ข้อกำหนด:** Go **1.26.2** ขึ้นไป (ตาม `go.mod`) — ไม่มี dependency ภายนอกอื่นเลย (มาตรฐาน stdlib ล้วน)
+**ข้อกำหนด:** Go **1.26.2** ขึ้นไป (ตาม `go.mod`) — ไม่มี Go module dependency ภายนอกเลย (มาตรฐาน stdlib ล้วน) ตัว `ola` binary เองจึง build ได้โดยไม่ต้องพึ่งอะไรเพิ่ม ยกเว้นบาง **feature ที่เป็น opt-in** ซึ่งพึ่ง system binary ภายนอกตอน**รัน**จริง (ไม่ใช่ตอน build): `scp_copy` ต้องมี `scp`, ไฟล์แนบ `.pdf` ต้องมี `pdftoppm` (แพ็กเกจ `poppler-utils`) — ดู [scp_copy](#scp_copy--โอนไฟล์ข้าม-host) และ [กลไกอ่าน PDF](#กลไกอ่าน-pdf)
 
 ```bash
 # 1) เตรียมโฟลเดอร์โปรเจกต์ (main.go, main_test.go, go.mod, platform_linux.go, platform_other.go ต้องอยู่ที่เดียวกัน)
@@ -157,6 +157,13 @@ ola ask "หาว่าโปรเจกต์นี้ใช้ framework อ
 | `OLA_API_ALLOW_MUTATING` | `--api-allow-mutating` | ปิด |
 | `OLA_API_REQUEST_TIMEOUT_SEC` | `--api-timeout` | `30` |
 
+### ไฟล์แนบ `.pdf` (opt-in ในแง่ที่ต้องมี `pdftoppm` ติดตั้ง)
+
+| ตัวแปร | Flag | ค่าเริ่มต้น |
+|---|---|---|
+| `OLA_PDF_MAX_PAGES` | `--pdf-max-pages` | `20` |
+| `OLA_PDF_DPI` | `--pdf-dpi` | `150` |
+
 ---
 
 ## `ola ask`
@@ -226,14 +233,35 @@ Usage: ola ask [options] <prompt> [files...]
       --scp-local-dir/-key/-timeout/-max-bytes
       --api-endpoints <list>    เปิด api_request
       --api-allow-direct-url / --api-allow-mutating / --api-timeout
+      --pdf-max-pages <n>       จำนวนหน้าแรกสูงสุดที่แปลงเป็นภาพต่อไฟล์ PDF (default: 20)
+      --pdf-dpi <n>             ความละเอียดตอนแปลง PDF เป็นภาพ (default: 150)
   -h, --help             แสดงข้อความช่วยเหลือนี้
 ```
 
 ### ไฟล์แนบ (`[files...]`)
 
 - `.jpg .jpeg .png .webp .gif` → อ่านและแนบเป็น base64 ใน field `images` ของ user message
+- `.pdf` → แปลงเป็นภาพทีละหน้า (ผ่าน `pdftoppm` จาก poppler-utils) แล้วแนบเป็น `images` แบบเดียวกับรูป — ดู [กลไกอ่าน PDF](#กลไกอ่าน-pdf) ด้านล่าง
 - นามสกุลอื่นทั้งหมด → อ่านเป็นข้อความต่อท้ายเข้าไปใน prompt โดยตรง (คั่นด้วย separator เว้นแต่ใช้ `-r/--raw`)
 - ไฟล์ที่ไม่พบ → แสดง warning แล้วข้าม ไม่หยุดโปรแกรม
+
+### กลไกอ่าน PDF
+
+`ola` ไม่มีตัวอ่าน PDF ในตัว (Go standard library ไม่มี) จึงเรียกโปรแกรมภายนอก **`pdftoppm`** (จาก poppler-utils) มาแปลงแต่ละหน้าของ PDF เป็นภาพ PNG ก่อนแนบเข้า request แบบเดียวกับไฟล์รูปทั่วไป — เหตุผลที่เลือกแปลงเป็น **ภาพ** แทนการดึงข้อความ (text extraction):
+
+- ใช้ได้แม้เป็น PDF ที่ **สแกนมา** (ไม่มี text layer ฝังอยู่เลย) เพราะโมเดลอ่านเนื้อหาจากภาพโดยตรง ไม่ต้องพึ่ง text layer ในไฟล์
+- **ข้อแลกเปลี่ยน:** โมเดลที่ใช้ต้องรองรับ vision ด้วย (ไม่ใช่ทุกโมเดลใน Ollama จะทำได้) — ola ไม่เช็คให้ว่าโมเดลรองรับหรือไม่ แค่ส่งภาพไปตามปกติ เหมือนที่ทำกับไฟล์รูปที่แนบอยู่แล้ว
+
+**ติดตั้ง:** ต้องมี `pdftoppm` ใน `PATH` ก่อน (แพ็กเกจ `poppler-utils` บน Debian/Ubuntu, `poppler` บน macOS Homebrew/Arch) — ถ้าไม่พบ ola จะแสดง warning แล้วข้ามไฟล์ PDF นั้นไป ไม่ทำให้ทั้งเซสชันล้ม (เหมือน `scp_copy` ที่พึ่ง system `scp` binary อยู่แล้ว — นี่คือทางเลือกเดียวกัน: ยอมพึ่ง binary ภายนอกแทนการเพิ่ม Go dependency เข้าไปในตัว `ola` เอง)
+
+**ควบคุมได้ด้วย:**
+
+| Flag | Env | Default | ความหมาย |
+|---|---|---|---|
+| `--pdf-max-pages <n>` | `OLA_PDF_MAX_PAGES` | 20 | จำนวนหน้าแรกสูงสุดที่แปลงต่อไฟล์ — กันไม่ให้เอกสารร้อยกว่าหน้าพยายามแนบภาพความละเอียดสูงเป็นร้อยรูปในคำขอเดียว ถ้าเอกสารมีมากกว่านี้ ola จะแนบ N หน้าแรกแล้วเติมข้อความเตือนไว้ใน prompt ว่าอาจมีหน้าที่ไม่ได้แนบ |
+| `--pdf-dpi <n>` | `OLA_PDF_DPI` | 150 | ความละเอียดตอน rasterize — เพิ่มถ้าตัวหนังสือในเอกสารเล็ก/แน่นมาก ลดถ้าต้องการประหยัด payload/context |
+
+ไม่มี OCR หรือการดึงข้อความใด ๆ เกิดขึ้นในกระบวนการนี้ — คุณภาพการอ่านเนื้อหาขึ้นอยู่กับความสามารถ vision ของโมเดลที่ใช้ล้วน ๆ
 
 ### ตัวอย่างการใช้งาน
 
@@ -271,6 +299,12 @@ ola ask -q -x mytopic 'deploy to production'
 
 # ดู payload ที่จะส่งจริง โดยไม่ยิง request จริง (ไว้ debug prompt/tool schema)
 ola ask -n 'ทดสอบ dry run'
+
+# แนบไฟล์ PDF (แปลงเป็นภาพให้โมเดล vision อ่าน - ต้องมี pdftoppm และโมเดลที่รองรับ vision)
+ola ask -m qwen3-vl 'สรุปเอกสารนี้ให้หน่อย' invoice.pdf
+
+# แนบ PDF หนา ๆ แต่จำกัดหน้า/ความละเอียดเพื่อประหยัด context
+ola ask -m qwen3-vl --pdf-max-pages 5 --pdf-dpi 100 'สรุปสารบัญคร่าว ๆ' manual.pdf
 ```
 
 **หมายเหตุ:**
@@ -635,3 +669,4 @@ go test -run TestCodingQuietMode -v ./...
 - **System prompt แก้จากภายนอกไม่ได้** — ไม่มี `-s/--system` อีกต่อไป ปรับพฤติกรรมได้ผ่าน flag/env ที่มีให้เท่านั้น (หรือแก้ constant ในซอร์สแล้ว build ใหม่)
 - **`web_fetch` ไม่รัน JavaScript** — หน้าเว็บที่เป็น client-side-rendered SPA ล้วนจะได้ error ชัดเจน ไม่ใช่เนื้อหาว่างเปล่า
 - **ไม่รองรับ auto-detect .gitignore** สำหรับ directory tree ที่แปะเข้า prompt แรก — ยกเว้นเฉพาะโฟลเดอร์ที่รู้จักแบบ hardcode (`.git`, `node_modules`, `vendor`, `target`, `.venv`, `__pycache__`, `dist`, `build`, `.idea`, `.terraform` ฯลฯ) อาจไม่ตรงกับทุกโปรเจกต์เป๊ะ
+- **ไฟล์แนบ `.pdf` ต้องมี `pdftoppm` ติดตั้งอยู่ และโมเดลที่ใช้ต้องรองรับ vision** — ola แปลง PDF เป็นภาพรายหน้าแล้วส่งแบบเดียวกับไฟล์รูป ไม่มีการดึงข้อความ (text extraction) หรือ OCR ใด ๆ ทั้งสิ้น ถ้าโมเดิลไม่รองรับ vision ภาพที่แนบไปจะไม่ถูกนำไปใช้ประโยชน์ (ola ไม่เช็คความสามารถของโมเดลให้ล่วงหน้า) ดู [กลไกอ่าน PDF](#กลไกอ่าน-pdf)
