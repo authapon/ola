@@ -522,6 +522,26 @@ ola telegrambot \
 
 ถ้าฐานความรู้มีไฟล์จำนวนมาก แนะนำให้โมเดิลลองด้วย `pattern: "*"` แล้วไม่ใส่ `query` (จะได้รายชื่อไฟล์ทั้งหมด) ก่อน แล้วค่อยเลือกอ่านไฟล์ที่เกี่ยวข้องด้วย `read_knowledge` ตรงๆ ถ้ารู้สึกว่าการ grep ด้วย query ไม่ช่วยอะไร
 
+**ทางแก้ที่ตรงจุดกว่า:** เปิด embedding-based (semantic) search ด้วย `--embed-model` — ดูหัวข้อถัดไป
+
+### Embedding-based (semantic) search — `--embed-model`
+
+เมื่อ grep แบบตรงตัวหาไม่เจอ (แต่ `pattern` เจอไฟล์อยู่) และตั้ง `--embed-model` ไว้ `search_knowledge` จะ**ลองค้นแบบเข้าใจความหมายต่อโดยอัตโนมัติ** ก่อนจะ fallback ไปแนบเนื้อหาไฟล์แบบข้อก่อนหน้า — แก้ปัญหา "สัตว์เลี้ยง" vs "หมา/แมว" ได้ตรงจุดกว่าการ dump ทั้งไฟล์ โดยเฉพาะเมื่อฐานความรู้มีไฟล์เยอะขึ้นจนไฟล์ที่ match pattern เกิน 5 ไฟล์บ่อยๆ (fallback แบบเดิมจะเปลี่ยนไปแสดงแค่รายชื่อไฟล์แทนเนื้อหา)
+
+**สถาปัตยกรรมโดยย่อ:** ไม่มี vector database ภายนอก — ใช้ brute-force cosine similarity ในหน่วยความจำ (เร็วพอสำหรับฐานความรู้ขนาดหลักร้อยไฟล์) เรียก Ollama's native `/api/embed` โดยตรงผ่าน `net/http` (ไม่มี Go dependency ใหม่) แบ่งแต่ละไฟล์เป็น chunk ก่อน embed (ตัดตาม paragraph, chunk ที่ยาวเกินไปตัดซ้ำแบบ sliding window พร้อม overlap — ตัดแบบ rune-safe ไม่มีทางตัดกลางตัวอักษรไทยหลาย byte) ระบบจะ:
+
+1. **ตอนเริ่มทำงาน**: โหลด index เดิมจาก `<context-dir>/knowledge-index.json` (ถ้ามี) แล้ว **embed ทุกไฟล์ใหม่/ที่เปลี่ยนแปลงทันที** ก่อนเข้า loop รับข้อความ (ครั้งแรกที่ไม่มี index เดิม = embed ทั้งฐานความรู้ทันที)
+2. **ระหว่างรัน**: walk ไฟล์ใหม่เป็นระยะ (`--embed-refresh-interval`, default ทุก 5 นาที) เปรียบเทียบ hash เนื้อหาไฟล์กับที่ index ไว้ — ไฟล์ที่ไม่เปลี่ยนใช้ embedding เดิมจาก cache ไฟล์ใหม่/เปลี่ยนแปลงค่อย embed ใหม่เฉพาะไฟล์นั้น ไฟล์ที่ถูกลบจะหายไปจาก index ในรอบถัดไปด้วย
+3. **ตอนค้น**: ถ้า grep ไม่เจอเลย embed query (1 ครั้ง) แล้วเทียบ cosine similarity กับทุก chunk ที่อยู่ในไฟล์ที่ `pattern` match (จำกัดเฉพาะไฟล์ที่ pattern เลือกไว้ เพื่อให้ pattern ยังมีความหมาย) คืน top-`--embed-top-k` ที่คะแนนเกิน `--embed-min-score`
+
+**ข้อจำกัดสำคัญ:**
+- รองรับเฉพาะ `--provider ollama` ในตอนนี้ (เรียก `/api/embed` ของ Ollama โดยตรง — ยังไม่รองรับ OpenAI-compatible embeddings endpoint)
+- ต้อง `ollama pull` โมเดิล embedding แยกต่างหากจากโมเดิลแชท — **สำหรับฐานความรู้ภาษาไทย ควรเลือกโมเดิล embedding ที่รองรับหลายภาษา** (เช่น `bge-m3`) โมเดิลขนาดเล็กที่เทรนภาษาอังกฤษเป็นหลัก (เช่น `all-minilm`) มักให้ผลแย่กับข้อความไทยล้วน
+- `--embed-min-score` (default 0.35) เป็นแค่**ค่าตั้งต้น ไม่ใช่ค่าที่ผ่านการทดสอบจริง** — คะแนน cosine similarity ที่เหมาะสมขึ้นกับโมเดิล embedding ที่ใช้จริง ควรทดลองปรับตามผลลัพธ์ที่เห็นจริง
+- ยังเป็น fallback ชั้นที่สองอยู่ดี ไม่ใช่ตัวแทน grep แบบตรงตัว — grep ที่เจอ hit ตรงๆ ยังชนะเสมอ (เร็วกว่า ไม่ต้องเรียก API เพิ่ม)
+
+เช็คสถานะ embedding index (จำนวน chunk, โมเดิลที่ใช้, ตั้งค่าอะไรไว้) ได้จากคำสั่ง `/tools` ในแชท หรือดู log ตอน bot เริ่มทำงาน
+
 ### ถ้าโมเดิลตอบว่างเปล่า
 
 บางครั้งโมเดิล (โดยเฉพาะ reasoning model ที่ใช้ token งบประมาณไปกับ "thinking" จนหมดก่อนจะสร้างคำตอบจริง) อาจตอบกลับมาแบบไม่มีทั้งข้อความและไม่มี tool call เลย — `telegrambot` เจอกรณีนี้จะ**ลองใหม่ให้อัตโนมัติ 1 ครั้ง** (ส่งข้อความเตือนกลับไปให้โมเดิลว่าคำตอบก่อนหน้าว่างเปล่า) ถ้ายังว่างอีกจะถือเป็น error — ผู้ใช้จะได้ข้อความแจ้งปัญหากลับไปแทนที่จะได้ข้อความว่างเปล่า/ไม่มีอะไรตอบเลย และ **จะไม่มีการบันทึก turn ที่ล้มเหลวลง context ไฟล์** เช็ค log (`-o`) จะเห็นบรรทัด `[telegram_warning] โมเดลตอบว่างเปล่า` ถ้าเจอปัญหานี้บ่อย มักเป็นสัญญาณว่าโมเดิลที่ใช้อยู่เล็ก/ตั้ง `-c/--ctx` ต่ำเกินไปสำหรับ persona+ประวัติสนทนาที่ยาวขึ้นเรื่อยๆ
@@ -542,6 +562,10 @@ ola telegrambot \
 | `OLA_TELEGRAM_PERSONA` | `--persona` | — | ข้อความ persona/คำสั่งเพิ่มเติม เติมต่อท้าย system prompt |
 | `OLA_TELEGRAM_PERSONA_FILE` | `--persona-file` | — | ไฟล์ persona (ชนะ `--persona`/`OLA_TELEGRAM_PERSONA` ถ้าตั้งทั้งคู่) |
 | `OLA_TELEGRAM_KNOWLEDGE_DIR` | `--knowledge-dir` | — | comma-separated directory สำหรับ `search_knowledge`/`read_knowledge` |
+| `OLA_TELEGRAM_EMBED_MODEL` | `--embed-model` | — | Ollama embedding model (เช่น `bge-m3`) เปิด semantic search fallback (`--provider ollama` เท่านั้น) |
+| — | `--embed-top-k` | `5` | จำนวน chunk สูงสุดจาก semantic search |
+| — | `--embed-min-score` | `0.35` | คะแนน cosine similarity ขั้นต่ำ (ค่าตั้งต้น ควรปรับตามโมเดิลจริง) |
+| — | `--embed-refresh-interval` | `300` วินาที | ความถี่ walk ไฟล์หาการเปลี่ยนแปลง (index ที่ `<context-dir>/knowledge-index.json`) |
 | `OLA_TELEGRAM_CONTEXT_DIR` | `--context-dir` | `telegram-context` | ที่เก็บไฟล์ context ราย user/group |
 | — | `--context-keep-recent` | `20` | จำนวน turn ล่าสุดที่เก็บแบบเต็มหลัง compact |
 | — | `--context-compact-after` | `40` | compact เมื่อจำนวน turn เกินนี้ (ต้องมากกว่า `--context-keep-recent`) |

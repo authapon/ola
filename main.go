@@ -188,13 +188,16 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"html"
 	"io"
 	"io/fs"
+	"math"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -9176,20 +9179,14 @@ func knowledgeGrepFallbackContent(matches []string, cfg knowledgeConfig) string 
 	return b.String()
 }
 
-func toolSearchKnowledge(args map[string]interface{}, cfg knowledgeConfig) (string, error) {
-	if !cfg.enabled() {
-		return "", fmt.Errorf("search_knowledge ไม่ได้ถูกตั้งค่าสำหรับเซสชันนี้")
-	}
-	pattern, _ := args["pattern"].(string)
-	if pattern == "" {
-		return "", fmt.Errorf("ต้องระบุ pattern")
-	}
-	query, _ := args["query"].(string)
-
-	var matches []string
-	var grepHits []string
-	limitHit := false
-
+// knowledgeGrepSearch performs the pattern-match walk plus optional
+// exact-substring grep, returning structured results rather than a
+// formatted string. Shared by toolSearchKnowledge (grep-only, no
+// embedding) and telegramSession.searchKnowledgeTool (grep first, falls
+// back to embedding search - see that method's own doc comment) so both
+// layers see identical file/grep matching semantics from one
+// implementation.
+func knowledgeGrepSearch(pattern, query string, cfg knowledgeConfig) (matches []string, grepHits []string, limitHit bool) {
 	for _, label := range cfg.Labels {
 		if limitHit {
 			break
@@ -9242,9 +9239,16 @@ func toolSearchKnowledge(args map[string]interface{}, cfg knowledgeConfig) (stri
 			continue
 		}
 	}
+	return matches, grepHits, limitHit
+}
 
+// formatKnowledgeSearchResult turns knowledgeGrepSearch's structured
+// result into the text a tool result actually carries - including the
+// small-file content-dump fallback (see its own comment below) for when
+// query matched files by pattern but not by any single exact line.
+func formatKnowledgeSearchResult(matches, grepHits []string, limitHit bool, query string, cfg knowledgeConfig) string {
 	if len(matches) == 0 {
-		return "ไม่พบไฟล์ที่ตรงกับ pattern ในฐานความรู้", nil
+		return "ไม่พบไฟล์ที่ตรงกับ pattern ในฐานความรู้"
 	}
 	suffix := ""
 	if limitHit {
@@ -9262,20 +9266,36 @@ func toolSearchKnowledge(args map[string]interface{}, cfg knowledgeConfig) (stri
 			// matched files' own content directly when there are few
 			// enough to make that cheap and sane - the model can then find
 			// the actual relevant text itself without a second guess-and-
-			// retry round trip.
+			// retry round trip. (telegramSession.searchKnowledgeTool tries
+			// embedding-based search before ever falling back to this, when
+			// an embed model is configured - this function has no
+			// knowledge of that and is only ever the last resort.)
 			if len(matches) <= knowledgeGrepFallbackMaxFiles {
 				if fallback := knowledgeGrepFallbackContent(matches, cfg); fallback != "" {
 					return fmt.Sprintf(
 						"ไม่มีบรรทัดใดตรงกับ query %q แบบตรงตัว (คำในเอกสารอาจเขียนต่างจากคำค้นนี้) แต่พบไฟล์ %d ไฟล์ที่ตรงกับ pattern - แนบเนื้อหาให้เลย อ่านหาคำตอบจากตรงนี้ก่อนสรุปว่าไม่มีข้อมูล:\n\n%s%s",
-						query, len(matches), fallback, suffix), nil
+						query, len(matches), fallback, suffix)
 				}
 			}
 			return fmt.Sprintf("พบไฟล์ %d ไฟล์ตรงกับ pattern (%s) แต่ไม่มีบรรทัดใดตรงกับ query %q แบบตรงตัว - ลองเรียก read_knowledge อ่านไฟล์เหล่านั้นโดยตรง หรือค้นด้วย query อื่น%s",
-				len(matches), strings.Join(matches, ", "), query, suffix), nil
+				len(matches), strings.Join(matches, ", "), query, suffix)
 		}
-		return strings.Join(grepHits, "\n") + suffix, nil
+		return strings.Join(grepHits, "\n") + suffix
 	}
-	return strings.Join(matches, "\n") + suffix, nil
+	return strings.Join(matches, "\n") + suffix
+}
+
+func toolSearchKnowledge(args map[string]interface{}, cfg knowledgeConfig) (string, error) {
+	if !cfg.enabled() {
+		return "", fmt.Errorf("search_knowledge ไม่ได้ถูกตั้งค่าสำหรับเซสชันนี้")
+	}
+	pattern, _ := args["pattern"].(string)
+	if pattern == "" {
+		return "", fmt.Errorf("ต้องระบุ pattern")
+	}
+	query, _ := args["query"].(string)
+	matches, grepHits, limitHit := knowledgeGrepSearch(pattern, query, cfg)
+	return formatKnowledgeSearchResult(matches, grepHits, limitHit, query, cfg), nil
 }
 
 func toolReadKnowledge(args map[string]interface{}, cfg knowledgeConfig) (string, error) {
@@ -9348,8 +9368,460 @@ var readKnowledgeTool = ollamaTool{
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Knowledge base: embedding-based (semantic) search - a second, optional
+// layer on top of the grep-based search above. Exists because exact
+// substring grep has a real, observed failure mode: a document that says
+// "has a dog named Mecca and a cat named Piccolo" never contains the
+// literal word "pets", so a query for "pets" finds zero matching lines
+// even though the document plainly answers the question. This layer
+// solves that class of failure by comparing MEANING (via embedding
+// vectors) instead of exact text.
+//
+// Deliberately simple, matching what this knowledge base's actual scale
+// needs (tens to low hundreds of small documents, not a large corpus):
+// no external vector database, no approximate-nearest-neighbor index -
+// just brute-force cosine similarity over an in-memory slice of chunk
+// vectors. That's genuinely fast enough at this scale (a few thousand
+// chunks compared in well under a millisecond) and keeps the "no external
+// Go dependency" principle the rest of this project follows - talks to
+// Ollama's native /api/embed endpoint with net/http + encoding/json, the
+// same way every other integration in this file does.
+//
+// Only ever a FALLBACK, never a replacement: knowledgeGrepSearch (exact
+// substring match) still runs first and wins whenever it finds a hit,
+// since an exact match costs nothing extra (no embedding API call) and is
+// the most literal, least-surprising answer when it exists. Embedding
+// search only engages when grep comes up empty AND an --embed-model is
+// configured; otherwise behavior is byte-for-byte identical to before
+// this section existed (see formatKnowledgeSearchResult, still the last
+// resort either way).
+// ─────────────────────────────────────────────────────────────────
+
+// embedConfig configures the optional embedding layer. Disabled (Model
+// == "") means telegramSession.searchKnowledgeTool behaves exactly like
+// plain toolSearchKnowledge - the grep-only, always-available path.
+type embedConfig struct {
+	Model           string
+	TopK            int
+	MinScore        float32
+	RefreshInterval time.Duration
+}
+
+func (c embedConfig) enabled() bool { return c.Model != "" }
+
+const (
+	defaultEmbedTopK            = 5
+	defaultEmbedMinScore        = 0.35 // a starting point, not a validated constant - see README's own note on tuning this per embedding model
+	defaultEmbedRefreshInterval = 5 * time.Minute
+)
+
+func resolveEmbedConfig(model string, topK int, minScore float64, refreshSec int) embedConfig {
+	if model == "" {
+		model = os.Getenv("OLA_TELEGRAM_EMBED_MODEL")
+	}
+	if topK <= 0 {
+		topK = defaultEmbedTopK
+	}
+	score := float32(minScore)
+	if minScore <= 0 {
+		score = defaultEmbedMinScore
+	}
+	interval := defaultEmbedRefreshInterval
+	if refreshSec > 0 {
+		interval = time.Duration(refreshSec) * time.Second
+	}
+	return embedConfig{Model: model, TopK: topK, MinScore: score, RefreshInterval: interval}
+}
+
+// knowledgeChunk is one embedded, searchable slice of a knowledge-base
+// file's text. Embedding is stored pre-normalized to a unit vector (see
+// normalizeVector) so query time only needs a dot product, not a full
+// cosine-similarity division, for every comparison.
+type knowledgeChunk struct {
+	Label     string    `json:"label"`
+	Path      string    `json:"path"` // relative to Label's root, forward-slashed
+	Text      string    `json:"text"`
+	Embedding []float32 `json:"embedding"`
+}
+
+// knowledgeIndex is the full embedding index for a session's knowledge
+// base, persisted as JSON at <context-dir>/knowledge-index.json.
+// FileHashes enables incremental refresh (buildKnowledgeIndex): a file
+// whose hash hasn't changed since last time is never re-embedded, its
+// existing chunks are just carried over into the new index unchanged.
+type knowledgeIndex struct {
+	FileHashes map[string]string `json:"file_hashes"` // "label/path" -> sha256 hex of last-indexed content
+	Chunks     []knowledgeChunk  `json:"chunks"`
+}
+
+func knowledgeIndexPath(contextDir string) string {
+	return filepath.Join(contextDir, "knowledge-index.json")
+}
+
+func loadKnowledgeIndex(path string) (knowledgeIndex, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return knowledgeIndex{FileHashes: map[string]string{}}, nil
+		}
+		return knowledgeIndex{}, fmt.Errorf("อ่าน knowledge index %s ไม่ได้: %v", path, err)
+	}
+	var idx knowledgeIndex
+	if err := json.Unmarshal(data, &idx); err != nil {
+		return knowledgeIndex{}, fmt.Errorf("parse knowledge index %s ไม่ได้: %v", path, err)
+	}
+	if idx.FileHashes == nil {
+		idx.FileHashes = map[string]string{}
+	}
+	return idx, nil
+}
+
+// save writes atomically (tmp file + rename) for the same crash-safety
+// reason chatContext.save does - this file can be large (every chunk's
+// full embedding vector) and rebuilt periodically in the background, so a
+// process killed mid-write must never leave a truncated, unparseable
+// index behind.
+func (idx knowledgeIndex) save(path string) error {
+	data, err := json.Marshal(idx)
+	if err != nil {
+		return fmt.Errorf("marshal knowledge index ไม่ได้: %v", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return fmt.Errorf("เขียน knowledge index tmp file ไม่ได้: %v", err)
+	}
+	return os.Rename(tmp, path)
+}
+
+// knowledgeIndexStore holds the live, in-memory index behind a
+// sync.RWMutex so query-time semantic search (many readers, one per
+// concurrent chat) and background refreshKnowledgeIndex (occasional
+// writer) never race. Refresh always builds a brand-new knowledgeIndex
+// value off to the side and only takes the write lock to swap it in
+// (see telegramSession.refreshKnowledgeIndex) - readers that grabbed a
+// snapshot via get() just before a swap keep working against a complete,
+// consistent (if slightly stale) old index; they never see a half-built
+// one, because the old index's slice/map are never mutated in place,
+// only ever replaced wholesale.
+type knowledgeIndexStore struct {
+	mu    sync.RWMutex
+	index knowledgeIndex
+}
+
+func (st *knowledgeIndexStore) get() knowledgeIndex {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	return st.index
+}
+
+func (st *knowledgeIndexStore) set(idx knowledgeIndex) {
+	st.mu.Lock()
+	st.index = idx
+	st.mu.Unlock()
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Chunking: split a file's text into embedding-sized pieces before
+// calling the embed API. Deliberately simple - paragraph-aware where
+// possible (keeps a natural unit of meaning together), falling back to a
+// fixed-size sliding window with overlap for any single paragraph too
+// long to embed as one piece. All slicing is done on []rune, never raw
+// bytes/string indices, so a multi-byte UTF-8 character (any Thai text,
+// which this knowledge base is full of) is never split mid-sequence.
+// ─────────────────────────────────────────────────────────────────
+
+const knowledgeChunkSize = 700 // runes, approx - not a hard model limit, just a reasonable retrieval granularity
+const knowledgeChunkOverlap = 100
+
+func chunkKnowledgeText(text string) []string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	paragraphs := strings.Split(text, "\n\n")
+	var chunks []string
+	var cur strings.Builder
+	flush := func() {
+		s := strings.TrimSpace(cur.String())
+		if s != "" {
+			chunks = append(chunks, s)
+		}
+		cur.Reset()
+	}
+	for _, p := range paragraphs {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if utf8.RuneCountInString(p) > knowledgeChunkSize {
+			flush()
+			chunks = append(chunks, windowSplitRunes(p, knowledgeChunkSize, knowledgeChunkOverlap)...)
+			continue
+		}
+		if utf8.RuneCountInString(cur.String())+utf8.RuneCountInString(p) > knowledgeChunkSize {
+			flush()
+		}
+		if cur.Len() > 0 {
+			cur.WriteString("\n\n")
+		}
+		cur.WriteString(p)
+	}
+	flush()
+	return chunks
+}
+
+func windowSplitRunes(text string, size, overlap int) []string {
+	runes := []rune(text)
+	step := size - overlap
+	if step <= 0 {
+		step = size
+	}
+	var out []string
+	for i := 0; i < len(runes); i += step {
+		end := i + size
+		if end > len(runes) {
+			end = len(runes)
+		}
+		out = append(out, string(runes[i:end]))
+		if end == len(runes) {
+			break
+		}
+	}
+	return out
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Ollama embedding API client (POST /api/embed - the current, batching-
+// capable endpoint; the older singular /api/embeddings is deprecated
+// upstream and deliberately not used here). Embedding is Ollama-native
+// only for now - if --provider openai is in use, --embed-model is
+// rejected at startup with a clear message rather than silently trying
+// (and failing) to hit an endpoint that provider doesn't expose in the
+// same shape.
+// ─────────────────────────────────────────────────────────────────
+
+const embedBatchSize = 32 // chunks per /api/embed call, to keep any single request a sane size
+
+type ollamaEmbedResponse struct {
+	Embeddings [][]float32 `json:"embeddings"`
+	Error      string      `json:"error,omitempty"`
+}
+
+func ollamaEmbed(client *http.Client, host, model string, inputs []string) ([][]float32, error) {
+	if len(inputs) == 0 {
+		return nil, nil
+	}
+	payload, err := json.Marshal(map[string]interface{}{"model": model, "input": inputs})
+	if err != nil {
+		return nil, fmt.Errorf("marshal embed request ไม่ได้: %v", err)
+	}
+	httpReq, err := http.NewRequest(http.MethodPost, strings.TrimRight(host, "/")+"/api/embed", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("เรียก /api/embed ไม่ได้: %v", err)
+	}
+	defer resp.Body.Close()
+	var out ollamaEmbedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode /api/embed response ไม่ได้: %v", err)
+	}
+	if out.Error != "" {
+		return nil, fmt.Errorf("/api/embed error: %s", out.Error)
+	}
+	if len(out.Embeddings) != len(inputs) {
+		return nil, fmt.Errorf("/api/embed คืนจำนวน vector (%d) ไม่ตรงกับ input (%d)", len(out.Embeddings), len(inputs))
+	}
+	return out.Embeddings, nil
+}
+
+// ollamaEmbedBatch embeds an arbitrary number of texts, splitting into
+// embedBatchSize-sized /api/embed calls so a large re-index doesn't send
+// one enormous request.
+func ollamaEmbedBatch(client *http.Client, host, model string, texts []string) ([][]float32, error) {
+	var out [][]float32
+	for i := 0; i < len(texts); i += embedBatchSize {
+		end := i + embedBatchSize
+		if end > len(texts) {
+			end = len(texts)
+		}
+		vecs, err := ollamaEmbed(client, host, model, texts[i:end])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, vecs...)
+	}
+	return out, nil
+}
+
+func normalizeVector(v []float32) []float32 {
+	var sumSq float64
+	for _, x := range v {
+		sumSq += float64(x) * float64(x)
+	}
+	if sumSq == 0 {
+		return v
+	}
+	norm := float32(math.Sqrt(sumSq))
+	out := make([]float32, len(v))
+	for i, x := range v {
+		out[i] = x / norm
+	}
+	return out
+}
+
+// dotProduct is cosine similarity IF both vectors are already unit-
+// normalized (which every knowledgeChunk.Embedding and every query
+// vector this file produces always is - see normalizeVector). Comparing
+// vectors of mismatched length (should never happen with one embedding
+// model configured throughout, but cheap to guard) stops at the shorter.
+func dotProduct(a, b []float32) float32 {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	var sum float32
+	for i := 0; i < n; i++ {
+		sum += a[i] * b[i]
+	}
+	return sum
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Index building: walks every configured knowledge directory (NOT
+// filtered by any single search call's `pattern` - the index covers the
+// whole knowledge base regardless of what any one query asks for) and
+// (re-)embeds only files that are new or whose content hash has changed
+// since prev. Binary files and PDFs are skipped entirely (same
+// limitation read_knowledge/toolSearchKnowledge already have - no text to
+// embed either way).
+// ─────────────────────────────────────────────────────────────────
+
+func buildKnowledgeIndex(client *http.Client, embedHost, embedModel string, cfg knowledgeConfig, prev knowledgeIndex, outFile *os.File) (knowledgeIndex, error) {
+	prevChunksByFile := map[string][]knowledgeChunk{}
+	for _, c := range prev.Chunks {
+		key := c.Label + "/" + c.Path
+		prevChunksByFile[key] = append(prevChunksByFile[key], c)
+	}
+
+	newIdx := knowledgeIndex{FileHashes: map[string]string{}}
+	var pendingTexts []string
+	var pendingRefs []struct{ Label, Path string }
+
+	for _, label := range cfg.Labels {
+		root := cfg.Roots[label]
+		_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if info.IsDir() {
+				if p != root && skipDirNames[info.Name()] {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if looksBinaryFile(p, info) || strings.ToLower(filepath.Ext(p)) == ".pdf" {
+				return nil
+			}
+			data, readErr := os.ReadFile(p)
+			if readErr != nil {
+				return nil
+			}
+			rel, relErr := filepath.Rel(root, p)
+			if relErr != nil {
+				rel = info.Name()
+			}
+			relSlash := filepath.ToSlash(rel)
+			key := label + "/" + relSlash
+
+			sum := sha256.Sum256(data)
+			hash := hex.EncodeToString(sum[:])
+			newIdx.FileHashes[key] = hash
+
+			if prevHash, ok := prev.FileHashes[key]; ok && prevHash == hash {
+				newIdx.Chunks = append(newIdx.Chunks, prevChunksByFile[key]...)
+				return nil
+			}
+			for _, t := range chunkKnowledgeText(string(data)) {
+				pendingTexts = append(pendingTexts, t)
+				pendingRefs = append(pendingRefs, struct{ Label, Path string }{label, relSlash})
+			}
+			return nil
+		})
+	}
+
+	if len(pendingTexts) > 0 {
+		vectors, err := ollamaEmbedBatch(client, embedHost, embedModel, pendingTexts)
+		if err != nil {
+			return knowledgeIndex{}, fmt.Errorf("embed ไฟล์ที่เปลี่ยนแปลงไม่สำเร็จ: %v", err)
+		}
+		for i, vec := range vectors {
+			newIdx.Chunks = append(newIdx.Chunks, knowledgeChunk{
+				Label:     pendingRefs[i].Label,
+				Path:      pendingRefs[i].Path,
+				Text:      pendingTexts[i],
+				Embedding: normalizeVector(vec),
+			})
+		}
+		fmt.Fprintf(outFile, "[knowledge_index] embed ไฟล์ใหม่/เปลี่ยนแปลงแล้ว %d chunk(s) (รวม %d chunk(s) ใน index)\n", len(pendingTexts), len(newIdx.Chunks))
+	}
+
+	return newIdx, nil
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Query-time semantic search
+// ─────────────────────────────────────────────────────────────────
+
+type scoredKnowledgeChunk struct {
+	Chunk knowledgeChunk
+	Score float32
+}
+
+// semanticSearchKnowledge embeds query once, scores every chunk in idx
+// via dotProduct, and returns the topK highest-scoring chunks that clear
+// minScore. allowedFiles, when non-nil, restricts candidates to that set
+// of "label/path" keys - telegramSession.searchKnowledgeTool passes the
+// same file set knowledgeGrepSearch's `pattern` already matched, so
+// `pattern` stays meaningful instead of being silently ignored once
+// semantic search takes over from grep.
+func semanticSearchKnowledge(client *http.Client, embedHost, embedModel string, idx knowledgeIndex, allowedFiles map[string]bool, query string, topK int, minScore float32) ([]scoredKnowledgeChunk, error) {
+	vectors, err := ollamaEmbed(client, embedHost, embedModel, []string{query})
+	if err != nil {
+		return nil, err
+	}
+	if len(vectors) == 0 {
+		return nil, fmt.Errorf("/api/embed ไม่คืน vector สำหรับ query")
+	}
+	qv := normalizeVector(vectors[0])
+
+	var scored []scoredKnowledgeChunk
+	for _, c := range idx.Chunks {
+		if allowedFiles != nil && !allowedFiles[c.Label+"/"+c.Path] {
+			continue
+		}
+		scored = append(scored, scoredKnowledgeChunk{Chunk: c, Score: dotProduct(qv, c.Embedding)})
+	}
+	sort.Slice(scored, func(i, j int) bool { return scored[i].Score > scored[j].Score })
+	if topK > 0 && len(scored) > topK {
+		scored = scored[:topK]
+	}
+	var out []scoredKnowledgeChunk
+	for _, s := range scored {
+		if s.Score >= minScore {
+			out = append(out, s)
+		}
+	}
+	return out, nil
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Persona: purely additive, same principle as skills' "AVAILABLE SKILLS"
 // section (see buildSkillsPromptSection) - telegrambot keeps the same
+
 // "system prompt is fixed/built-in" rule the rest of ola follows (see the
 // package doc comment at the top of this file). --persona/--persona-file
 // can only ever APPEND tone/personality/operator instructions after the
@@ -9660,24 +10132,27 @@ func filterTools(all []ollamaTool, names ...string) []ollamaTool {
 // ─────────────────────────────────────────────────────────────────
 
 type telegramSession struct {
-	client         *http.Client // unbounded (no Timeout) - see buildTelegramHTTPClients' own doc comment for why this must never be given a short timeout
-	telegramClient *http.Client // short-timeout client, Telegram Bot API only (sendMessage/getMe) - never used for model calls
-	apiBase        string
-	token          string
-	botUsername    string
-	access         telegramAccessConfig
-	systemPrompt   string
-	tools          []ollamaTool
-	knowledgeCfg   knowledgeConfig
-	searchCfg      searchConfig
-	pcfg           providerConfig
-	ctxSize        int
-	contextDir     string
-	keepRecent     int
-	compactAfter   int
-	ntfyTopic      string
-	outFile        *os.File
-	sem            chan struct{}
+	client           *http.Client // unbounded (no Timeout) - see buildTelegramHTTPClients' own doc comment for why this must never be given a short timeout
+	telegramClient   *http.Client // short-timeout client, Telegram Bot API only (sendMessage/getMe) - never used for model calls
+	apiBase          string
+	token            string
+	botUsername      string
+	access           telegramAccessConfig
+	systemPrompt     string
+	tools            []ollamaTool
+	knowledgeCfg     knowledgeConfig
+	embedCfg         embedConfig
+	knowledgeIdx     *knowledgeIndexStore
+	knowledgeIdxPath string
+	searchCfg        searchConfig
+	pcfg             providerConfig
+	ctxSize          int
+	contextDir       string
+	keepRecent       int
+	compactAfter     int
+	ntfyTopic        string
+	outFile          *os.File
+	sem              chan struct{}
 
 	mu        sync.Mutex
 	chatLocks map[int64]*sync.Mutex
@@ -9726,6 +10201,101 @@ func telegramGroundToolResult(toolName, result string) string {
 	return "[ผลลัพธ์จริงจากการเรียก " + toolName + " เมื่อครู่นี้ - ใช้เฉพาะข้อมูลในนี้ ห้ามเติมแต่งหรือเดาตัวเลข/ข้อเท็จจริงเพิ่มเอง]\n" + result
 }
 
+// searchKnowledgeTool is the actual dispatch target for the
+// search_knowledge tool call (see runTelegramToolLoop's extra closure) -
+// a session-bound wrapper around the module-level, embedding-agnostic
+// toolSearchKnowledge. Behavior:
+//
+//  1. Exact substring grep (knowledgeGrepSearch) always runs first and
+//     wins outright whenever it finds a line hit - free, and the most
+//     literal/least-surprising answer when one exists.
+//  2. If grep finds the right file(s) by pattern but no matching line,
+//     and an --embed-model is configured, falls back to embedding-based
+//     semantic search restricted to those same pattern-matched files
+//     (keeps `pattern` meaningful rather than silently ignored).
+//  3. If no embed model is configured, or the embedding call itself
+//     fails, or semantic search finds nothing above --embed-min-score,
+//     falls through to formatKnowledgeSearchResult's own last-resort
+//     fallback (small-file content dump) - unchanged from before this
+//     method existed.
+func (s *telegramSession) searchKnowledgeTool(args map[string]interface{}) (string, error) {
+	if !s.knowledgeCfg.enabled() {
+		return "", fmt.Errorf("search_knowledge ไม่ได้ถูกตั้งค่าสำหรับเซสชันนี้")
+	}
+	pattern, _ := args["pattern"].(string)
+	if pattern == "" {
+		return "", fmt.Errorf("ต้องระบุ pattern")
+	}
+	query, _ := args["query"].(string)
+
+	matches, grepHits, limitHit := knowledgeGrepSearch(pattern, query, s.knowledgeCfg)
+
+	if query == "" || len(grepHits) > 0 || !s.embedCfg.enabled() || s.knowledgeIdx == nil {
+		return formatKnowledgeSearchResult(matches, grepHits, limitHit, query, s.knowledgeCfg), nil
+	}
+
+	allowed := make(map[string]bool, len(matches))
+	for _, m := range matches {
+		allowed[m] = true
+	}
+	idx := s.knowledgeIdx.get()
+	scored, err := semanticSearchKnowledge(s.client, s.pcfg.Host, s.embedCfg.Model, idx, allowed, query, s.embedCfg.TopK, s.embedCfg.MinScore)
+	if err != nil {
+		s.logf("[telegram_warning] embedding search ล้มเหลว (%v) - ใช้ fallback เดิมแทน\n", err)
+		return formatKnowledgeSearchResult(matches, grepHits, limitHit, query, s.knowledgeCfg), nil
+	}
+	if len(scored) == 0 {
+		return formatKnowledgeSearchResult(matches, grepHits, limitHit, query, s.knowledgeCfg), nil
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "ไม่มีบรรทัดใดตรงกับ query %q แบบตรงตัว แต่ค้นด้วย embedding เจอเนื้อหาที่เกี่ยวข้อง %d รายการ:\n\n", query, len(scored))
+	for _, sc := range scored {
+		fmt.Fprintf(&b, "=== %s/%s (คะแนนความเกี่ยวข้อง %.2f) ===\n%s\n\n", sc.Chunk.Label, sc.Chunk.Path, sc.Score, sc.Chunk.Text)
+	}
+	return strings.TrimSpace(b.String()), nil
+}
+
+// refreshKnowledgeIndex re-walks the knowledge base, (re-)embeds any
+// new/changed files (see buildKnowledgeIndex), swaps the result into
+// s.knowledgeIdx, and persists it to disk. Safe to call repeatedly - an
+// unchanged knowledge base costs one cheap directory walk and zero embed
+// API calls on every call after the first. No-ops entirely if embedding
+// isn't configured.
+func (s *telegramSession) refreshKnowledgeIndex() {
+	if !s.embedCfg.enabled() || !s.knowledgeCfg.enabled() || s.knowledgeIdx == nil {
+		return
+	}
+	prev := s.knowledgeIdx.get()
+	newIdx, err := buildKnowledgeIndex(s.client, s.pcfg.Host, s.embedCfg.Model, s.knowledgeCfg, prev, s.outFile)
+	if err != nil {
+		s.logf("[telegram_error] refresh knowledge index ล้มเหลว: %v\n", err)
+		return
+	}
+	s.knowledgeIdx.set(newIdx)
+	if err := newIdx.save(s.knowledgeIdxPath); err != nil {
+		s.logf("[telegram_error] บันทึก knowledge index ไม่ได้: %v\n", err)
+	}
+}
+
+// startKnowledgeIndexRefresher runs refreshKnowledgeIndex on a ticker for
+// the lifetime of the process ("มีการ walk file เพื่อ update ไฟล์ที่
+// เปลี่ยนแปลงเรื่อย ๆ" - keep noticing and picking up edited/added
+// knowledge-base files without needing a restart). cmdTelegramBot calls
+// refreshKnowledgeIndex once synchronously at startup first (so the
+// index - and the very first search_knowledge call - is ready
+// immediately, per the explicit "embed ทุกไฟล์ทันที" requirement) and
+// only starts this background ticker afterward.
+func (s *telegramSession) startKnowledgeIndexRefresher(interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.refreshKnowledgeIndex()
+		}
+	}()
+}
+
 // runTelegramToolLoop is the per-message counterpart of cmdAsk's own
 // inline tool-calling loop (see that function's own "for {" loop): call
 // the model via doChatRound, dispatch any tool_calls via
@@ -9744,7 +10314,7 @@ func (s *telegramSession) runTelegramToolLoop(messages []ollamaMessage) (string,
 			if !s.knowledgeCfg.enabled() {
 				return "", nil, false
 			}
-			r, e := toolSearchKnowledge(args, s.knowledgeCfg)
+			r, e := s.searchKnowledgeTool(args)
 			return r, e, true
 		case "read_knowledge":
 			if !s.knowledgeCfg.enabled() {
@@ -9841,6 +10411,16 @@ func (s *telegramSession) toolsStatusText() string {
 		fmt.Fprintf(&sb, "✅ search_knowledge/read_knowledge - ฐานความรู้ (%d ที่):\n", len(s.knowledgeCfg.Labels))
 		for _, label := range s.knowledgeCfg.Labels {
 			fmt.Fprintf(&sb, "   %s → %s\n", label, s.knowledgeCfg.Roots[label])
+		}
+		if s.embedCfg.enabled() {
+			n := 0
+			if s.knowledgeIdx != nil {
+				n = len(s.knowledgeIdx.get().Chunks)
+			}
+			fmt.Fprintf(&sb, "   embedding search: เปิด (model: %s, %d chunk ใน index, top-%d, min-score %.2f, refresh ทุก %s)\n",
+				s.embedCfg.Model, n, s.embedCfg.TopK, s.embedCfg.MinScore, s.embedCfg.RefreshInterval)
+		} else {
+			sb.WriteString("   embedding search: ปิด (ไม่ได้ตั้ง --embed-model - ใช้ grep + แนบเนื้อหาไฟล์เล็กๆ แทน)\n")
 		}
 	} else {
 		sb.WriteString("❌ search_knowledge/read_knowledge - ปิด (ไม่ได้ตั้ง --knowledge-dir หรือ directory ที่ระบุหาไม่เจอ - เช็ค stderr/log ตอน bot เริ่มทำงาน)\n")
@@ -10002,6 +10582,12 @@ func telegramUsage(fs *flag.FlagSet) func() {
 		fmt.Println()
 		fmt.Println("Knowledge base (read-only document search):")
 		fmt.Println("  --knowledge-dir <dirs>    OLA_TELEGRAM_KNOWLEDGE_DIR   comma-separated directory (เหมือน --skills-dir)")
+		fmt.Println("  --embed-model <name>      OLA_TELEGRAM_EMBED_MODEL   Ollama embedding model (เช่น bge-m3) - เปิด semantic search")
+		fmt.Println("                            fallback เมื่อ grep แบบ exact-match ไม่เจอ (--provider ollama เท่านั้น ในตอนนี้)")
+		fmt.Println("  --embed-top-k <n>         จำนวน chunk สูงสุดที่คืนจาก semantic search (default 5)")
+		fmt.Println("  --embed-min-score <f>     คะแนน cosine similarity ขั้นต่ำ (default 0.35 - ค่าตั้งต้น ควรปรับตามโมเดิลที่ใช้จริง)")
+		fmt.Println("  --embed-refresh-interval <sec>  ความถี่ในการ walk ไฟล์หาการเปลี่ยนแปลง (default 300 = 5 นาที)")
+		fmt.Println("  index เก็บที่ <context-dir>/knowledge-index.json - embed ทุกไฟล์ทันทีตอนเริ่มทำงาน แล้ว refresh เป็นระยะ (เฉพาะไฟล์ที่เปลี่ยน)")
 		fmt.Println()
 		fmt.Println("Per-chat persistent context:")
 		fmt.Println("  --context-dir <dir>            OLA_TELEGRAM_CONTEXT_DIR   (default: telegram-context)")
@@ -10072,6 +10658,10 @@ func cmdTelegramBot(args []string) int {
 	var allowedUsers, allowedGroups string
 	var persona, personaFile string
 	var knowledgeDir string
+	var embedModel string
+	var embedTopK int
+	var embedMinScore float64
+	var embedRefreshSec int
 	var contextDir string
 	var keepRecent, compactAfter int
 	var pollTimeoutSec, maxConcurrent int
@@ -10094,6 +10684,10 @@ func cmdTelegramBot(args []string) int {
 	fs.StringVar(&persona, "persona", "", "")
 	fs.StringVar(&personaFile, "persona-file", "", "")
 	fs.StringVar(&knowledgeDir, "knowledge-dir", "", "")
+	fs.StringVar(&embedModel, "embed-model", "", "")
+	fs.IntVar(&embedTopK, "embed-top-k", 0, "")
+	fs.Float64Var(&embedMinScore, "embed-min-score", 0, "")
+	fs.IntVar(&embedRefreshSec, "embed-refresh-interval", 0, "")
 	fs.StringVar(&contextDir, "context-dir", "", "")
 	fs.IntVar(&keepRecent, "context-keep-recent", 0, "")
 	fs.IntVar(&compactAfter, "context-compact-after", 0, "")
@@ -10210,6 +10804,18 @@ func cmdTelegramBot(args []string) int {
 		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
 	}
 
+	embedCfg := resolveEmbedConfig(embedModel, embedTopK, embedMinScore, embedRefreshSec)
+	if embedCfg.enabled() {
+		if !knowledgeCfg.enabled() {
+			fmt.Fprintln(os.Stderr, "error: --embed-model ตั้งไว้แต่ไม่มี --knowledge-dir - embedding search ใช้กับฐานความรู้เท่านั้น ไม่มีอะไรให้ index")
+			return 1
+		}
+		if pcfg.Provider != providerOllama {
+			fmt.Fprintln(os.Stderr, "error: --embed-model รองรับเฉพาะ --provider ollama ในตอนนี้ (เรียก Ollama's /api/embed โดยตรง)")
+			return 1
+		}
+	}
+
 	searchCfg := resolveSearchConfig(searxngURL, searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec, flagNoWebSearch)
 	if !flagNoWebSearch {
 		searchCfg.OllamaAPIKey, searchCfg.OllamaBase = resolveOllamaSearchConfig(ollamaSearchKey)
@@ -10263,25 +10869,47 @@ func cmdTelegramBot(args []string) int {
 	}
 
 	session := &telegramSession{
-		client:         modelClient,
-		telegramClient: telegramClient,
-		apiBase:        telegramAPIBase,
-		token:          token,
-		botUsername:    me.Username,
-		access:         access,
-		systemPrompt:   systemPrompt,
-		tools:          tools,
-		knowledgeCfg:   knowledgeCfg,
-		searchCfg:      searchCfg,
-		pcfg:           pcfg,
-		ctxSize:        ctxSize,
-		contextDir:     contextDir,
-		keepRecent:     keepRecent,
-		compactAfter:   compactAfter,
-		ntfyTopic:      ntfyTopic,
-		outFile:        outFile,
-		sem:            make(chan struct{}, maxConcurrent),
-		chatLocks:      map[int64]*sync.Mutex{},
+		client:           modelClient,
+		telegramClient:   telegramClient,
+		apiBase:          telegramAPIBase,
+		token:            token,
+		botUsername:      me.Username,
+		access:           access,
+		systemPrompt:     systemPrompt,
+		tools:            tools,
+		knowledgeCfg:     knowledgeCfg,
+		embedCfg:         embedCfg,
+		knowledgeIdx:     &knowledgeIndexStore{},
+		knowledgeIdxPath: knowledgeIndexPath(contextDir),
+		searchCfg:        searchCfg,
+		pcfg:             pcfg,
+		ctxSize:          ctxSize,
+		contextDir:       contextDir,
+		keepRecent:       keepRecent,
+		compactAfter:     compactAfter,
+		ntfyTopic:        ntfyTopic,
+		outFile:          outFile,
+		sem:              make(chan struct{}, maxConcurrent),
+		chatLocks:        map[int64]*sync.Mutex{},
+	}
+
+	if embedCfg.enabled() {
+		// Load whatever index survived a previous run (if any) so a
+		// restart doesn't force re-embedding a knowledge base that hasn't
+		// changed - buildKnowledgeIndex only (re-)embeds files whose
+		// content hash differs from what's already cached. On a genuinely
+		// first run (no cache file yet) every file is "changed" by
+		// definition, so this embeds the whole knowledge base immediately,
+		// as requested - not lazily on the first search_knowledge call.
+		if prevIdx, err := loadKnowledgeIndex(session.knowledgeIdxPath); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: โหลด knowledge index เดิม (%s) ไม่ได้ (%v) - จะสร้างใหม่ทั้งหมด\n", session.knowledgeIdxPath, err)
+		} else {
+			session.knowledgeIdx.set(prevIdx)
+		}
+		fmt.Println("กำลัง embed ฐานความรู้ (embed-model: " + embedCfg.Model + ")...")
+		session.refreshKnowledgeIndex()
+		fmt.Printf("  embed เสร็จแล้ว: %d chunk(s) ใน index (%s)\n", len(session.knowledgeIdx.get().Chunks), session.knowledgeIdxPath)
+		session.startKnowledgeIndexRefresher(embedCfg.RefreshInterval)
 	}
 
 	fmt.Printf("ola telegrambot: เชื่อมต่อสำเร็จเป็น @%s (model: %s, provider: %s)\n", me.Username, pcfg.Model, pcfg.Provider)

@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -6916,6 +6917,7 @@ func newTestTelegramSession(t *testing.T, telegramSrv, ollamaSrv *httptest.Serve
 		pcfg:           providerConfig{Provider: providerOllama, Host: ollamaSrv.URL, Model: "mock-model"},
 		ctxSize:        4096,
 		contextDir:     contextDir,
+		knowledgeIdx:   &knowledgeIndexStore{},
 		keepRecent:     defaultTelegramKeepRecentTurns,
 		compactAfter:   defaultTelegramCompactAfterTurns,
 		outFile:        logFile,
@@ -7429,5 +7431,422 @@ func TestToolSearchKnowledgeNoFallbackWhenTooManyFilesMatch(t *testing.T) {
 	}
 	if !strings.Contains(result, "doc0.md") {
 		t.Fatalf("expected matched file paths to still be listed so read_knowledge can target one, got: %s", result)
+	}
+}
+
+// ======================================================================
+// Section: telegrambot embedding-based knowledge search
+// ======================================================================
+
+func TestChunkKnowledgeTextShortTextIsOneChunk(t *testing.T) {
+	got := chunkKnowledgeText("นายอรรถพล คงหวาน มีหมาชื่อว่า เมกกะ และมีแมวชื่อ พิคโค่")
+	if len(got) != 1 {
+		t.Fatalf("expected 1 chunk for short text, got %d: %v", len(got), got)
+	}
+}
+
+func TestChunkKnowledgeTextEmptyReturnsNil(t *testing.T) {
+	if got := chunkKnowledgeText("   \n\n  "); got != nil {
+		t.Fatalf("expected nil for blank text, got %v", got)
+	}
+}
+
+func TestChunkKnowledgeTextLongParagraphSplitsWithOverlap(t *testing.T) {
+	// A single paragraph (no \n\n) longer than knowledgeChunkSize runes,
+	// built from multi-byte Thai text - the regression concern here is
+	// that windowSplitRunes must slice on runes, never raw bytes, or a
+	// multi-byte UTF-8 character could be split mid-sequence.
+	para := strings.Repeat("สวัสดีครับผมชื่อโอลา ", 60) // well over knowledgeChunkSize runes
+	chunks := chunkKnowledgeText(para)
+	if len(chunks) < 2 {
+		t.Fatalf("expected the long paragraph to split into multiple chunks, got %d", len(chunks))
+	}
+	for _, c := range chunks {
+		if !utf8.ValidString(c) {
+			t.Fatalf("chunk is not valid UTF-8 (split mid multi-byte character): %q", c)
+		}
+		if utf8.RuneCountInString(c) > knowledgeChunkSize {
+			t.Fatalf("chunk exceeds knowledgeChunkSize: %d runes", utf8.RuneCountInString(c))
+		}
+	}
+}
+
+func TestChunkKnowledgeTextRespectsParagraphBoundaries(t *testing.T) {
+	text := "ย่อหน้าแรก\n\nย่อหน้าที่สอง\n\nย่อหน้าที่สาม"
+	chunks := chunkKnowledgeText(text)
+	// short paragraphs should get packed together into as few chunks as
+	// reasonable, not one chunk per paragraph
+	joined := strings.Join(chunks, " ")
+	for _, want := range []string{"ย่อหน้าแรก", "ย่อหน้าที่สอง", "ย่อหน้าที่สาม"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("expected chunk content to contain %q, got %v", want, chunks)
+		}
+	}
+}
+
+func TestNormalizeVectorAndDotProduct(t *testing.T) {
+	v := normalizeVector([]float32{3, 4}) // 3-4-5 triangle, magnitude 5
+	if math.Abs(float64(v[0])-0.6) > 0.0001 || math.Abs(float64(v[1])-0.8) > 0.0001 {
+		t.Fatalf("expected unit vector [0.6, 0.8], got %v", v)
+	}
+	// a vector against itself (already normalized) has cosine similarity 1
+	if got := dotProduct(v, v); math.Abs(float64(got)-1.0) > 0.0001 {
+		t.Fatalf("expected self dot product ~1.0, got %v", got)
+	}
+	// orthogonal unit vectors have cosine similarity 0
+	a := normalizeVector([]float32{1, 0})
+	b := normalizeVector([]float32{0, 1})
+	if got := dotProduct(a, b); math.Abs(float64(got)) > 0.0001 {
+		t.Fatalf("expected orthogonal dot product ~0, got %v", got)
+	}
+}
+
+func TestNormalizeVectorZeroVectorDoesNotPanic(t *testing.T) {
+	got := normalizeVector([]float32{0, 0, 0})
+	if len(got) != 3 {
+		t.Fatalf("expected zero vector to pass through unchanged, got %v", got)
+	}
+}
+
+// newMockEmbedServer returns an httptest.Server implementing /api/embed
+// with a caller-supplied deterministic text->vector function, plus a call
+// counter (for staleness/incremental-reindex assertions).
+func newMockEmbedServer(t *testing.T, vectorFor func(text string) []float32) (*httptest.Server, *int32) {
+	t.Helper()
+	var calls int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/embed", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		var req struct {
+			Model string   `json:"model"`
+			Input []string `json:"input"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		var embeddings [][]float32
+		for _, in := range req.Input {
+			embeddings = append(embeddings, vectorFor(in))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"model":      req.Model,
+			"embeddings": embeddings,
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, &calls
+}
+
+func TestOllamaEmbedAndBatch(t *testing.T) {
+	srv, calls := newMockEmbedServer(t, func(text string) []float32 {
+		return []float32{float32(len(text)), 1, 2}
+	})
+	vecs, err := ollamaEmbed(srv.Client(), srv.URL, "mock-embed", []string{"a", "bb", "ccc"})
+	if err != nil {
+		t.Fatalf("ollamaEmbed error: %v", err)
+	}
+	if len(vecs) != 3 || vecs[0][0] != 1 || vecs[1][0] != 2 || vecs[2][0] != 3 {
+		t.Fatalf("unexpected vectors: %v", vecs)
+	}
+	if atomic.LoadInt32(calls) != 1 {
+		t.Fatalf("expected exactly 1 batched call for 3 inputs, got %d", *calls)
+	}
+
+	// batching: more inputs than embedBatchSize should split into multiple calls
+	atomic.StoreInt32(calls, 0)
+	var many []string
+	for i := 0; i < embedBatchSize+5; i++ {
+		many = append(many, fmt.Sprintf("text-%d", i))
+	}
+	vecs, err = ollamaEmbedBatch(srv.Client(), srv.URL, "mock-embed", many)
+	if err != nil {
+		t.Fatalf("ollamaEmbedBatch error: %v", err)
+	}
+	if len(vecs) != len(many) {
+		t.Fatalf("expected %d vectors, got %d", len(many), len(vecs))
+	}
+	if atomic.LoadInt32(calls) != 2 {
+		t.Fatalf("expected exactly 2 batched calls for %d inputs (batch size %d), got %d", len(many), embedBatchSize, *calls)
+	}
+}
+
+func TestBuildKnowledgeIndexIncrementalReembedsOnlyChangedFiles(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("เนื้อหาไฟล์ A"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.md"), []byte("เนื้อหาไฟล์ B"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := resolveKnowledgeConfig(dir)
+
+	srv, calls := newMockEmbedServer(t, func(text string) []float32 {
+		return []float32{float32(len(text)), 0, 0}
+	})
+	logFile, _ := os.CreateTemp(t.TempDir(), "log")
+	defer logFile.Close()
+
+	idx1, err := buildKnowledgeIndex(srv.Client(), srv.URL, "mock-embed", cfg, knowledgeIndex{FileHashes: map[string]string{}}, logFile)
+	if err != nil {
+		t.Fatalf("buildKnowledgeIndex (initial) error: %v", err)
+	}
+	if len(idx1.Chunks) != 2 {
+		t.Fatalf("expected 2 chunks (one per file) on initial build, got %d", len(idx1.Chunks))
+	}
+	firstCallCount := atomic.LoadInt32(calls)
+	if firstCallCount == 0 {
+		t.Fatal("expected at least one embed call on initial build")
+	}
+
+	// Re-run with the SAME files unchanged: should reuse cached chunks,
+	// zero new embed calls.
+	atomic.StoreInt32(calls, 0)
+	idx2, err := buildKnowledgeIndex(srv.Client(), srv.URL, "mock-embed", cfg, idx1, logFile)
+	if err != nil {
+		t.Fatalf("buildKnowledgeIndex (unchanged) error: %v", err)
+	}
+	if atomic.LoadInt32(calls) != 0 {
+		t.Fatalf("expected 0 embed calls when no file changed, got %d", *calls)
+	}
+	if len(idx2.Chunks) != 2 {
+		t.Fatalf("expected chunks to be carried over unchanged, got %d", len(idx2.Chunks))
+	}
+
+	// Modify one file: should re-embed ONLY that file's chunk(s).
+	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("เนื้อหาไฟล์ A ที่แก้ไขแล้ว"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	atomic.StoreInt32(calls, 0)
+	idx3, err := buildKnowledgeIndex(srv.Client(), srv.URL, "mock-embed", cfg, idx2, logFile)
+	if err != nil {
+		t.Fatalf("buildKnowledgeIndex (a.md changed) error: %v", err)
+	}
+	if atomic.LoadInt32(calls) != 1 {
+		t.Fatalf("expected exactly 1 embed call (only a.md's single chunk) after editing one file, got %d", *calls)
+	}
+	if len(idx3.Chunks) != 2 {
+		t.Fatalf("expected still 2 chunks total (1 refreshed + 1 reused), got %d", len(idx3.Chunks))
+	}
+
+	// Delete one file: it must not linger in the new index.
+	if err := os.Remove(filepath.Join(dir, "b.md")); err != nil {
+		t.Fatal(err)
+	}
+	idx4, err := buildKnowledgeIndex(srv.Client(), srv.URL, "mock-embed", cfg, idx3, logFile)
+	if err != nil {
+		t.Fatalf("buildKnowledgeIndex (b.md deleted) error: %v", err)
+	}
+	if len(idx4.Chunks) != 1 {
+		t.Fatalf("expected deleted file's chunk to be dropped, got %d chunks", len(idx4.Chunks))
+	}
+	if _, ok := idx4.FileHashes["km/b.md"]; ok {
+		t.Fatal("expected deleted file's hash entry to be removed from the index")
+	}
+}
+
+func TestKnowledgeIndexSaveLoadRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := knowledgeIndexPath(dir)
+
+	loaded, err := loadKnowledgeIndex(path)
+	if err != nil {
+		t.Fatalf("loadKnowledgeIndex on a not-yet-existing file should not error, got: %v", err)
+	}
+	if len(loaded.Chunks) != 0 {
+		t.Fatalf("expected empty index for a fresh path, got %d chunks", len(loaded.Chunks))
+	}
+
+	idx := knowledgeIndex{
+		FileHashes: map[string]string{"km/a.md": "deadbeef"},
+		Chunks: []knowledgeChunk{
+			{Label: "km", Path: "a.md", Text: "เนื้อหา", Embedding: []float32{0.6, 0.8}},
+		},
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.save(path); err != nil {
+		t.Fatalf("save error: %v", err)
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Fatal("expected the .tmp file to be gone after an atomic rename")
+	}
+
+	reloaded, err := loadKnowledgeIndex(path)
+	if err != nil {
+		t.Fatalf("reload error: %v", err)
+	}
+	if len(reloaded.Chunks) != 1 || reloaded.Chunks[0].Text != "เนื้อหา" || reloaded.FileHashes["km/a.md"] != "deadbeef" {
+		t.Fatalf("round-trip mismatch: %#v", reloaded)
+	}
+}
+
+func TestKnowledgeIndexStoreConcurrentAccess(t *testing.T) {
+	st := &knowledgeIndexStore{}
+	st.set(knowledgeIndex{FileHashes: map[string]string{}, Chunks: []knowledgeChunk{{Label: "km", Path: "a.md"}}})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = st.get()
+		}()
+	}
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			st.set(knowledgeIndex{FileHashes: map[string]string{}, Chunks: []knowledgeChunk{{Label: "km", Path: fmt.Sprintf("%d.md", n)}}})
+		}(i)
+	}
+	wg.Wait() // must not panic/race (run with -race to actually catch a data race)
+}
+
+// TestSemanticSearchKnowledgeFindsMeaningNotJustText is the embedding-
+// search version of the exact bug report this whole layer exists to fix:
+// a document says "has a dog named Mecca and a cat named Piccolo" and
+// never contains the word "pets" - exact grep can't find it (see
+// TestToolSearchKnowledgeGrepFallbackWhenQueryWordsDiffer for the
+// content-dump mitigation), but a real embedding model would score the
+// "pets" query highly against that chunk because the MEANING overlaps.
+// Uses a small deterministic mock embedding function (not a real model)
+// that assigns high similarity to the "related" chunk and low similarity
+// to an unrelated one, to prove the ranking/threshold plumbing itself
+// works correctly end to end.
+func TestSemanticSearchKnowledgeFindsMeaningNotJustText(t *testing.T) {
+	srv, _ := newMockEmbedServer(t, func(text string) []float32 {
+		switch {
+		case strings.Contains(text, "เมกกะ") || strings.Contains(text, "สัตว์เลี้ยง"):
+			return []float32{1, 0} // "pets" query and the pets-chunk point the same way
+		default:
+			return []float32{0, 1} // unrelated content points a different way
+		}
+	})
+
+	idx := knowledgeIndex{
+		FileHashes: map[string]string{},
+		Chunks: []knowledgeChunk{
+			{Label: "km", Path: "a.md", Text: "นายอรรถพล คงหวาน มีหมาชื่อว่า เมกกะ และมีแมวชื่อ พิคโค่", Embedding: normalizeVector([]float32{1, 0})},
+			{Label: "km", Path: "b.md", Text: "ตารางเรียนวิชา Network Security", Embedding: normalizeVector([]float32{0, 1})},
+		},
+	}
+
+	scored, err := semanticSearchKnowledge(srv.Client(), srv.URL, "mock-embed", idx, nil, "สัตว์เลี้ยง", 5, 0.5)
+	if err != nil {
+		t.Fatalf("semanticSearchKnowledge error: %v", err)
+	}
+	if len(scored) != 1 {
+		t.Fatalf("expected exactly 1 result above the score threshold, got %d: %v", len(scored), scored)
+	}
+	if !strings.Contains(scored[0].Chunk.Text, "เมกกะ") {
+		t.Fatalf("expected the pets chunk to be the match, got: %s", scored[0].Chunk.Text)
+	}
+	if scored[0].Score < 0.99 {
+		t.Fatalf("expected near-perfect similarity for the deterministic mock vectors, got %v", scored[0].Score)
+	}
+}
+
+func TestSemanticSearchKnowledgeRespectsAllowedFilesFilter(t *testing.T) {
+	srv, _ := newMockEmbedServer(t, func(text string) []float32 { return []float32{1, 0} })
+	idx := knowledgeIndex{
+		Chunks: []knowledgeChunk{
+			{Label: "km", Path: "a.md", Text: "A", Embedding: normalizeVector([]float32{1, 0})},
+			{Label: "km", Path: "b.md", Text: "B", Embedding: normalizeVector([]float32{1, 0})},
+		},
+	}
+	scored, err := semanticSearchKnowledge(srv.Client(), srv.URL, "mock-embed", idx, map[string]bool{"km/a.md": true}, "q", 5, 0.0)
+	if err != nil {
+		t.Fatalf("semanticSearchKnowledge error: %v", err)
+	}
+	if len(scored) != 1 || scored[0].Chunk.Path != "a.md" {
+		t.Fatalf("expected only km/a.md to be considered, got: %v", scored)
+	}
+}
+
+// TestSearchKnowledgeToolUsesEmbeddingFallbackEndToEnd drives the actual
+// telegramSession.searchKnowledgeTool dispatch path (what
+// runTelegramToolLoop really calls) through the full grep-misses ->
+// embedding-search-hits flow, using the real a.md content from the bug
+// report.
+func TestSearchKnowledgeToolUsesEmbeddingFallbackEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("นายอรรถพล คงหวาน มีหมาชื่อว่า เมกกะ และมีแมวชื่อ พิคโค่"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	knowledgeCfg, _ := resolveKnowledgeConfig(dir)
+
+	embedSrv, _ := newMockEmbedServer(t, func(text string) []float32 {
+		if strings.Contains(text, "เมกกะ") || strings.Contains(text, "สัตว์เลี้ยง") {
+			return []float32{1, 0}
+		}
+		return []float32{0, 1}
+	})
+
+	telegramSrv, _ := newMockTelegramSendMessageServer(t)
+	ollamaSrv := httptest.NewServer(http.NewServeMux()) // unused for this test, just needs to exist
+	defer ollamaSrv.Close()
+
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, t.TempDir(), map[int64]bool{1: true})
+	session.knowledgeCfg = knowledgeCfg
+	session.embedCfg = embedConfig{Model: "mock-embed", TopK: 5, MinScore: 0.5}
+	session.client = embedSrv.Client() // searchKnowledgeTool calls ollamaEmbed via s.client
+	session.pcfg.Host = embedSrv.URL
+
+	idx, err := buildKnowledgeIndex(embedSrv.Client(), embedSrv.URL, "mock-embed", knowledgeCfg, knowledgeIndex{FileHashes: map[string]string{}}, session.outFile)
+	if err != nil {
+		t.Fatalf("buildKnowledgeIndex error: %v", err)
+	}
+	session.knowledgeIdx.set(idx)
+
+	result, err := session.searchKnowledgeTool(map[string]interface{}{"pattern": "*", "query": "สัตว์เลี้ยง"})
+	if err != nil {
+		t.Fatalf("searchKnowledgeTool error: %v", err)
+	}
+	if !strings.Contains(result, "เมกกะ") || !strings.Contains(result, "พิคโค่") {
+		t.Fatalf("expected the semantic-search fallback to surface the actual answer, got: %s", result)
+	}
+	if !strings.Contains(result, "embedding") {
+		t.Fatalf("expected the result to be labeled as coming from embedding search, got: %s", result)
+	}
+}
+
+// TestSearchKnowledgeToolFallsBackWhenEmbeddingScoresAreLow confirms that
+// when semantic search runs but finds nothing above --embed-min-score,
+// searchKnowledgeTool still falls through to the existing small-file
+// content-dump fallback rather than returning an empty-handed "no match".
+func TestSearchKnowledgeToolFallsBackWhenEmbeddingScoresAreLow(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("เนื้อหาที่ไม่เกี่ยวข้องกับคำถามเลย"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	knowledgeCfg, _ := resolveKnowledgeConfig(dir)
+
+	embedSrv, _ := newMockEmbedServer(t, func(text string) []float32 {
+		return []float32{float32(len(text) % 7), float32(len(text) % 5)} // low/inconsistent similarity by construction
+	})
+
+	telegramSrv, _ := newMockTelegramSendMessageServer(t)
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, t.TempDir(), map[int64]bool{1: true})
+	session.knowledgeCfg = knowledgeCfg
+	session.embedCfg = embedConfig{Model: "mock-embed", TopK: 5, MinScore: 0.999} // impossibly high bar - forces the fallback
+	session.client = embedSrv.Client()
+	session.pcfg.Host = embedSrv.URL
+
+	idx, err := buildKnowledgeIndex(embedSrv.Client(), embedSrv.URL, "mock-embed", knowledgeCfg, knowledgeIndex{FileHashes: map[string]string{}}, session.outFile)
+	if err != nil {
+		t.Fatalf("buildKnowledgeIndex error: %v", err)
+	}
+	session.knowledgeIdx.set(idx)
+
+	result, err := session.searchKnowledgeTool(map[string]interface{}{"pattern": "*", "query": "คำค้นที่ไม่ตรงอะไรเลย"})
+	if err != nil {
+		t.Fatalf("searchKnowledgeTool error: %v", err)
+	}
+	if !strings.Contains(result, "เนื้อหาที่ไม่เกี่ยวข้อง") {
+		t.Fatalf("expected the small-file-dump fallback to still fire when embedding scores are all below threshold, got: %s", result)
 	}
 }
