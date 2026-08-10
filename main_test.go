@@ -6905,21 +6905,22 @@ func newTestTelegramSession(t *testing.T, telegramSrv, ollamaSrv *httptest.Serve
 	}
 	t.Cleanup(func() { logFile.Close() })
 	return &telegramSession{
-		client:       ollamaSrv.Client(),
-		apiBase:      telegramSrv.URL,
-		token:        "test-token",
-		botUsername:  "olabot",
-		access:       telegramAccessConfig{Users: users, Groups: map[int64]bool{}},
-		systemPrompt: builtinTelegramSystemPromptIntro + "\n\n" + builtinTelegramSystemPromptRules,
-		tools:        filterTools(builtinTools, "get_current_time", "delay"),
-		pcfg:         providerConfig{Provider: providerOllama, Host: ollamaSrv.URL, Model: "mock-model"},
-		ctxSize:      4096,
-		contextDir:   contextDir,
-		keepRecent:   defaultTelegramKeepRecentTurns,
-		compactAfter: defaultTelegramCompactAfterTurns,
-		outFile:      logFile,
-		sem:          make(chan struct{}, 4),
-		chatLocks:    map[int64]*sync.Mutex{},
+		client:         ollamaSrv.Client(),
+		telegramClient: telegramSrv.Client(),
+		apiBase:        telegramSrv.URL,
+		token:          "test-token",
+		botUsername:    "olabot",
+		access:         telegramAccessConfig{Users: users, Groups: map[int64]bool{}},
+		systemPrompt:   builtinTelegramSystemPromptIntro + "\n\n" + builtinTelegramSystemPromptRules,
+		tools:          filterTools(builtinTools, "get_current_time", "delay"),
+		pcfg:           providerConfig{Provider: providerOllama, Host: ollamaSrv.URL, Model: "mock-model"},
+		ctxSize:        4096,
+		contextDir:     contextDir,
+		keepRecent:     defaultTelegramKeepRecentTurns,
+		compactAfter:   defaultTelegramCompactAfterTurns,
+		outFile:        logFile,
+		sem:            make(chan struct{}, 4),
+		chatLocks:      map[int64]*sync.Mutex{},
 	}
 }
 
@@ -7340,5 +7341,33 @@ func TestHandleTelegramMessageGroundsWebSearchResultInFollowUpRequest(t *testing
 	}
 	if !strings.Contains(secondRoundBody, "example.com/gold") {
 		t.Fatalf("expected the real SearXNG result URL to reach the model, body: %s", secondRoundBody)
+	}
+}
+
+// TestBuildTelegramHTTPClientsTimeouts is the regression test for a real
+// production bug: cmdTelegramBot once gave the SAME short-timeout client
+// to both Telegram API calls and model (Ollama/OpenAI) calls, which meant
+// every single message failed against a real local Ollama server with
+// "context deadline exceeded (Client.Timeout exceeded while awaiting
+// headers)" as soon as the model took longer than 30s to respond (routine
+// for a large model) - see buildTelegramHTTPClients' own doc comment.
+// This pins down the three clients' timeouts so that regression can't
+// silently come back. Deliberately doesn't compare against a live slow
+// server (that would make the test itself slow/flaky) - the property
+// that matters and is fully checkable without one is which Timeout value
+// each client got.
+func TestBuildTelegramHTTPClientsTimeouts(t *testing.T) {
+	pollTimeoutSec := 600
+	poll, telegram, model := buildTelegramHTTPClients(pollTimeoutSec)
+
+	if model.Timeout != 0 {
+		t.Fatalf("SECURITY/RELIABILITY REGRESSION: the model (Ollama/OpenAI) HTTP client must be unbounded (Timeout=0, matching newHTTPClient()), got %v - a large local model taking longer than this to respond would fail every single message", model.Timeout)
+	}
+	if telegram.Timeout <= 0 || telegram.Timeout > 2*time.Minute {
+		t.Fatalf("expected the Telegram API client to have a short, bounded timeout (fail fast on a hung connection), got %v", telegram.Timeout)
+	}
+	wantMinPoll := time.Duration(pollTimeoutSec) * time.Second
+	if poll.Timeout <= wantMinPoll {
+		t.Fatalf("expected the poll client's timeout (%v) to be comfortably longer than --poll-timeout (%ds), or long polls would be killed client-side before Telegram can answer", poll.Timeout, pollTimeoutSec)
 	}
 }

@@ -9589,23 +9589,24 @@ func filterTools(all []ollamaTool, names ...string) []ollamaTool {
 // ─────────────────────────────────────────────────────────────────
 
 type telegramSession struct {
-	client       *http.Client
-	apiBase      string
-	token        string
-	botUsername  string
-	access       telegramAccessConfig
-	systemPrompt string
-	tools        []ollamaTool
-	knowledgeCfg knowledgeConfig
-	searchCfg    searchConfig
-	pcfg         providerConfig
-	ctxSize      int
-	contextDir   string
-	keepRecent   int
-	compactAfter int
-	ntfyTopic    string
-	outFile      *os.File
-	sem          chan struct{}
+	client         *http.Client // unbounded (no Timeout) - see buildTelegramHTTPClients' own doc comment for why this must never be given a short timeout
+	telegramClient *http.Client // short-timeout client, Telegram Bot API only (sendMessage/getMe) - never used for model calls
+	apiBase        string
+	token          string
+	botUsername    string
+	access         telegramAccessConfig
+	systemPrompt   string
+	tools          []ollamaTool
+	knowledgeCfg   knowledgeConfig
+	searchCfg      searchConfig
+	pcfg           providerConfig
+	ctxSize        int
+	contextDir     string
+	keepRecent     int
+	compactAfter   int
+	ntfyTopic      string
+	outFile        *os.File
+	sem            chan struct{}
 
 	mu        sync.Mutex
 	chatLocks map[int64]*sync.Mutex
@@ -9827,7 +9828,7 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 		if chat.Type != "private" {
 			reply += fmt.Sprintf("\nGroup Chat ID: %d", chat.ID)
 		}
-		_ = tgSendMessage(s.client, s.apiBase, s.token, chat.ID, reply)
+		_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID, reply)
 		return
 	}
 
@@ -9836,7 +9837,7 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 		if chat.Type != "private" {
 			reply += fmt.Sprintf("\nGroup Chat ID: %d", chat.ID)
 		}
-		_ = tgSendMessage(s.client, s.apiBase, s.token, chat.ID, reply)
+		_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID, reply)
 		s.logf("[telegram_denied] user=%d(%s) chat=%d(%s) type=%s\n", from.ID, from.Username, chat.ID, chat.Title, chat.Type)
 		return
 	}
@@ -9851,7 +9852,7 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 	// from inside the chat itself, without needing shell/log access to the
 	// host it's running on.
 	if text == "/tools" {
-		_ = tgSendMessage(s.client, s.apiBase, s.token, chat.ID, s.toolsStatusText())
+		_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID, s.toolsStatusText())
 		return
 	}
 
@@ -9862,7 +9863,7 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 	cctx, err := loadChatContext(s.contextDir, chat)
 	if err != nil {
 		s.logf("[telegram_error] โหลด context ไม่ได้: %v\n", err)
-		_ = tgSendMessage(s.client, s.apiBase, s.token, chat.ID, "ขออภัย เกิดข้อผิดพลาดในการโหลดบทสนทนา ลองใหม่อีกครั้ง")
+		_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID, "ขออภัย เกิดข้อผิดพลาดในการโหลดบทสนทนา ลองใหม่อีกครั้ง")
 		return
 	}
 
@@ -9880,7 +9881,7 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 		if s.ntfyTopic != "" {
 			sendNotification(s.ntfyTopic, truncateWords(fmt.Sprintf("[telegrambot error] chat=%d: %v", chat.ID, err), maxNotificationWords))
 		}
-		_ = tgSendMessage(s.client, s.apiBase, s.token, chat.ID, "ขออภัย เกิดข้อผิดพลาดระหว่างประมวลผล ลองใหม่อีกครั้ง")
+		_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID, "ขออภัย เกิดข้อผิดพลาดระหว่างประมวลผล ลองใหม่อีกครั้ง")
 		return
 	}
 	s.logf("[assistant] %s\n", answer)
@@ -9894,7 +9895,7 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 		s.logf("[telegram_error] บันทึก context ไม่ได้: %v\n", err)
 	}
 
-	if err := tgSendMessage(s.client, s.apiBase, s.token, chat.ID, answer); err != nil {
+	if err := tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID, answer); err != nil {
 		s.logf("[telegram_error] ส่งข้อความกลับไม่ได้: %v\n", err)
 	}
 }
@@ -9954,6 +9955,39 @@ func telegramUsage(fs *flag.FlagSet) func() {
 		fmt.Println("คำสั่งในตัว: /whoami หรือ /start (ดู user/chat ID ของตัวเอง, ใช้ได้แม้ยังไม่อยู่ใน allowlist), /tools (เช็คสถานะ tool ปัจจุบัน - เฉพาะผู้ที่อยู่ใน allowlist)")
 		fs.PrintDefaults()
 	}
+}
+
+// buildTelegramHTTPClients returns three *DIFFERENT* http.Client values
+// for telegrambot's three distinct kinds of outbound call, each with the
+// timeout that kind of call actually needs:
+//
+//   - poll: getUpdates long-polling. Blocks server-side for up to
+//     pollTimeoutSec waiting for a new message, so this client's own
+//     Timeout must be comfortably longer than that or every long poll
+//     gets killed client-side before Telegram ever gets a chance to
+//     answer.
+//   - telegram: every other Telegram Bot API call (sendMessage, getMe) -
+//     ordinary fast REST calls, a normal short timeout is correct and
+//     desirable here (fail fast on a hung connection).
+//   - model: calls to the configured Ollama/OpenAI-compatible endpoint
+//     (doChatRound, used by both runTelegramToolLoop and
+//     compactChatContext). THIS ONE MUST NOT HAVE A SHORT TIMEOUT - real
+//     model inference, especially a large local model on modest hardware
+//     or with reasoning/"thinking" enabled, can legitimately take far
+//     longer than any fixed REST-call timeout to even begin streaming a
+//     response. A regression once gave this call the SAME short-timeout
+//     client as the Telegram API calls, which surfaced in practice as
+//     "context deadline exceeded (Client.Timeout exceeded while awaiting
+//     headers)" against the local Ollama server on every single message,
+//     regardless of --poll-timeout (which only affects the poll client
+//     above, never this one). newHTTPClient() - the same zero-Timeout
+//     client "ask"/"coding" already use for their own model calls - is
+//     the correct choice here, not a hand-rolled one.
+func buildTelegramHTTPClients(pollTimeoutSec int) (poll, telegram, model *http.Client) {
+	poll = &http.Client{Timeout: time.Duration(pollTimeoutSec+15) * time.Second}
+	telegram = &http.Client{Timeout: 30 * time.Second}
+	model = newHTTPClient()
+	return poll, telegram, model
 }
 
 func cmdTelegramBot(args []string) int {
@@ -10149,38 +10183,34 @@ func cmdTelegramBot(args []string) int {
 		ntfyTopic = os.Getenv("OLA_TOPIC")
 	}
 
-	// getUpdates blocks for up to pollTimeoutSec waiting for new messages -
-	// this client needs its own Timeout comfortably longer than that, or
-	// every long poll gets killed client-side before Telegram can answer.
-	// sendMessage/getMe use a normal short-timeout client instead.
-	pollClient := &http.Client{Timeout: time.Duration(pollTimeoutSec+15) * time.Second}
-	apiClient := &http.Client{Timeout: 30 * time.Second}
+	pollClient, telegramClient, modelClient := buildTelegramHTTPClients(pollTimeoutSec)
 
-	me, err := tgGetMe(apiClient, telegramAPIBase, token)
+	me, err := tgGetMe(telegramClient, telegramAPIBase, token)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: เชื่อมต่อ Telegram Bot API ไม่ได้ (เช็ค OLA_TELEGRAM_TOKEN และการเชื่อมต่อเน็ต): %v\n", err)
 		return 1
 	}
 
 	session := &telegramSession{
-		client:       apiClient,
-		apiBase:      telegramAPIBase,
-		token:        token,
-		botUsername:  me.Username,
-		access:       access,
-		systemPrompt: systemPrompt,
-		tools:        tools,
-		knowledgeCfg: knowledgeCfg,
-		searchCfg:    searchCfg,
-		pcfg:         pcfg,
-		ctxSize:      ctxSize,
-		contextDir:   contextDir,
-		keepRecent:   keepRecent,
-		compactAfter: compactAfter,
-		ntfyTopic:    ntfyTopic,
-		outFile:      outFile,
-		sem:          make(chan struct{}, maxConcurrent),
-		chatLocks:    map[int64]*sync.Mutex{},
+		client:         modelClient,
+		telegramClient: telegramClient,
+		apiBase:        telegramAPIBase,
+		token:          token,
+		botUsername:    me.Username,
+		access:         access,
+		systemPrompt:   systemPrompt,
+		tools:          tools,
+		knowledgeCfg:   knowledgeCfg,
+		searchCfg:      searchCfg,
+		pcfg:           pcfg,
+		ctxSize:        ctxSize,
+		contextDir:     contextDir,
+		keepRecent:     keepRecent,
+		compactAfter:   compactAfter,
+		ntfyTopic:      ntfyTopic,
+		outFile:        outFile,
+		sem:            make(chan struct{}, maxConcurrent),
+		chatLocks:      map[int64]*sync.Mutex{},
 	}
 
 	fmt.Printf("ola telegrambot: เชื่อมต่อสำเร็จเป็น @%s (model: %s, provider: %s)\n", me.Username, pcfg.Model, pcfg.Provider)
