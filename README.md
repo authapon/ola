@@ -2,15 +2,16 @@
 
 **ola** เป็น CLI (คำสั่งเดียว, ไบนารีเดียว, เขียนด้วย Go ล้วน ไม่พึ่งพา `curl`/`jq`/`perl`/`base64` ภายนอก) สำหรับคุยกับ LLM ผ่าน Ollama (หรือ endpoint แบบ OpenAI-compatible ใดก็ได้) พร้อม **tool calling ที่เปิดใช้งานเสมอ** — โมเดลไม่ได้แค่ตอบข้อความ แต่ *อ่าน/เขียน/แก้ไฟล์จริงบนดิสก์*, รันคำสั่ง shell, ค้นเว็บ, เรียก API, โอนไฟล์ข้าม host, และถามคุณกลับเมื่อจำเป็น ทั้งหมดนี้ sandbox อยู่ใน current directory ที่คุณรัน `ola` เท่านั้น
 
-โปรเจกต์นี้มีสามคำสั่งย่อย:
+โปรเจกต์นี้มีสี่คำสั่งย่อย:
 
 | คำสั่ง | ใช้เมื่อไหร่ |
 |---|---|
 | [`ola ask`](#ola-ask) | ถามคำถามครั้งเดียว มี human คอยตอบโต้ระหว่างทางได้ (เหมือนคุยกับ AI assistant ทั่วไป แต่มันแก้ไฟล์ให้จริง) |
 | [`ola coding`](#ola-coding) | ให้ทำงานยาว ๆ แบบไม่มีคนเฝ้า: ป้อนไฟล์ requirements แล้วปล่อยให้มันวางแผน → เขียนโค้ด → build/test เอง → แก้จนผ่านจริง |
 | [`ola telegrambot`](#ola-telegrambot) | รัน ola เป็น Telegram bot แบบ long-running ตอบเฉพาะ user/group ที่กำหนดไว้ล่วงหน้า ใช้ toolset แบบ read-only (ไม่แตะไฟล์/shell) พร้อมความจำต่อแชทที่ persist ข้าม process |
+| [`ola discordbot`](#ola-discordbot) | Discord counterpart ของ `telegrambot` — หลักการ/toolset/ความจำเหมือนกันทุกประการ ต่างแค่วิธีเชื่อมต่อกับแพลตฟอร์ม (Gateway WebSocket แทน long-polling) |
 
-> ทั้งสามคำสั่งพูดได้สองภาษา (protocol): Ollama's native `/api/chat` (ค่าเริ่มต้น) หรือ endpoint แบบ OpenAI chat-completions (`-P openai`) — ดู [Provider](#provider-ollama-vs-openai-compatible)
+> ทั้งสี่คำสั่งพูดได้สองภาษา (protocol): Ollama's native `/api/chat` (ค่าเริ่มต้น) หรือ endpoint แบบ OpenAI chat-completions (`-P openai`) — ดู [Provider](#provider-ollama-vs-openai-compatible)
 
 ---
 
@@ -23,17 +24,18 @@
 5. [`ola ask`](#ola-ask)
 6. [`ola coding`](#ola-coding)
 7. [`ola telegrambot`](#ola-telegrambot)
-8. [Provider: ollama vs openai-compatible](#provider-ollama-vs-openai-compatible)
-9. [Web search / web fetch](#web-search--web-fetch)
-10. [ตั้งค่า SearXNG ด้วย `websearch.yml`](#ตั้งค่า-searxng-ด้วย-websearchyml)
-11. [Skills system](#skills-system)
-12. [scp_copy — โอนไฟล์ข้าม host](#scp_copy--โอนไฟล์ข้าม-host)
-13. [api_request — เรียก HTTP API](#api_request--เรียก-http-api)
-14. [Quiet mode](#quiet-mode)
-15. [ntfy.sh push notifications](#ntfysh-push-notifications)
-16. [ไฟล์แพลตฟอร์ม (`platform_linux.go` / `platform_other.go`)](#ไฟล์แพลตฟอร์ม)
-17. [การรันเทสต์](#การรันเทสต์)
-18. [ข้อจำกัด/สิ่งที่ควรรู้](#ข้อจำกัดสิ่งที่ควรรู้)
+8. [`ola discordbot`](#ola-discordbot)
+9. [Provider: ollama vs openai-compatible](#provider-ollama-vs-openai-compatible)
+10. [Web search / web fetch](#web-search--web-fetch)
+11. [ตั้งค่า SearXNG ด้วย `websearch.yml`](#ตั้งค่า-searxng-ด้วย-websearchyml)
+12. [Skills system](#skills-system)
+13. [scp_copy — โอนไฟล์ข้าม host](#scp_copy--โอนไฟล์ข้าม-host)
+14. [api_request — เรียก HTTP API](#api_request--เรียก-http-api)
+15. [Quiet mode](#quiet-mode)
+16. [ntfy.sh push notifications](#ntfysh-push-notifications)
+17. [ไฟล์แพลตฟอร์ม (`platform_linux.go` / `platform_other.go`)](#ไฟล์แพลตฟอร์ม)
+18. [การรันเทสต์](#การรันเทสต์)
+19. [ข้อจำกัด/สิ่งที่ควรรู้](#ข้อจำกัดสิ่งที่ควรรู้)
 
 ---
 
@@ -44,23 +46,28 @@
 - **เขียนไฟล์จริง ไม่ใช่ข้อความให้ copy-paste** — ola รุ่นเก่าเคยมีกลไก marker พิเศษ (`<<<ooo FILENAME ooo>>> ... <<<xxx FILENAME xxx>>>`) กับคำสั่งย่อย `extract` ให้มนุษย์ค่อยแยกไฟล์เอาทีหลัง กลไกนั้นถูกถอดออกไปแล้ว — ตอนนี้ `write_file`/`edit_file` แก้ไฟล์บนดิสก์ทันที
 - **System prompt คงที่ ตายตัวในไบนารี** — ไม่มี `-s/--system` ให้เปลี่ยนจากภายนอกอีกต่อไป เพราะ contract ของ tool calling (tool มีอะไรบ้าง, sandbox ยังไง, เมื่อไหร่ต้องถาม user) สำคัญเกินกว่าจะให้ override แบบเสี่ยง prompt พังตอนรันจริง ข้อยกเว้นเดียวคือส่วน "AVAILABLE SKILLS" ที่ *เติมต่อ* ท้าย prompt เมื่อตั้งค่า skills เท่านั้น (ดู [Skills system](#skills-system))
 - **ไม่เชื่อคำพูดโมเดิลเปล่า ๆ** — เมื่อโมเดิลแก้ไฟล์โค้ด ola จะรัน build/test ของโปรเจกต์เองอย่างอิสระอีกครั้งก่อนยอมรับว่า "เสร็จ" (`ola ask`) หรือบังคับ gate หลายชั้น (`ola coding`) แทนที่จะเชื่อว่าโมเดิลพูดว่า "compiles/passes tests" แล้วจบ
-- **โครงสร้างซอร์สโค้ด** — โปรเจกต์รวมไฟล์ทั้งหมดเหลือน้อยไฟล์ (file-count cleanup): `main.go` (entry point + tool-calling loop ของทั้งสามคำสั่งย่อย + integrations ทั้งหมด รวม `telegrambot`), `main_test.go` (เทสต์ทั้งหมด), และ `platform_linux.go`/`platform_other.go` ที่แยกเฉพาะโค้ดที่ผูกกับ build tag (`//go:build linux` / `//go:build !linux`) เพราะไฟล์แบบ build-tag ต้องมี "เฉพาะ" โค้ดที่ตรงเงื่อนไขเท่านั้น เลยรวมเข้า `main.go` ไม่ได้
-- **`telegrambot` เป็น trust model คนละแบบกับ `ask`/`coding`** — สองคำสั่งนั้นรันในเทอร์มินัลของผู้ดำเนินการเอง แต่ `telegrambot` รับข้อความจากคนอื่นผ่านอินเทอร์เน็ต จึงมี toolset แบบ read-only เท่านั้น (ไม่มี `read_file`/`write_file`/`run_command`/ฯลฯ) และ dispatcher tool ของตัวเอง (`dispatchTelegramToolCall`) แยกจาก `ask`/`coding` โดยเจตนา — ดู [`ola telegrambot`](#ola-telegrambot)
+- **โครงสร้างซอร์สโค้ด** — โปรเจกต์รวมไฟล์ทั้งหมดเหลือน้อยไฟล์ (file-count cleanup): `main.go` (entry point + tool-calling loop ของทั้งสี่คำสั่งย่อย + integrations ทั้งหมด รวม `telegrambot`/`discordbot`), `main_test.go` (เทสต์ทั้งหมด), และ `platform_linux.go`/`platform_other.go` ที่แยกเฉพาะโค้ดที่ผูกกับ build tag (`//go:build linux` / `//go:build !linux`) เพราะไฟล์แบบ build-tag ต้องมี "เฉพาะ" โค้ดที่ตรงเงื่อนไขเท่านั้น เลยรวมเข้า `main.go` ไม่ได้
+- **`telegrambot`/`discordbot` เป็น trust model คนละแบบกับ `ask`/`coding`** — สองคำสั่งนั้นรันในเทอร์มินัลของผู้ดำเนินการเอง แต่แชทบอททั้งสองรับข้อความจากคนอื่นผ่านอินเทอร์เน็ต จึงมี toolset แบบ read-only เท่านั้น (ไม่มี `read_file`/`write_file`/`run_command`/ฯลฯ) และ dispatcher tool ของตัวเอง (`dispatchChatToolCall`) แยกจาก `ask`/`coding` โดยเจตนา — ดู [`ola telegrambot`](#ola-telegrambot)/[`ola discordbot`](#ola-discordbot)
+- **`telegrambot`/`discordbot` ใช้ core ร่วมกัน** — persona, ฐานความรู้ (grep + embedding search), context compaction, grounding marker กัน hallucination, และ tool-calling loop ล้วนอยู่ใน `chatBotCore` ที่ทั้งสองบอท embed ใช้ร่วมกัน มีแค่การเชื่อมต่อ/รับส่งข้อความกับแพลตฟอร์มเท่านั้นที่ต่างกันจริงๆ — บั๊กที่แก้ในส่วน core จะได้ประโยชน์กับทั้งสองบอทพร้อมกันเสมอ
+- **ต้องมี `github.com/gorilla/websocket` เป็น Go dependency เดียว** — เพราะ Discord ไม่มี long-polling ต้องเปิด WebSocket connection ค้างไว้ (Gateway) ซึ่ง Go stdlib ไม่มี WebSocket client ให้ใช้ ส่วนที่เหลือทั้งหมด (Gateway protocol เอง, REST client, ทุก integration อื่น) ยังเขียนด้วย stdlib ล้วนเหมือนเดิม — ดู [`ola discordbot`](#ola-discordbot) สำหรับรายละเอียดการตัดสินใจนี้
 
 ---
 
 ## การติดตั้ง
 
-**ข้อกำหนด:** Go **1.26.2** ขึ้นไป (ตาม `go.mod`) — ไม่มี Go module dependency ภายนอกเลย (มาตรฐาน stdlib ล้วน) ตัว `ola` binary เองจึง build ได้โดยไม่ต้องพึ่งอะไรเพิ่ม ยกเว้นสอง feature ที่พึ่ง system binary ภายนอกตอน**รัน**จริง (ไม่ใช่ตอน build): `scp_copy` (opt-in, ต้องตั้งค่าก่อนถึงจะเปิดใช้) ต้องมี `scp`, ส่วนการอ่าน PDF (ทั้งแนบผ่าน `[files...]` และ tool `read_pdf` ที่เปิดเสมอไม่ต้องตั้งค่า) ต้องมี `pdftoppm` (แพ็กเกจ `poppler-utils`) — ดู [scp_copy](#scp_copy--โอนไฟล์ข้าม-host) และ [กลไกอ่าน PDF](#กลไกอ่าน-pdf)
+**ข้อกำหนด:** Go **1.26.2** ขึ้นไป (ตาม `go.mod`) — เกือบทั้งหมด stdlib ล้วน มี Go module dependency ภายนอกอยู่ **ตัวเดียว**: `github.com/gorilla/websocket` (ใช้เฉพาะโดย `ola discordbot` สำหรับต่อ WebSocket Gateway — Go stdlib ไม่มี WebSocket client ให้ใช้ ดู [`ola discordbot`](#ola-discordbot) สำหรับเหตุผลเต็ม) แปลว่าต้องมีอินเทอร์เน็ตตอน `go build`/`go mod tidy` ครั้งแรก (หรือ vendor ไว้ล่วงหน้า) แต่หลังจากนั้น build ได้ตามปกติ ตัว `ola` binary เองใช้งานได้โดยไม่ต้องพึ่งอะไรเพิ่ม ยกเว้นสอง feature ที่พึ่ง system binary ภายนอกตอน**รัน**จริง (ไม่ใช่ตอน build): `scp_copy` (opt-in, ต้องตั้งค่าก่อนถึงจะเปิดใช้) ต้องมี `scp`, ส่วนการอ่าน PDF (ทั้งแนบผ่าน `[files...]` และ tool `read_pdf` ที่เปิดเสมอไม่ต้องตั้งค่า) ต้องมี `pdftoppm` (แพ็กเกจ `poppler-utils`) — ดู [scp_copy](#scp_copy--โอนไฟล์ข้าม-host) และ [กลไกอ่าน PDF](#กลไกอ่าน-pdf)
 
 ```bash
-# 1) เตรียมโฟลเดอร์โปรเจกต์ (main.go, main_test.go, go.mod, platform_linux.go, platform_other.go ต้องอยู่ที่เดียวกัน)
+# 1) เตรียมโฟลเดอร์โปรเจกต์ (main.go, main_test.go, go.mod, go.sum, platform_linux.go, platform_other.go ต้องอยู่ที่เดียวกัน)
 cd /path/to/ola
 
-# 2) build เป็นไบนารีชื่อ ola
+# 2) ดึง dependency ตัวเดียว (ครั้งแรกเท่านั้น ต้องมีอินเทอร์เน็ต)
+go mod download
+
+# 3) build เป็นไบนารีชื่อ ola
 go build -o ola .
 
-# 3) (แนะนำ) ย้ายเข้า PATH
+# 4) (แนะนำ) ย้ายเข้า PATH
 sudo mv ola /usr/local/bin/ola
 # หรือสำหรับ user เดียว:
 mv ola ~/.local/bin/ola   # ต้องแน่ใจว่า ~/.local/bin อยู่ใน $PATH แล้ว
@@ -575,6 +582,73 @@ ola telegrambot \
 | — | `-o, --output` | `telegrambot.log` | log ไฟล์แบบเต็ม เปิดแบบ **append เสมอ** (ต่างจาก `ask`/`coding` ที่ overwrite เป็น default — `telegrambot` เป็น process เดียวรันยาวข้าม restart) |
 
 ตัวแปรที่เหลือ (การเชื่อมต่อโมเดล `-m/-c/-P/--api-base/-k`, `-x/--topic`, และ web search/fetch ทั้งชุด `--searxng-url`/`--ollama-search-key`/`--no-web-search`/ฯลฯ) ใช้ร่วมกับ `ola ask` ทุกประการ — ดู [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด) และ [Web search / web fetch](#web-search--web-fetch) `web_search` เปิดอัตโนมัติเมื่อมีการตั้ง backend ไว้ (SearXNG หรือ Ollama search key) ส่วน `web_fetch` เปิดอัตโนมัติเสมอเหมือน `ask` จนกว่าจะสั่ง `--no-web-search`
+
+---
+
+## `ola discordbot`
+
+Discord counterpart ของ `ola telegrambot` — **หลักการ, toolset, persona, ฐานความรู้ (grep + embedding search), context compaction, grounding marker กัน hallucination ทั้งหมดเหมือนกันทุกประการ** เพราะทั้งสองบอทใช้ `chatBotCore` ตัวเดียวกัน (ดู [ภาพรวมและปรัชญาการออกแบบ](#ภาพรวมและปรัชญาการออกแบบ)) — **หัวข้อนี้จะพูดถึงเฉพาะส่วนที่ต่างจาก `telegrambot` เท่านั้น** ส่วนที่เหมือนกัน (persona ordering, embedding search, `/tools`-เทียบเท่า, ฯลฯ) ดูรายละเอียดเต็มได้ที่ [`ola telegrambot`](#ola-telegrambot)
+
+### ความต่างสำคัญ: ไม่มี long-polling ต้องใช้ WebSocket Gateway
+
+Discord ไม่มี endpoint แบบ `getUpdates` ของ Telegram — บอทต้องเปิด **WebSocket connection ค้างไว้ตลอดเวลา** ไปที่ Discord's Gateway เพื่อรับข้อความ ไม่มีทางเลี่ยงด้วย REST อย่างเดียว เนื่องจาก Go standard library ไม่มี WebSocket client เลย โปรเจกต์นี้เลยต้องมี **Go dependency ภายนอกตัวเดียว** คือ `github.com/gorilla/websocket` ใช้เฉพาะสำหรับ WebSocket frame transport เท่านั้น — ทุกอย่างที่เหนือกว่านั้น (Gateway protocol เอง: HELLO/IDENTIFY/HEARTBEAT/DISPATCH, REST client, rate-limit handling) ยังเขียนด้วย `net/http`/`encoding/json` ตรงๆ เหมือน integration อื่นทุกตัวในโปรเจกต์นี้
+
+**ข้อจำกัดที่ตั้งใจไว้:** เมื่อ connection หลุด (ไม่ว่าจากเหตุผลอะไร) discordbot จะ **reconnect ด้วย IDENTIFY ใหม่เสมอ** แทนที่จะ implement RESUME handshake (OP 6 ของ Discord ที่ replay session เดิมเพื่อกู้ event ที่พลาดไปช่วงสั้นๆ ตอน reconnect) — IDENTIFY ใหม่เป็นพฤติกรรมที่ Discord รองรับอย่างเป็นทางการเช่นกัน (ไม่ใช่ workaround) เพียงแต่มีโอกาสพลาดข้อความที่ถูกส่งมาในช่วงไม่กี่วินาทีระหว่าง reconnect ถ้าเรื่องนี้สำคัญกับการใช้งานของคุณ อาจพิจารณา implement RESUME เพิ่มเติมในอนาคต
+
+### ⚠️ ต้องเปิด "Message Content Intent" ด้วยมือใน Discord Developer Portal
+
+การอ่านเนื้อหาข้อความ (`content`) เป็น **privileged intent** ของ Discord ต้องไปเปิดที่ Developer Portal → Bot → Privileged Gateway Intents ด้วยตัวเอง (โค้ดขอ intent นี้ตอน IDENTIFY อยู่แล้ว แต่ Discord จะไม่อนุญาตถ้ายังไม่ได้เปิดในพอร์ทัล) **ลืมเปิดจุดนี้คือสาเหตุอันดับหนึ่งที่บอท online ปกติแต่เพิกเฉยทุกข้อความเงียบๆ โดยไม่มี error ให้เห็นเลย** เช็คจุดนี้ก่อนเป็นอันดับแรกถ้าบอทดูเหมือนไม่ตอบอะไร
+
+### เริ่มต้นใช้งาน
+
+```bash
+export OLA_DISCORD_TOKEN='your-bot-token-from-discord-developer-portal'
+export OLA_OLLAMA_MODEL=qwen3.6:27b
+
+# ยังไม่รู้ user id ของตัวเอง? ทัก !whoami กับบอทหลัง DM ได้ (ทำงานแม้ยังไม่อยู่ใน allowlist)
+ola discordbot --discord-allowed-users 000000000000000000
+
+# ใช้งานจริง
+ola discordbot \
+  --discord-allowed-users 111111111111111111 \
+  --discord-allowed-guilds 222222222222222222 \
+  --persona 'คุณคือผู้ช่วยตอบคำถามวิชา Network Security ของภาควิชา ตอบสุภาพ กระชับ เป็นภาษาไทย' \
+  --knowledge-dir /srv/course-docs/network-security \
+  --embed-model bge-m3
+```
+
+### Allowlist สามชั้น (ต่างจาก Telegram ที่มีสองชั้น)
+
+Discord ซ้อนโครงสร้างลึกกว่า Telegram: Server (guild) > Channel > Message
+
+| Flag | ความหมาย |
+|---|---|
+| `--discord-allowed-users` | user ID ที่ DM ได้ (เหมือน `--telegram-allowed-users`) |
+| `--discord-allowed-guilds` | server ID ที่บอทตอบได้ |
+| `--discord-allowed-channels` | **optional** — จำกัดเฉพาะบาง channel ใน guild ที่อนุญาต ถ้าไม่ตั้งจะตอบได้ทุก channel ของ guild นั้น |
+
+### พฤติกรรมใน guild channel
+
+ตอบเฉพาะเมื่อถูก **@mention** (เช็คจาก `mentions` array ที่ Discord parse มาให้แล้ว ไม่ได้ regex เอง) หรือขึ้นต้นด้วย `!ola`/`!ask` — **ยังไม่รองรับการตอบกลับด้วย reply** (ต่างจาก Telegram ที่ reply ข้อความบอทก็ทำงาน) เพราะ Discord's `message_reference` มีแค่ `message_id` ไม่มีข้อมูลผู้เขียนข้อความที่ถูก reply ติดมาด้วย ต้องมี REST call เพิ่มไปดึงข้อความนั้นก่อนถึงจะรู้ว่าเป็นข้อความของบอทหรือเปล่า — ตัดออกไปก่อนเพื่อไม่ต้องมี round-trip เพิ่มทุกข้อความในกลุ่ม
+
+### ความจำต่อแชท: แยกตาม channel ไม่ใช่ทั้ง server
+
+ต่างจาก Telegram ที่ group หนึ่งกลุ่ม = context หนึ่งไฟล์ Discord แยกความจำเป็น**รายแชนแนล** (`discord_channel_<id>.json`) เพราะแต่ละ channel ในเซิร์ฟเวอร์เดียวกันมักคุยกันคนละเรื่อง ให้แต่ละ channel มีความจำของตัวเองสมเหตุสมผลกว่าแชร์ความจำทั้งเซิร์ฟเวอร์ ส่วน DM ใช้ `discord_dm_<user id>.json` — คีย์ทั้งหมดขึ้นต้นด้วย `discord_` เสมอ ชนกับ key ของ Telegram (`user_<id>`/`group_<id>`) ไม่ได้ ดังนั้น**ใช้ `--context-dir` เดียวกันกับ telegrambot ได้อย่างปลอดภัย** ถ้าอยากรันสองบอทคู่กัน
+
+### Flags / Environment variables
+
+| ตัวแปร | Flag | ค่าเริ่มต้น | หมายเหตุ |
+|---|---|---|---|
+| `OLA_DISCORD_TOKEN` | *(env เท่านั้น)* | — | **จำเป็น** — bot token จาก Discord Developer Portal |
+| `OLA_DISCORD_ALLOWED_USERS` | `--discord-allowed-users` | — | comma-separated user ID (DM) |
+| `OLA_DISCORD_ALLOWED_GUILDS` | `--discord-allowed-guilds` | — | comma-separated server ID |
+| `OLA_DISCORD_ALLOWED_CHANNELS` | `--discord-allowed-channels` | — | comma-separated channel ID (optional) |
+| `OLA_DISCORD_CONTEXT_DIR` | `--context-dir` | `discord-context` | ที่เก็บไฟล์ context ราย DM/channel |
+| `OLA_DISCORD_API_BASE` | `--discord-api-base` | `https://discord.com/api/v10` | override สำหรับทดสอบกับ mock server |
+| — | `--discord-max-concurrent` | `4` | จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส |
+| — | `-o, --output` | `discordbot.log` | log ไฟล์แบบเต็ม เปิดแบบ append เสมอ |
+
+ตัวแปรที่เหลือทั้งหมด (`--persona`/`--persona-file`, `--knowledge-dir`, `--embed-model`/`--embed-top-k`/`--embed-min-score`/`--embed-refresh-interval`, `--context-keep-recent`/`--context-compact-after`, การเชื่อมต่อโมเดล, web search/fetch ทั้งชุด) **ใช้ร่วมกับ `ola telegrambot` ทุก flag ทุกพฤติกรรมเป๊ะๆ** — ดู [`ola telegrambot`](#ola-telegrambot) และ [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด)
 
 ---
 

@@ -198,6 +198,7 @@ import (
 	"io"
 	"io/fs"
 	"math"
+	"math/rand"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -215,6 +216,8 @@ import (
 	"syscall"
 	"time"
 	"unicode/utf8"
+
+	"github.com/gorilla/websocket"
 )
 
 // ─────────────────────────────────────────────────────────────────
@@ -468,6 +471,8 @@ func main() {
 		os.Exit(cmdCoding(os.Args[2:]))
 	case "telegrambot":
 		os.Exit(cmdTelegramBot(os.Args[2:]))
+	case "discordbot":
+		os.Exit(cmdDiscordBot(os.Args[2:]))
 	case "-h", "--help", "help":
 		printTopUsage()
 		os.Exit(0)
@@ -496,7 +501,12 @@ func printTopUsage() {
 	fmt.Println("          much smaller read-only toolset than ask/coding (no filesystem/")
 	fmt.Println("          shell access) plus persistent, auto-compacted per-chat context.")
 	fmt.Println()
-	fmt.Println("Run 'ola ask -h', 'ola coding -h', or 'ola telegrambot -h' for command-specific help.")
+	fmt.Println("  discordbot   Discord counterpart of telegrambot - same principles (allow-")
+	fmt.Println("          listed users/servers, persona, knowledge base, per-chat context)")
+	fmt.Println("          over a persistent Gateway WebSocket connection instead of long-")
+	fmt.Println("          polling, since Discord has no polling endpoint.")
+	fmt.Println()
+	fmt.Println("Run 'ola ask -h', 'ola coding -h', 'ola telegrambot -h', or 'ola discordbot -h' for command-specific help.")
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -8748,7 +8758,7 @@ func marshalDryRunPayload(provider llmProvider, req ollamaRequest) ([]byte, erro
 // edit_file/create_folder/run_command/scp_copy/api_request/ask_user - only
 // read-only lookups: search_knowledge/read_knowledge (a configured,
 // read-only document folder set - never the bot process's own cwd) and,
-// if configured, web_search/web_fetch. See dispatchTelegramToolCall's own
+// if configured, web_search/web_fetch. See dispatchChatToolCall's own
 // doc comment for why this subcommand does NOT reuse dispatchToolCall.
 // ─────────────────────────────────────────────────────────────────
 
@@ -9846,30 +9856,25 @@ func resolveTelegramPersona(personaFlag, personaFile string) (string, error) {
 	return strings.TrimSpace(persona), nil
 }
 
-// builtinTelegramSystemPrompt is split into an intro and a rules half
-// (rather than one block) specifically so persona can be inserted BETWEEN
-// them - see cmdTelegramBot's assembly of the final systemPrompt. Putting
-// persona right after the identity-establishing opening line, before the
-// rule bullets, matters in practice: a persona appended only at the very
-// end (after a generic "you are an AI assistant" framing plus a long list
-// of rules) was observed to sometimes lose out to that generic framing -
-// a model asked "what's your name" would answer "I'm a bot" instead of
-// the persona's own name, even though the persona text was present
-// somewhere in the same system prompt the whole time. Naming/personality
-// is presented here as the FIRST thing established, and
-// builtinTelegramSystemPromptRules' own last bullet explicitly calls out
-// this exact failure mode - separate from (but still just as additive/
-// non-overridable-of-the-safety-rules as) the persona mechanism itself;
-// see resolveTelegramPersona and this section's header comment.
-const builtinTelegramSystemPromptIntro = `คุณคือผู้ช่วย AI ที่ตอบคำถามผ่านบอท Telegram`
+// chatBotSystemPromptIntro builds the identity-establishing opening line
+// for a given platform name - kept as a tiny function rather than two
+// separate constants so builtinChatBotSystemPromptRules' shared content
+// (everything else about the fixed contract) never needs to be
+// duplicated between telegrambot and discordbot. Putting persona right
+// after this intro, before the rule bullets, matters in practice - see
+// buildChatBotSystemPrompt's own doc comment for the full "why".
+func chatBotSystemPromptIntro(platform string) string {
+	return "คุณคือผู้ช่วย AI ที่ตอบคำถามผ่านบอท " + platform
+}
 
-// builtinTelegramSystemPromptRules is telegrambot's own fixed base prompt
-// - separate from builtinSystemPrompt/builtinCodingSystemPrompt because
-// the tool contract is genuinely different (no filesystem/shell tools at
-// all; read-only knowledge/web lookups only - see this section's header
-// comment) and because replies here are chat messages on a phone screen,
-// not terminal output.
-const builtinTelegramSystemPromptRules = `กติกาพื้นฐานที่ต้องทำตามเสมอ:
+// builtinChatBotSystemPromptRules is the fixed base prompt shared by
+// telegrambot and discordbot - separate from builtinSystemPrompt/
+// builtinCodingSystemPrompt because the tool contract is genuinely
+// different (no filesystem/shell tools at all; read-only knowledge/web
+// lookups only - see this section's header comment) and because replies
+// here are chat messages on a phone screen, not terminal output. Nothing
+// in this text is platform-specific.
+const builtinChatBotSystemPromptRules = `กติกาพื้นฐานที่ต้องทำตามเสมอ:
 - ตอบเป็นข้อความแชทธรรมดา กระชับ อ่านง่ายบนมือถือ - ไม่ใช่รายงานยาวเป็นหน้าๆ เว้นแต่ผู้ใช้ขอรายละเอียดเจาะจง
 - ทุกคำตอบสุดท้ายต้องมีเนื้อความเสมอ ห้ามตอบข้อความว่างเปล่าเด็ดขาด ถ้าไม่แน่ใจว่าจะตอบอะไร ให้ถามกลับหรือบอกตรงๆ ว่าไม่มีข้อมูลพอ ดีกว่าปล่อยว่าง
 - คุณไม่มีเครื่องมือแก้ไฟล์ รันคำสั่ง หรือเข้าถึงระบบปฏิบัติการใดๆ ทั้งสิ้น เครื่องมือที่อาจมีให้ (ถ้าตั้งค่าไว้ - เช็คได้จาก tool list ที่แนบมากับ request นี้) มีแค่: search_knowledge/read_knowledge (ฐานความรู้ที่ผู้ดูแลกำหนดไว้ล่วงหน้า, read-only), web_search/web_fetch (ค้นอินเทอร์เน็ต, ถ้าเปิดใช้), get_current_time, delay
@@ -9882,35 +9887,55 @@ const builtinTelegramSystemPromptRules = `กติกาพื้นฐาน�
 - ห้ามแต่งคำตอบให้ดูเหมือนเพิ่งค้นข้อมูลมา (เช่น ใส่ 🔍, "ผลการค้นหา", "คำค้นที่ 1/2/3", "ข้อมูลอ้างอิง", ลิงก์/URL ที่ไม่มีจริง) เว้นแต่ข้อความนั้นมาจากผลลัพธ์จริงของ web_search/web_fetch/search_knowledge ที่เพิ่งเรียกในเทิร์นนี้เท่านั้น - ผลลัพธ์จริงจาก tool เหล่านี้จะขึ้นต้นด้วย "[ผลลัพธ์จริงจากการเรียก ... เมื่อครู่นี้]" เสมอ ถ้าไม่มีข้อความแบบนั้นอยู่ในบทสนทนานี้จริง ห้ามอ้างว่าค้นแล้วเด็ดขาด ให้ตอบจากความรู้ทั่วไปแล้วบอกตรงๆ ว่าไม่ได้ค้นสด หรือเรียก tool จริงก่อนแล้วค่อยตอบ
 `
 
-// buildTelegramSystemPrompt assembles the final system prompt from the
-// fixed intro/rules halves plus the optional persona, in that specific
-// order (intro, then persona, then rules) - see
-// builtinTelegramSystemPromptIntro's own doc comment for why the order
-// matters. Pulled out as its own function (rather than left inline in
-// cmdTelegramBot) so the assembly itself is directly unit-testable
-// without needing to drive cmdTelegramBot's whole startup path.
-func buildTelegramSystemPrompt(persona string) string {
-	systemPrompt := builtinTelegramSystemPromptIntro
+// buildChatBotSystemPrompt assembles the final system prompt from the
+// platform intro/shared rules plus the optional persona, in that specific
+// order (intro, then persona, then rules) - see chatBotSystemPromptIntro's
+// own doc comment for why the order matters: a persona appended only at
+// the very end (after a generic "you are an AI assistant" framing plus a
+// long list of rules) was observed to sometimes lose out to that generic
+// framing - a model asked "what's your name" would answer "I'm a bot"
+// instead of the persona's own name, even though the persona text was
+// present somewhere in the same system prompt the whole time.
+func buildChatBotSystemPrompt(platform, persona string) string {
+	systemPrompt := chatBotSystemPromptIntro(platform)
 	if persona != "" {
 		systemPrompt += "\n\n─── PERSONA (กำหนดโดยผู้ดูแล ผ่าน --persona/--persona-file) ───\nนี่คือชื่อ บุคลิก และวิธีพูดของคุณ - ใช้เป็นตัวตนของคุณเสมอในทุกคำตอบ:\n" + persona + "\n─── จบ PERSONA ───"
 	}
-	systemPrompt += "\n\n" + builtinTelegramSystemPromptRules
+	systemPrompt += "\n\n" + builtinChatBotSystemPromptRules
 	return systemPrompt
 }
 
+func buildTelegramSystemPrompt(persona string) string {
+	return buildChatBotSystemPrompt("Telegram", persona)
+}
+func buildDiscordSystemPrompt(persona string) string {
+	return buildChatBotSystemPrompt("Discord", persona)
+}
+
 // ─────────────────────────────────────────────────────────────────
-// Per-chat persistent context: one JSON file per private user or group,
-// under --context-dir/OLA_TELEGRAM_CONTEXT_DIR. This is durable, cross-
-// process, cross-restart memory - not to be confused with compactMessages
-// (used by "coding" to trim a single run's in-flight request, see that
-// function's own doc comment). What's stored here is only the human-
-// visible exchange (final user message + final assistant answer) for each
-// turn, not that turn's own tool-calling scratch work - the intermediate
-// tool_call/tool_result messages of a turn's reasoning loop stay ephemeral
-// (in memory for that one request, logged in full to the -o log file, see
-// runTelegramToolLoop) rather than persisted long-term. That keeps the
-// persisted file small and focused on what a human would actually want
-// "remembered" about the conversation.
+// Per-chat persistent context: one JSON file per conversation (a private/
+// DM chat, a Telegram group, or a Discord channel), under --context-dir.
+// Shared by both telegramSession and discordSession via chatBotCore - see
+// that struct's own doc comment. This is durable, cross-process, cross-
+// restart memory - not to be confused with compactMessages (used by
+// "coding" to trim a single run's in-flight request, see that function's
+// own doc comment). What's stored here is only the human-visible exchange
+// (final user message + final assistant answer) for each turn, not that
+// turn's own tool-calling scratch work - the intermediate tool_call/
+// tool_result messages of a turn's reasoning loop stay ephemeral (in
+// memory for that one request, logged in full to the -o log file, see
+// chatBotCore.runChatToolLoop) rather than persisted long-term. That
+// keeps the persisted file small and focused on what a human would
+// actually want "remembered" about the conversation.
+//
+// Keyed by a plain string (not a platform-specific chat/channel type) so
+// this same code serves both bots: telegramContextKey/discordContextKey
+// build that string per platform. Telegram's key format ("user_<id>" /
+// "group_<id>") is unchanged from before this generalization - existing
+// on-disk context files from a running telegrambot deployment keep
+// working exactly as before. Discord's keys are prefixed "discord_" so
+// the two platforms can safely share one --context-dir without ever
+// colliding, even though Telegram and Discord IDs are both just numbers.
 // ─────────────────────────────────────────────────────────────────
 
 type chatTurn struct {
@@ -9920,28 +9945,31 @@ type chatTurn struct {
 }
 
 type chatContext struct {
-	ChatID      int64      `json:"chat_id"`
-	ChatType    string     `json:"chat_type"`
+	Key         string     `json:"key"`
 	Summary     string     `json:"summary,omitempty"`
 	Turns       []chatTurn `json:"turns"`
 	Compactions int        `json:"compactions"`
 	LastActive  time.Time  `json:"last_active"`
 }
 
-func chatContextPath(dir string, chat tgChat) string {
+func telegramContextKey(chat tgChat) string {
 	kind := "user"
 	if chat.Type != "private" {
 		kind = "group"
 	}
-	return filepath.Join(dir, fmt.Sprintf("%s_%d.json", kind, chat.ID))
+	return fmt.Sprintf("%s_%d", kind, chat.ID)
 }
 
-func loadChatContext(dir string, chat tgChat) (*chatContext, error) {
-	path := chatContextPath(dir, chat)
+func chatContextPath(dir, key string) string {
+	return filepath.Join(dir, key+".json")
+}
+
+func loadChatContext(dir, key string) (*chatContext, error) {
+	path := chatContextPath(dir, key)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return &chatContext{ChatID: chat.ID, ChatType: chat.Type}, nil
+			return &chatContext{Key: key}, nil
 		}
 		return nil, fmt.Errorf("อ่าน context %s ไม่ได้: %v", path, err)
 	}
@@ -9949,12 +9977,15 @@ func loadChatContext(dir string, chat tgChat) (*chatContext, error) {
 	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, fmt.Errorf("parse context %s ไม่ได้: %v", path, err)
 	}
+	if c.Key == "" {
+		c.Key = key
+	}
 	return &c, nil
 }
 
 // save writes the context file atomically (write to a .tmp sibling, then
-// rename over the real path) rather than a plain os.WriteFile. telegrambot
-// is meant to run unattended for days/weeks - if the process is killed
+// rename over the real path) rather than a plain os.WriteFile. Both bots
+// are meant to run unattended for days/weeks - if the process is killed
 // mid-write (OOM, host reboot, systemd restart) a plain WriteFile could
 // leave a truncated, unparseable JSON file behind, permanently losing that
 // chat's memory on next load. A rename is atomic on the same filesystem,
@@ -9964,7 +9995,7 @@ func (c *chatContext) save(dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("สร้าง context-dir %s ไม่ได้: %v", dir, err)
 	}
-	path := chatContextPath(dir, tgChat{ID: c.ChatID, Type: c.ChatType})
+	path := chatContextPath(dir, c.Key)
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal context ไม่ได้: %v", err)
@@ -10051,7 +10082,7 @@ func compactChatContext(client *http.Client, pcfg providerConfig, ctxSize int, c
 // ─────────────────────────────────────────────────────────────────
 // Tool dispatch
 //
-// dispatchTelegramToolCall is a DELIBERATELY SEPARATE dispatcher from
+// dispatchChatToolCall is a DELIBERATELY SEPARATE dispatcher from
 // dispatchToolCall (used by "ask"/"coding") - it does NOT call
 // dispatchToolCall and fall back to it for unknown names. Reusing
 // dispatchToolCall here would be a real security gap: its switch
@@ -10063,11 +10094,11 @@ func compactChatContext(client *http.Client, pcfg providerConfig, ctxSize int, c
 // steered by a prompt injected through a fetched web page or a knowledge
 // document - could emit a "write_file" tool_call it was never offered,
 // and dispatchToolCall would still execute it against whatever directory
-// the bot process happens to be running in. dispatchTelegramToolCall only
+// the bot process happens to be running in. dispatchChatToolCall only
 // ever recognizes the exact tool names telegrambot explicitly offers.
 // ─────────────────────────────────────────────────────────────────
 
-func dispatchTelegramToolCall(tc toolCall, outFile *os.File, extra func(name string, args map[string]interface{}) (string, error, bool)) string {
+func dispatchChatToolCall(tc toolCall, outFile *os.File, extra func(name string, args map[string]interface{}) (string, error, bool)) string {
 	var args map[string]interface{}
 	unmarshalErr := json.Unmarshal(tc.Function.Arguments, &args)
 
@@ -10131,13 +10162,30 @@ func filterTools(all []ollamaTool, names ...string) []ollamaTool {
 // an incoming update.
 // ─────────────────────────────────────────────────────────────────
 
-type telegramSession struct {
-	client           *http.Client // unbounded (no Timeout) - see buildTelegramHTTPClients' own doc comment for why this must never be given a short timeout
-	telegramClient   *http.Client // short-timeout client, Telegram Bot API only (sendMessage/getMe) - never used for model calls
-	apiBase          string
-	token            string
-	botUsername      string
-	access           telegramAccessConfig
+// ─────────────────────────────────────────────────────────────────
+// chatBotCore: the platform-agnostic half of a chat-bot session, shared
+// by telegramSession and discordSession via embedding. Everything on
+// here - the tool-calling loop, the knowledge base (grep + embedding
+// search), context compaction, the /tools-style status text - has never
+// depended on which chat platform is asking; the only genuinely
+// platform-specific work is the wire format each bot's transport speaks
+// (long-polling + REST for Telegram, a persistent Gateway WebSocket + REST
+// for Discord - see discordSession) and how each platform's messages/
+// allowlists are shaped. Splitting this out means a fix made here (this
+// file has already been through several rounds of real bug fixes - empty-
+// completion retries, the persona-ordering fix, the fabricated-search-
+// narration grounding markers, incremental knowledge-base embedding)
+// benefits both bots automatically, instead of needing to be re-applied
+// to two independent copies that would slowly drift apart.
+//
+// Go embedding means every field and method here is directly accessible
+// as e.g. s.client or s.runChatToolLoop(...) from a *telegramSession or
+// *discordSession that embeds chatBotCore by value - callers don't need
+// to know or care that these are "actually" on a different struct.
+// ─────────────────────────────────────────────────────────────────
+
+type chatBotCore struct {
+	client           *http.Client // unbounded (no Timeout) - see buildTelegramHTTPClients'/buildDiscordHTTPClients' own doc comments for why this must never be given a short timeout
 	systemPrompt     string
 	tools            []ollamaTool
 	knowledgeCfg     knowledgeConfig
@@ -10152,7 +10200,20 @@ type telegramSession struct {
 	compactAfter     int
 	ntfyTopic        string
 	outFile          *os.File
-	sem              chan struct{}
+}
+
+func (c *chatBotCore) logf(format string, a ...interface{}) {
+	fmt.Fprintf(c.outFile, format, a...)
+}
+
+type telegramSession struct {
+	chatBotCore
+	telegramClient *http.Client // short-timeout client, Telegram Bot API only (sendMessage/getMe) - never used for model calls
+	apiBase        string
+	token          string
+	botUsername    string
+	access         telegramAccessConfig
+	sem            chan struct{}
 
 	mu        sync.Mutex
 	chatLocks map[int64]*sync.Mutex
@@ -10169,11 +10230,7 @@ func (s *telegramSession) chatMutex(chatID int64) *sync.Mutex {
 	return m
 }
 
-func (s *telegramSession) logf(format string, a ...interface{}) {
-	fmt.Fprintf(s.outFile, format, a...)
-}
-
-// telegramGroundToolResult prefixes a provenance marker onto a successful
+// groundToolResult prefixes a provenance marker onto a successful
 // result from one of the fact-retrieval tools (web_search, web_fetch,
 // search_knowledge, read_knowledge) before it's fed back to the model as
 // a tool message. This exists because of an observed failure mode: a
@@ -10187,11 +10244,11 @@ func (s *telegramSession) logf(format string, a ...interface{}) {
 // gives the model an explicit, checkable boundary between "this exact
 // text came from a real tool call just now" and everything else it
 // generates, paired with the matching instruction in
-// builtinTelegramSystemPromptRules that forbids search-style framing
+// builtinChatBotSystemPromptRules that forbids search-style framing
 // anywhere else. A mitigation, not a guarantee - a model that ignores
 // tool results already ignores instructions too; see this section's
 // README notes on model reliability limits.
-func telegramGroundToolResult(toolName, result string) string {
+func groundToolResult(toolName, result string) string {
 	grounded := map[string]bool{
 		"web_search": true, "web_fetch": true, "search_knowledge": true, "read_knowledge": true,
 	}
@@ -10218,8 +10275,8 @@ func telegramGroundToolResult(toolName, result string) string {
 //     falls through to formatKnowledgeSearchResult's own last-resort
 //     fallback (small-file content dump) - unchanged from before this
 //     method existed.
-func (s *telegramSession) searchKnowledgeTool(args map[string]interface{}) (string, error) {
-	if !s.knowledgeCfg.enabled() {
+func (c *chatBotCore) searchKnowledgeTool(args map[string]interface{}) (string, error) {
+	if !c.knowledgeCfg.enabled() {
 		return "", fmt.Errorf("search_knowledge ไม่ได้ถูกตั้งค่าสำหรับเซสชันนี้")
 	}
 	pattern, _ := args["pattern"].(string)
@@ -10228,24 +10285,24 @@ func (s *telegramSession) searchKnowledgeTool(args map[string]interface{}) (stri
 	}
 	query, _ := args["query"].(string)
 
-	matches, grepHits, limitHit := knowledgeGrepSearch(pattern, query, s.knowledgeCfg)
+	matches, grepHits, limitHit := knowledgeGrepSearch(pattern, query, c.knowledgeCfg)
 
-	if query == "" || len(grepHits) > 0 || !s.embedCfg.enabled() || s.knowledgeIdx == nil {
-		return formatKnowledgeSearchResult(matches, grepHits, limitHit, query, s.knowledgeCfg), nil
+	if query == "" || len(grepHits) > 0 || !c.embedCfg.enabled() || c.knowledgeIdx == nil {
+		return formatKnowledgeSearchResult(matches, grepHits, limitHit, query, c.knowledgeCfg), nil
 	}
 
 	allowed := make(map[string]bool, len(matches))
 	for _, m := range matches {
 		allowed[m] = true
 	}
-	idx := s.knowledgeIdx.get()
-	scored, err := semanticSearchKnowledge(s.client, s.pcfg.Host, s.embedCfg.Model, idx, allowed, query, s.embedCfg.TopK, s.embedCfg.MinScore)
+	idx := c.knowledgeIdx.get()
+	scored, err := semanticSearchKnowledge(c.client, c.pcfg.Host, c.embedCfg.Model, idx, allowed, query, c.embedCfg.TopK, c.embedCfg.MinScore)
 	if err != nil {
-		s.logf("[telegram_warning] embedding search ล้มเหลว (%v) - ใช้ fallback เดิมแทน\n", err)
-		return formatKnowledgeSearchResult(matches, grepHits, limitHit, query, s.knowledgeCfg), nil
+		c.logf("[telegram_warning] embedding search ล้มเหลว (%v) - ใช้ fallback เดิมแทน\n", err)
+		return formatKnowledgeSearchResult(matches, grepHits, limitHit, query, c.knowledgeCfg), nil
 	}
 	if len(scored) == 0 {
-		return formatKnowledgeSearchResult(matches, grepHits, limitHit, query, s.knowledgeCfg), nil
+		return formatKnowledgeSearchResult(matches, grepHits, limitHit, query, c.knowledgeCfg), nil
 	}
 
 	var b strings.Builder
@@ -10258,23 +10315,23 @@ func (s *telegramSession) searchKnowledgeTool(args map[string]interface{}) (stri
 
 // refreshKnowledgeIndex re-walks the knowledge base, (re-)embeds any
 // new/changed files (see buildKnowledgeIndex), swaps the result into
-// s.knowledgeIdx, and persists it to disk. Safe to call repeatedly - an
+// c.knowledgeIdx, and persists it to disk. Safe to call repeatedly - an
 // unchanged knowledge base costs one cheap directory walk and zero embed
 // API calls on every call after the first. No-ops entirely if embedding
 // isn't configured.
-func (s *telegramSession) refreshKnowledgeIndex() {
-	if !s.embedCfg.enabled() || !s.knowledgeCfg.enabled() || s.knowledgeIdx == nil {
+func (c *chatBotCore) refreshKnowledgeIndex() {
+	if !c.embedCfg.enabled() || !c.knowledgeCfg.enabled() || c.knowledgeIdx == nil {
 		return
 	}
-	prev := s.knowledgeIdx.get()
-	newIdx, err := buildKnowledgeIndex(s.client, s.pcfg.Host, s.embedCfg.Model, s.knowledgeCfg, prev, s.outFile)
+	prev := c.knowledgeIdx.get()
+	newIdx, err := buildKnowledgeIndex(c.client, c.pcfg.Host, c.embedCfg.Model, c.knowledgeCfg, prev, c.outFile)
 	if err != nil {
-		s.logf("[telegram_error] refresh knowledge index ล้มเหลว: %v\n", err)
+		c.logf("[telegram_error] refresh knowledge index ล้มเหลว: %v\n", err)
 		return
 	}
-	s.knowledgeIdx.set(newIdx)
-	if err := newIdx.save(s.knowledgeIdxPath); err != nil {
-		s.logf("[telegram_error] บันทึก knowledge index ไม่ได้: %v\n", err)
+	c.knowledgeIdx.set(newIdx)
+	if err := newIdx.save(c.knowledgeIdxPath); err != nil {
+		c.logf("[telegram_error] บันทึก knowledge index ไม่ได้: %v\n", err)
 	}
 }
 
@@ -10286,12 +10343,12 @@ func (s *telegramSession) refreshKnowledgeIndex() {
 // index - and the very first search_knowledge call - is ready
 // immediately, per the explicit "embed ทุกไฟล์ทันที" requirement) and
 // only starts this background ticker afterward.
-func (s *telegramSession) startKnowledgeIndexRefresher(interval time.Duration) {
+func (c *chatBotCore) startKnowledgeIndexRefresher(interval time.Duration) {
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for range ticker.C {
-			s.refreshKnowledgeIndex()
+			c.refreshKnowledgeIndex()
 		}
 	}()
 }
@@ -10299,7 +10356,7 @@ func (s *telegramSession) startKnowledgeIndexRefresher(interval time.Duration) {
 // runTelegramToolLoop is the per-message counterpart of cmdAsk's own
 // inline tool-calling loop (see that function's own "for {" loop): call
 // the model via doChatRound, dispatch any tool_calls via
-// dispatchTelegramToolCall, feed results back, repeat until a plain
+// dispatchChatToolCall, feed results back, repeat until a plain
 // answer or the iteration cap is hit. Kept as its own small loop here
 // (sharing doChatRound/maxToolIterations with "ask", but not "ask"'s
 // verify-loop/session-change-log machinery, which is specific to a
@@ -10307,32 +10364,41 @@ func (s *telegramSession) startKnowledgeIndexRefresher(interval time.Duration) {
 // factored out of cmdAsk into a fully shared function - see the earlier
 // design discussion: that refactor is a reasonable future improvement,
 // not required to ship this safely.
-func (s *telegramSession) runTelegramToolLoop(messages []ollamaMessage) (string, error) {
+// runChatToolLoop is the shared tool-calling loop both telegramSession
+// and discordSession drive their per-message replies through: call the
+// model via doChatRound, dispatch any tool_calls via dispatchChatToolCall,
+// feed results back (through groundToolResult - see its own doc comment),
+// repeat until a plain answer or the iteration cap is hit. Modeled on
+// cmdAsk's own inline tool-calling loop (see that function's own "for {"
+// loop) but without "ask"'s verify-loop/session-change-log machinery,
+// which is specific to a filesystem-editing session neither chat bot ever
+// runs.
+func (c *chatBotCore) runChatToolLoop(messages []ollamaMessage) (string, error) {
 	extra := func(name string, args map[string]interface{}) (string, error, bool) {
 		switch name {
 		case "search_knowledge":
-			if !s.knowledgeCfg.enabled() {
+			if !c.knowledgeCfg.enabled() {
 				return "", nil, false
 			}
-			r, e := s.searchKnowledgeTool(args)
+			r, e := c.searchKnowledgeTool(args)
 			return r, e, true
 		case "read_knowledge":
-			if !s.knowledgeCfg.enabled() {
+			if !c.knowledgeCfg.enabled() {
 				return "", nil, false
 			}
-			r, e := toolReadKnowledge(args, s.knowledgeCfg)
+			r, e := toolReadKnowledge(args, c.knowledgeCfg)
 			return r, e, true
 		case "web_search":
-			if !s.searchCfg.searchEnabled() {
+			if !c.searchCfg.searchEnabled() {
 				return "", nil, false
 			}
-			r, e := toolWebSearch(args, s.searchCfg)
+			r, e := toolWebSearch(args, c.searchCfg)
 			return r, e, true
 		case "web_fetch":
-			if !s.searchCfg.fetchEnabled() {
+			if !c.searchCfg.fetchEnabled() {
 				return "", nil, false
 			}
-			r, e := toolWebFetch(args, s.searchCfg)
+			r, e := toolWebFetch(args, c.searchCfg)
 			return r, e, true
 		default:
 			return "", nil, false
@@ -10340,13 +10406,13 @@ func (s *telegramSession) runTelegramToolLoop(messages []ollamaMessage) (string,
 	}
 
 	req := ollamaRequest{
-		Model:   s.pcfg.Model,
-		Options: ollamaOptions{NumCtx: s.ctxSize},
+		Model:   c.pcfg.Model,
+		Options: ollamaOptions{NumCtx: c.ctxSize},
 		Stream:  true,
-		Tools:   s.tools,
+		Tools:   c.tools,
 	}
 
-	// telegramMaxEmptyRetries guards against a real failure mode observed
+	// chatBotMaxEmptyRetries guards against a real failure mode observed
 	// in practice: a round with statusCode<400 and no error can still come
 	// back with BOTH outcome.Content and outcome.ToolCalls empty (e.g. a
 	// reasoning model that spent its whole output budget "thinking" and
@@ -10355,7 +10421,7 @@ func (s *telegramSession) runTelegramToolLoop(messages []ollamaMessage) (string,
 	// answer" final result would silently persist and send an empty
 	// message. Instead, nudge the model once and retry before giving up -
 	// see the loop body below.
-	const telegramMaxEmptyRetries = 1
+	const chatBotMaxEmptyRetries = 1
 	emptyRetries := 0
 
 	iteration := 0
@@ -10365,7 +10431,7 @@ func (s *telegramSession) runTelegramToolLoop(messages []ollamaMessage) (string,
 			return "", fmt.Errorf("เกินจำนวนรอบสูงสุด (%d รอบ) ของ tool-calling loop", maxToolIterations)
 		}
 		req.Messages = messages
-		outcome, statusCode, err := doChatRound(s.client, s.pcfg, req, s.outFile, "", "", "", "")
+		outcome, statusCode, err := doChatRound(c.client, c.pcfg, req, c.outFile, "", "", "", "")
 		if err != nil {
 			return "", err
 		}
@@ -10374,9 +10440,9 @@ func (s *telegramSession) runTelegramToolLoop(messages []ollamaMessage) (string,
 		}
 		if len(outcome.ToolCalls) == 0 {
 			if strings.TrimSpace(outcome.Content) == "" {
-				fmt.Fprintf(s.outFile, "[telegram_warning] โมเดลตอบว่างเปล่า (ไม่มี content, ไม่มี tool_calls) รอบที่ %d/%d ของข้อความนี้\n",
-					emptyRetries+1, telegramMaxEmptyRetries+1)
-				if emptyRetries >= telegramMaxEmptyRetries {
+				fmt.Fprintf(c.outFile, "[chatbot_warning] โมเดลตอบว่างเปล่า (ไม่มี content, ไม่มี tool_calls) รอบที่ %d/%d ของข้อความนี้\n",
+					emptyRetries+1, chatBotMaxEmptyRetries+1)
+				if emptyRetries >= chatBotMaxEmptyRetries {
 					return "", fmt.Errorf("โมเดลตอบข้อความว่างเปล่าซ้ำ (%d ครั้ง) - ไม่ส่งคำตอบว่างกลับไปหาผู้ใช้", emptyRetries+1)
 				}
 				emptyRetries++
@@ -10392,9 +10458,9 @@ func (s *telegramSession) runTelegramToolLoop(messages []ollamaMessage) (string,
 			Role: "assistant", Content: outcome.Content, Thinking: outcome.Thinking, ToolCalls: outcome.ToolCalls,
 		})
 		for _, tc := range outcome.ToolCalls {
-			result := dispatchTelegramToolCall(tc, s.outFile, extra)
+			result := dispatchChatToolCall(tc, c.outFile, extra)
 			messages = append(messages, ollamaMessage{
-				Role: "tool", Content: telegramGroundToolResult(tc.Function.Name, result), Name: tc.Function.Name, ToolCallID: tc.ID,
+				Role: "tool", Content: groundToolResult(tc.Function.Name, result), Name: tc.Function.Name, ToolCallID: tc.ID,
 			})
 		}
 	}
@@ -10404,33 +10470,33 @@ func (s *telegramSession) runTelegramToolLoop(messages []ollamaMessage) (string,
 // its startup banner (see the end of that function), reachable live from
 // inside a chat via /tools - see handleTelegramMessage's own comment on
 // why this exists.
-func (s *telegramSession) toolsStatusText() string {
+func (c *chatBotCore) toolsStatusText() string {
 	var sb strings.Builder
-	sb.WriteString("สถานะ tool ของ telegrambot ตอนนี้:\n\n")
-	if s.knowledgeCfg.enabled() {
-		fmt.Fprintf(&sb, "✅ search_knowledge/read_knowledge - ฐานความรู้ (%d ที่):\n", len(s.knowledgeCfg.Labels))
-		for _, label := range s.knowledgeCfg.Labels {
-			fmt.Fprintf(&sb, "   %s → %s\n", label, s.knowledgeCfg.Roots[label])
+	sb.WriteString("สถานะ tool ตอนนี้:\n\n")
+	if c.knowledgeCfg.enabled() {
+		fmt.Fprintf(&sb, "✅ search_knowledge/read_knowledge - ฐานความรู้ (%d ที่):\n", len(c.knowledgeCfg.Labels))
+		for _, label := range c.knowledgeCfg.Labels {
+			fmt.Fprintf(&sb, "   %s → %s\n", label, c.knowledgeCfg.Roots[label])
 		}
-		if s.embedCfg.enabled() {
+		if c.embedCfg.enabled() {
 			n := 0
-			if s.knowledgeIdx != nil {
-				n = len(s.knowledgeIdx.get().Chunks)
+			if c.knowledgeIdx != nil {
+				n = len(c.knowledgeIdx.get().Chunks)
 			}
 			fmt.Fprintf(&sb, "   embedding search: เปิด (model: %s, %d chunk ใน index, top-%d, min-score %.2f, refresh ทุก %s)\n",
-				s.embedCfg.Model, n, s.embedCfg.TopK, s.embedCfg.MinScore, s.embedCfg.RefreshInterval)
+				c.embedCfg.Model, n, c.embedCfg.TopK, c.embedCfg.MinScore, c.embedCfg.RefreshInterval)
 		} else {
 			sb.WriteString("   embedding search: ปิด (ไม่ได้ตั้ง --embed-model - ใช้ grep + แนบเนื้อหาไฟล์เล็กๆ แทน)\n")
 		}
 	} else {
 		sb.WriteString("❌ search_knowledge/read_knowledge - ปิด (ไม่ได้ตั้ง --knowledge-dir หรือ directory ที่ระบุหาไม่เจอ - เช็ค stderr/log ตอน bot เริ่มทำงาน)\n")
 	}
-	if s.searchCfg.searchEnabled() {
-		fmt.Fprintf(&sb, "✅ web_search - backend: %s\n", s.searchCfg.searchBackendLabel())
+	if c.searchCfg.searchEnabled() {
+		fmt.Fprintf(&sb, "✅ web_search - backend: %s\n", c.searchCfg.searchBackendLabel())
 	} else {
 		sb.WriteString("❌ web_search - ปิด (ไม่ได้ตั้ง --searxng-url หรือ --ollama-search-key)\n")
 	}
-	if s.searchCfg.fetchEnabled() {
+	if c.searchCfg.fetchEnabled() {
 		sb.WriteString("✅ web_fetch (fetch URL ที่ระบุตรงๆ เท่านั้น ไม่ใช่ค้นหาแบบเปิดกว้าง)\n")
 	} else {
 		sb.WriteString("❌ web_fetch - ปิด (--no-web-search)\n")
@@ -10511,7 +10577,7 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 	lock.Lock()
 	defer lock.Unlock()
 
-	cctx, err := loadChatContext(s.contextDir, chat)
+	cctx, err := loadChatContext(s.contextDir, telegramContextKey(chat))
 	if err != nil {
 		s.logf("[telegram_error] โหลด context ไม่ได้: %v\n", err)
 		_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID, "ขออภัย เกิดข้อผิดพลาดในการโหลดบทสนทนา ลองใหม่อีกครั้ง")
@@ -10526,7 +10592,7 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 	messages = append(messages, ollamaMessage{Role: "user", Content: text})
 
 	s.logf("\n=== chat=%d(%s) user=%d(%s) ===\n[user] %s\n", chat.ID, chat.Type, from.ID, from.Username, text)
-	answer, err := s.runTelegramToolLoop(messages)
+	answer, err := s.runChatToolLoop(messages)
 	if err != nil {
 		s.logf("[telegram_error] chat=%d: %v\n", chat.ID, err)
 		if s.ntfyTopic != "" {
@@ -10834,7 +10900,7 @@ func cmdTelegramBot(args []string) int {
 
 	// Persona is deliberately assembled BETWEEN the intro and the rules
 	// (not appended after everything else) - see
-	// builtinTelegramSystemPromptIntro's own doc comment for why this
+	// chatBotSystemPromptIntro's own doc comment for why this
 	// ordering matters in practice, not just cosmetically.
 	systemPrompt := buildTelegramSystemPrompt(persona)
 
@@ -10869,28 +10935,30 @@ func cmdTelegramBot(args []string) int {
 	}
 
 	session := &telegramSession{
-		client:           modelClient,
-		telegramClient:   telegramClient,
-		apiBase:          telegramAPIBase,
-		token:            token,
-		botUsername:      me.Username,
-		access:           access,
-		systemPrompt:     systemPrompt,
-		tools:            tools,
-		knowledgeCfg:     knowledgeCfg,
-		embedCfg:         embedCfg,
-		knowledgeIdx:     &knowledgeIndexStore{},
-		knowledgeIdxPath: knowledgeIndexPath(contextDir),
-		searchCfg:        searchCfg,
-		pcfg:             pcfg,
-		ctxSize:          ctxSize,
-		contextDir:       contextDir,
-		keepRecent:       keepRecent,
-		compactAfter:     compactAfter,
-		ntfyTopic:        ntfyTopic,
-		outFile:          outFile,
-		sem:              make(chan struct{}, maxConcurrent),
-		chatLocks:        map[int64]*sync.Mutex{},
+		chatBotCore: chatBotCore{
+			client:           modelClient,
+			systemPrompt:     systemPrompt,
+			tools:            tools,
+			knowledgeCfg:     knowledgeCfg,
+			embedCfg:         embedCfg,
+			knowledgeIdx:     &knowledgeIndexStore{},
+			knowledgeIdxPath: knowledgeIndexPath(contextDir),
+			searchCfg:        searchCfg,
+			pcfg:             pcfg,
+			ctxSize:          ctxSize,
+			contextDir:       contextDir,
+			keepRecent:       keepRecent,
+			compactAfter:     compactAfter,
+			ntfyTopic:        ntfyTopic,
+			outFile:          outFile,
+		},
+		telegramClient: telegramClient,
+		apiBase:        telegramAPIBase,
+		token:          token,
+		botUsername:    me.Username,
+		access:         access,
+		sem:            make(chan struct{}, maxConcurrent),
+		chatLocks:      map[int64]*sync.Mutex{},
 	}
 
 	if embedCfg.enabled() {
@@ -10958,4 +11026,1086 @@ func cmdTelegramBot(args []string) int {
 			go session.handleTelegramMessage(msg)
 		}
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Section: discordbot (originally discord.go)
+//
+// "ola discordbot" is discordbot's Discord counterpart of telegrambot: same
+// principles (allow-listed users/servers, additive persona, read-only
+// knowledge base + optional embedding search, per-chat persistent context
+// with LLM-based compaction, the same restrictive read-only toolset,
+// grounding markers against fabricated search narration) via
+// chatBotCore (see that struct's own doc comment) - discordSession only
+// adds the parts that are genuinely different: how Discord delivers
+// messages and how a reply gets sent back.
+//
+// THE BIG DIFFERENCE FROM TELEGRAM: Discord has no long-polling endpoint.
+// A bot must hold a persistent WebSocket connection open to Discord's
+// "Gateway" to receive messages at all - there is no way around this with
+// REST alone. Go's standard library has no WebSocket client, so this uses
+// one small external dependency (github.com/gorilla/websocket) ONLY for
+// the WebSocket frame transport - every application-level concern (the
+// Gateway's HELLO/IDENTIFY/HEARTBEAT/DISPATCH protocol, REST calls,
+// rate-limit handling) is still hand-rolled with net/http+encoding/json,
+// same as every other integration in this file. That protocol logic sits
+// behind the small wsConn interface below specifically so it can be unit
+// tested against a fake in-memory transport, never a real Discord
+// connection - see discordGatewaySession's own doc comment.
+//
+// SCOPE NOTE: this implementation reconnects via a fresh IDENTIFY on any
+// disconnect (dropped connection, missed heartbeat ACK, OP 7 RECONNECT,
+// OP 9 INVALID_SESSION) rather than implementing Discord's RESUME
+// handshake (OP 6, replaying session_id + last sequence number to recover
+// events missed during a brief reconnect window). A fresh IDENTIFY is
+// Discord's own documented fallback and fully supported - RESUME is an
+// optimization to avoid missing messages sent during the handful of
+// seconds a reconnect takes, not a correctness requirement. Worth adding
+// later if that gap in coverage matters for your use case; not required
+// to ship a working bot.
+// ─────────────────────────────────────────────────────────────────
+
+const discordGatewayVersion = 10
+const discordAPIBase = "https://discord.com/api/v10"
+
+// wsConn is the minimal WebSocket transport discordGatewaySession needs -
+// deliberately small enough that a fake in-memory implementation can
+// stand in for tests. dialDiscordGateway is the only place the real
+// gorilla/websocket dependency is actually used.
+type wsConn interface {
+	ReadMessage() ([]byte, error)
+	WriteMessage(data []byte) error
+	Close() error
+}
+
+// gorillaWSConn adapts *websocket.Conn to wsConn.
+type gorillaWSConn struct {
+	conn *websocket.Conn
+}
+
+func (g *gorillaWSConn) ReadMessage() ([]byte, error) {
+	_, data, err := g.conn.ReadMessage()
+	return data, err
+}
+
+func (g *gorillaWSConn) WriteMessage(data []byte) error {
+	return g.conn.WriteMessage(websocket.TextMessage, data)
+}
+
+func (g *gorillaWSConn) Close() error {
+	return g.conn.Close()
+}
+
+func dialDiscordGateway(url string) (wsConn, error) {
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &gorillaWSConn{conn: conn}, nil
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Gateway protocol: op codes, the envelope every Gateway message is
+// wrapped in, and the payload shapes for the handful of ops this bot
+// actually needs to send/handle. See
+// https://discord.com/developers/docs/topics/gateway - only the DISPATCH
+// event types this bot cares about (MESSAGE_CREATE) are parsed; every
+// other event is received (so intents stay accurate) and silently
+// ignored.
+// ─────────────────────────────────────────────────────────────────
+
+const (
+	discordOpDispatch       = 0
+	discordOpHeartbeat      = 1
+	discordOpIdentify       = 2
+	discordOpReconnect      = 7
+	discordOpInvalidSession = 9
+	discordOpHello          = 10
+	discordOpHeartbeatACK   = 11
+)
+
+const (
+	discordIntentGuilds         = 1 << 0
+	discordIntentGuildMessages  = 1 << 9
+	discordIntentDirectMessages = 1 << 12
+	discordIntentMessageContent = 1 << 15 // privileged - must ALSO be enabled in the Discord Developer Portal, see discordUsage
+)
+
+const discordDefaultIntents = discordIntentGuilds | discordIntentGuildMessages | discordIntentDirectMessages | discordIntentMessageContent
+
+// discordGatewayPayload is the envelope every Gateway message (both
+// directions) is wrapped in. D is left as raw JSON and decoded into a
+// concrete type only once Op/T tell us what shape to expect.
+type discordGatewayPayload struct {
+	Op int             `json:"op"`
+	D  json.RawMessage `json:"d,omitempty"`
+	S  *int64          `json:"s,omitempty"` // sequence number, present on DISPATCH - tracked for HEARTBEAT
+	T  string          `json:"t,omitempty"` // event name, present on DISPATCH (e.g. "MESSAGE_CREATE")
+}
+
+type discordHello struct {
+	HeartbeatInterval int64 `json:"heartbeat_interval"`
+}
+
+type discordIdentifyProperties struct {
+	OS      string `json:"os"`
+	Browser string `json:"browser"`
+	Device  string `json:"device"`
+}
+
+type discordIdentify struct {
+	Token      string                    `json:"token"`
+	Intents    int                       `json:"intents"`
+	Properties discordIdentifyProperties `json:"properties"`
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Discord message/user model (only the fields this bot actually uses -
+// Discord's real objects have many more)
+// ─────────────────────────────────────────────────────────────────
+
+type discordUser struct {
+	ID       string `json:"id"` // snowflake, ALWAYS a JSON string (not a number) - Discord does this deliberately so 64-bit IDs survive JSON round-trips in languages (like JS) whose "number" type can't represent them exactly. Every Discord ID in this file is a string for the same reason.
+	Username string `json:"username"`
+	Bot      bool   `json:"bot"`
+}
+
+type discordMessageReference struct {
+	MessageID string `json:"message_id"`
+}
+
+type discordMessage struct {
+	ID               string                   `json:"id"`
+	ChannelID        string                   `json:"channel_id"`
+	GuildID          string                   `json:"guild_id,omitempty"` // absent/empty for DMs
+	Author           discordUser              `json:"author"`
+	Content          string                   `json:"content"`
+	Mentions         []discordUser            `json:"mentions"`
+	MessageReference *discordMessageReference `json:"message_reference,omitempty"`
+}
+
+func (m *discordMessage) isDM() bool { return m.GuildID == "" }
+
+// ─────────────────────────────────────────────────────────────────
+// REST client. Every call carries "Authorization: Bot <token>" (a
+// different auth scheme from Telegram's URL-embedded token). 429s are
+// retried once after honoring Discord's own retry_after - a real
+// production bot would want a fuller per-route rate-limit bucket
+// tracker (see Discord's X-RateLimit-* response headers), but a single
+// bot answering allow-listed users is nowhere near the volume where that
+// matters; this simple retry-once-on-429 covers the common case without
+// that added complexity.
+// ─────────────────────────────────────────────────────────────────
+
+type discord429Body struct {
+	RetryAfter float64 `json:"retry_after"`
+}
+
+func discordRESTRequest(client *http.Client, apiBase, token, method, path string, body interface{}) ([]byte, int, error) {
+	var reqBody io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return nil, 0, fmt.Errorf("marshal request ไม่ได้: %v", err)
+		}
+		reqBody = bytes.NewReader(data)
+	}
+	do := func() (*http.Response, error) {
+		httpReq, err := http.NewRequest(method, apiBase+path, reqBody)
+		if err != nil {
+			return nil, err
+		}
+		httpReq.Header.Set("Authorization", "Bot "+token)
+		httpReq.Header.Set("Content-Type", "application/json")
+		return client.Do(httpReq)
+	}
+
+	resp, err := do()
+	if err != nil {
+		return nil, 0, err
+	}
+	respBody, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("อ่าน response body ไม่ได้: %v", err)
+	}
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		var rl discord429Body
+		_ = json.Unmarshal(respBody, &rl)
+		wait := time.Duration(rl.RetryAfter * float64(time.Second))
+		if wait <= 0 {
+			wait = time.Second
+		}
+		time.Sleep(wait)
+		if reqBody != nil {
+			data, _ := json.Marshal(body)
+			reqBody = bytes.NewReader(data)
+		}
+		resp, err = do()
+		if err != nil {
+			return nil, 0, err
+		}
+		respBody, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, resp.StatusCode, fmt.Errorf("อ่าน response body ไม่ได้: %v", err)
+		}
+	}
+
+	return respBody, resp.StatusCode, nil
+}
+
+func discordGetMe(client *http.Client, apiBase, token string) (discordUser, error) {
+	body, status, err := discordRESTRequest(client, apiBase, token, http.MethodGet, "/users/@me", nil)
+	if err != nil {
+		return discordUser{}, err
+	}
+	if status >= 400 {
+		return discordUser{}, fmt.Errorf("GET /users/@me สถานะ %d: %s", status, string(body))
+	}
+	var out discordUser
+	if err := json.Unmarshal(body, &out); err != nil {
+		return discordUser{}, fmt.Errorf("decode /users/@me response ไม่ได้: %v", err)
+	}
+	return out, nil
+}
+
+func discordGetGatewayURL(client *http.Client, apiBase, token string) (string, error) {
+	body, status, err := discordRESTRequest(client, apiBase, token, http.MethodGet, "/gateway/bot", nil)
+	if err != nil {
+		return "", err
+	}
+	if status >= 400 {
+		return "", fmt.Errorf("GET /gateway/bot สถานะ %d: %s", status, string(body))
+	}
+	var out struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return "", fmt.Errorf("decode /gateway/bot response ไม่ได้: %v", err)
+	}
+	return out.URL, nil
+}
+
+// discordMaxMessageRunes stays a little under Discord's hard 2000-
+// character sendMessage cap - see splitDiscordMessage.
+const discordMaxMessageRunes = 1900
+
+func splitDiscordMessage(text string) []string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		text = "(ไม่มีคำตอบ)"
+	}
+	runes := []rune(text)
+	if len(runes) <= discordMaxMessageRunes {
+		return []string{text}
+	}
+	var chunks []string
+	for len(runes) > 0 {
+		n := discordMaxMessageRunes
+		if n > len(runes) {
+			n = len(runes)
+		}
+		cut := n
+		if n == discordMaxMessageRunes {
+			for i := n - 1; i > n/2; i-- {
+				if runes[i] == '\n' {
+					cut = i + 1
+					break
+				}
+			}
+		}
+		chunk := strings.TrimSpace(string(runes[:cut]))
+		if chunk != "" {
+			chunks = append(chunks, chunk)
+		}
+		runes = runes[cut:]
+	}
+	if len(chunks) == 0 {
+		chunks = []string{"(ไม่มีคำตอบ)"}
+	}
+	return chunks
+}
+
+func discordSendMessage(client *http.Client, apiBase, token, channelID, text string) error {
+	for _, chunk := range splitDiscordMessage(text) {
+		body, status, err := discordRESTRequest(client, apiBase, token, http.MethodPost, "/channels/"+channelID+"/messages", map[string]string{"content": chunk})
+		if err != nil {
+			return err
+		}
+		if status >= 400 {
+			return fmt.Errorf("POST /channels/%s/messages สถานะ %d: %s", channelID, status, string(body))
+		}
+	}
+	return nil
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Gateway session state machine. Deliberately structured so
+// runOnce (one connection's lifetime, from dial through disconnect) can
+// be driven against a fake wsConn in tests, never a real Discord
+// connection - see this section's own header comment for the RESUME
+// simplification this makes.
+// ─────────────────────────────────────────────────────────────────
+
+type discordGatewaySession struct {
+	token      string
+	intents    int
+	dial       func(url string) (wsConn, error) // swappable in tests
+	gatewayURL func() (string, error)           // swappable in tests - normally discordGetGatewayURL
+	onMessage  func(*discordMessage)
+	outFile    *os.File
+}
+
+// runOnce connects once, completes the HELLO/IDENTIFY handshake, then
+// reads and dispatches events until the connection closes or a fatal
+// protocol error occurs - at which point it returns so the caller (run)
+// can reconnect with a fresh IDENTIFY. A background goroutine sends
+// HEARTBEATs on the interval Discord specified in HELLO; runOnce cancels
+// it via the returned stop func before returning.
+func (s *discordGatewaySession) runOnce() error {
+	url, err := s.gatewayURL()
+	if err != nil {
+		return fmt.Errorf("หา gateway URL ไม่ได้: %v", err)
+	}
+	conn, err := s.dial(url + "?v=" + strconv.Itoa(discordGatewayVersion) + "&encoding=json")
+	if err != nil {
+		return fmt.Errorf("เชื่อมต่อ gateway ไม่ได้: %v", err)
+	}
+	defer conn.Close()
+
+	// HELLO must be the first message.
+	raw, err := conn.ReadMessage()
+	if err != nil {
+		return fmt.Errorf("อ่าน HELLO ไม่ได้: %v", err)
+	}
+	var hello discordGatewayPayload
+	if err := json.Unmarshal(raw, &hello); err != nil {
+		return fmt.Errorf("parse HELLO ไม่ได้: %v", err)
+	}
+	if hello.Op != discordOpHello {
+		return fmt.Errorf("คาดว่าจะได้ HELLO (op %d) แต่ได้ op %d แทน", discordOpHello, hello.Op)
+	}
+	var helloData discordHello
+	if err := json.Unmarshal(hello.D, &helloData); err != nil {
+		return fmt.Errorf("parse HELLO payload ไม่ได้: %v", err)
+	}
+
+	identify := discordGatewayPayload{Op: discordOpIdentify}
+	identify.D, _ = json.Marshal(discordIdentify{
+		Token:      s.token,
+		Intents:    s.intents,
+		Properties: discordIdentifyProperties{OS: "linux", Browser: "ola", Device: "ola"},
+	})
+	identifyBytes, _ := json.Marshal(identify)
+	if err := conn.WriteMessage(identifyBytes); err != nil {
+		return fmt.Errorf("ส่ง IDENTIFY ไม่ได้: %v", err)
+	}
+
+	var seq int64
+	var seqMu sync.Mutex
+	ackCh := make(chan struct{}, 1)
+	stopHeartbeat := make(chan struct{})
+	var hbWG sync.WaitGroup
+	hbWG.Add(1)
+	go func() {
+		defer hbWG.Done()
+		interval := time.Duration(helloData.HeartbeatInterval) * time.Millisecond
+		// Discord recommends jittering the very first heartbeat so many
+		// bots reconnecting at once don't all beat in lockstep.
+		jitter := time.Duration(rand.Int63n(int64(interval)))
+		timer := time.NewTimer(jitter)
+		defer timer.Stop()
+		for {
+			select {
+			case <-stopHeartbeat:
+				return
+			case <-timer.C:
+				seqMu.Lock()
+				s := seq
+				seqMu.Unlock()
+				var sPtr *int64
+				if s != 0 {
+					sPtr = &s
+				}
+				payload, _ := json.Marshal(discordGatewayPayload{Op: discordOpHeartbeat, D: mustMarshalSeq(sPtr)})
+				if err := conn.WriteMessage(payload); err != nil {
+					return
+				}
+				select {
+				case <-ackCh:
+					// got ACK'd in time, all good
+				case <-time.After(interval):
+					// no ACK before the next beat was due - connection is
+					// presumed dead; closing here makes the blocking
+					// ReadMessage in the main loop below return an error,
+					// which sends runOnce back to run() to reconnect.
+					conn.Close()
+					return
+				case <-stopHeartbeat:
+					return
+				}
+				timer.Reset(interval)
+			}
+		}
+	}()
+	defer func() {
+		close(stopHeartbeat)
+		hbWG.Wait()
+	}()
+
+	for {
+		raw, err := conn.ReadMessage()
+		if err != nil {
+			return err // connection closed/errored - caller reconnects
+		}
+		var payload discordGatewayPayload
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			fmt.Fprintf(s.outFile, "[discord_warning] parse gateway payload ไม่ได้: %v\n", err)
+			continue
+		}
+		if payload.S != nil {
+			seqMu.Lock()
+			seq = *payload.S
+			seqMu.Unlock()
+		}
+		switch payload.Op {
+		case discordOpHeartbeatACK:
+			select {
+			case ackCh <- struct{}{}:
+			default:
+			}
+		case discordOpReconnect:
+			return fmt.Errorf("gateway ขอให้ reconnect (OP 7)")
+		case discordOpInvalidSession:
+			return fmt.Errorf("gateway แจ้ง session ไม่ถูกต้อง (OP 9) - จะ identify ใหม่")
+		case discordOpDispatch:
+			s.handleDispatch(payload)
+		}
+	}
+}
+
+func mustMarshalSeq(s *int64) json.RawMessage {
+	data, _ := json.Marshal(s)
+	return data
+}
+
+func (s *discordGatewaySession) handleDispatch(payload discordGatewayPayload) {
+	if payload.T != "MESSAGE_CREATE" {
+		return // every other event is received (intents require it) but irrelevant to this bot
+	}
+	var msg discordMessage
+	if err := json.Unmarshal(payload.D, &msg); err != nil {
+		fmt.Fprintf(s.outFile, "[discord_warning] parse MESSAGE_CREATE ไม่ได้: %v\n", err)
+		return
+	}
+	if s.onMessage != nil {
+		s.onMessage(&msg)
+	}
+}
+
+// run is the outer reconnect loop: keep calling runOnce, logging and
+// backing off between attempts, for the lifetime of the process. stopCh
+// closed ends the loop (used for graceful shutdown - see cmdDiscordBot).
+func (s *discordGatewaySession) run(stopCh <-chan struct{}) {
+	backoff := time.Second
+	const maxBackoff = 60 * time.Second
+	for {
+		select {
+		case <-stopCh:
+			return
+		default:
+		}
+		err := s.runOnce()
+		select {
+		case <-stopCh:
+			return
+		default:
+		}
+		if err != nil {
+			fmt.Fprintf(s.outFile, "[discord_error] gateway connection หลุด: %v - จะลองเชื่อมต่อใหม่ใน %s\n", err, backoff)
+		}
+		select {
+		case <-stopCh:
+			return
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Access control: allow-listed users (DMs), guilds (servers), and
+// optionally specific channels within an allowed guild. Discord's
+// structure nests deeper than Telegram's (Guild > Channel > Message vs
+// just Chat > Message) so this needs one more tier than
+// telegramAccessConfig. IDs are strings (see discordUser's own doc
+// comment on why Discord snowflakes are never numeric here).
+// ─────────────────────────────────────────────────────────────────
+
+type discordAccessConfig struct {
+	Users    map[string]bool
+	Guilds   map[string]bool
+	Channels map[string]bool // optional further restriction within an allowed guild; empty means "any channel of an allowed guild"
+}
+
+func (c discordAccessConfig) allowed(msg *discordMessage) bool {
+	if msg.isDM() {
+		return c.Users[msg.Author.ID]
+	}
+	if !c.Guilds[msg.GuildID] {
+		return false
+	}
+	if len(c.Channels) == 0 {
+		return true
+	}
+	return c.Channels[msg.ChannelID]
+}
+
+func (c discordAccessConfig) empty() bool {
+	return len(c.Users) == 0 && len(c.Guilds) == 0
+}
+
+func parseDiscordIDList(raw string) (map[string]bool, []string) {
+	ids := map[string]bool{}
+	var warnings []string
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if _, err := strconv.ParseUint(part, 10, 64); err != nil {
+			warnings = append(warnings, fmt.Sprintf("ไม่สามารถแปลง %q เป็น Discord snowflake ID ที่เป็นตัวเลขได้ - ข้าม", part))
+			continue
+		}
+		ids[part] = true
+	}
+	return ids, warnings
+}
+
+func resolveDiscordAccessConfig(usersFlag, guildsFlag, channelsFlag string) (discordAccessConfig, []string) {
+	usersRaw := usersFlag
+	if usersRaw == "" {
+		usersRaw = os.Getenv("OLA_DISCORD_ALLOWED_USERS")
+	}
+	guildsRaw := guildsFlag
+	if guildsRaw == "" {
+		guildsRaw = os.Getenv("OLA_DISCORD_ALLOWED_GUILDS")
+	}
+	channelsRaw := channelsFlag
+	if channelsRaw == "" {
+		channelsRaw = os.Getenv("OLA_DISCORD_ALLOWED_CHANNELS")
+	}
+	users, uw := parseDiscordIDList(usersRaw)
+	guilds, gw := parseDiscordIDList(guildsRaw)
+	channels, cw := parseDiscordIDList(channelsRaw)
+	warnings := append(append(uw, gw...), cw...)
+	return discordAccessConfig{Users: users, Guilds: guilds, Channels: channels}, warnings
+}
+
+// discordContextKey builds this message's persistent-context file key -
+// "discord_dm_<user id>" for a DM, "discord_channel_<channel id>" for a
+// guild channel. Channel-level (not guild-level) granularity for guild
+// messages is deliberate: different channels in the same server are
+// usually different topics/conversations, so giving each its own memory
+// is a better default than one shared context for an entire server. The
+// "discord_" prefix can never collide with Telegram's unprefixed
+// "user_<id>"/"group_<id>" keys, so both bots can safely share one
+// --context-dir.
+func discordContextKey(msg *discordMessage) string {
+	if msg.isDM() {
+		return "discord_dm_" + msg.Author.ID
+	}
+	return "discord_channel_" + msg.ChannelID
+}
+
+// discordMessageAddressesBot mirrors telegramMessageAddressesBot's own
+// reasoning: a guild channel is a shared space other humans are also
+// talking in, not a 1:1 session the way a DM is - only answer when
+// clearly addressed (an @mention of the bot, matched via the mentions
+// array Discord already parsed for us rather than fragile string
+// matching on the raw "<@id>" syntax, or a reply to the bot's own
+// message).
+func discordMessageAddressesBot(msg *discordMessage, botUserID string) bool {
+	for _, m := range msg.Mentions {
+		if m.ID == botUserID {
+			return true
+		}
+	}
+	trimmed := strings.TrimSpace(msg.Content)
+	return strings.HasPrefix(trimmed, "!ola") || strings.HasPrefix(trimmed, "!ask")
+}
+
+func stripDiscordMention(text, botUserID string) string {
+	text = strings.ReplaceAll(text, "<@"+botUserID+">", "")
+	text = strings.ReplaceAll(text, "<@!"+botUserID+">", "") // nickname-mention form
+	trimmed := strings.TrimSpace(text)
+	trimmed = strings.TrimPrefix(trimmed, "!ola")
+	trimmed = strings.TrimPrefix(trimmed, "!ask")
+	return strings.TrimSpace(trimmed)
+}
+
+// ─────────────────────────────────────────────────────────────────
+// discordSession embeds chatBotCore (see that struct's own doc comment)
+// - everything platform-agnostic (the tool loop, knowledge base, context
+// compaction, grounding) is inherited from there unchanged. Only the
+// Discord-specific transport/addressing pieces live here.
+// ─────────────────────────────────────────────────────────────────
+
+type discordSession struct {
+	chatBotCore
+	restClient  *http.Client // short-timeout client, Discord REST API only - never used for model calls, same separation of concerns as telegramSession.telegramClient
+	apiBase     string
+	token       string
+	botUserID   string
+	botUsername string
+	access      discordAccessConfig
+	sem         chan struct{}
+
+	mu        sync.Mutex
+	chanLocks map[string]*sync.Mutex
+}
+
+func (s *discordSession) chanMutex(key string) *sync.Mutex {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, ok := s.chanLocks[key]
+	if !ok {
+		m = &sync.Mutex{}
+		s.chanLocks[key] = m
+	}
+	return m
+}
+
+// toolsStatusText is inherited from chatBotCore - reused verbatim, see
+// that method's own doc comment.
+
+func (s *discordSession) handleDiscordMessage(msg *discordMessage) {
+	s.sem <- struct{}{}
+	defer func() { <-s.sem }()
+
+	if msg.Author.Bot || msg.Author.ID == s.botUserID {
+		return // never respond to bots (including itself) - avoids echo loops with other bots in the same server
+	}
+	text := strings.TrimSpace(msg.Content)
+	if text == "" {
+		return
+	}
+
+	if !msg.isDM() {
+		if !discordMessageAddressesBot(msg, s.botUserID) {
+			return // guild channel: only answer when clearly addressed
+		}
+		text = stripDiscordMention(text, s.botUserID)
+		if text == "" {
+			return
+		}
+	}
+
+	if text == "!whoami" || text == "!start" {
+		reply := fmt.Sprintf("User ID ของคุณ: %s", msg.Author.ID)
+		if !msg.isDM() {
+			reply += fmt.Sprintf("\nGuild ID: %s\nChannel ID: %s", msg.GuildID, msg.ChannelID)
+		}
+		_ = discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID, reply)
+		return
+	}
+
+	if !s.access.allowed(msg) {
+		reply := fmt.Sprintf("คุณยังไม่ได้รับอนุญาตให้ใช้บอทนี้ ส่ง !whoami เพื่อดู ID แล้วแจ้งผู้ดูแลให้เพิ่มสิทธิ์\nUser ID: %s", msg.Author.ID)
+		if !msg.isDM() {
+			reply += fmt.Sprintf("\nGuild ID: %s\nChannel ID: %s", msg.GuildID, msg.ChannelID)
+		}
+		_ = discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID, reply)
+		s.logf("[discord_denied] user=%s(%s) guild=%s channel=%s\n", msg.Author.ID, msg.Author.Username, msg.GuildID, msg.ChannelID)
+		return
+	}
+
+	if text == "!tools" {
+		_ = discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID, s.toolsStatusText())
+		return
+	}
+
+	key := discordContextKey(msg)
+	lock := s.chanMutex(key)
+	lock.Lock()
+	defer lock.Unlock()
+
+	cctx, err := loadChatContext(s.contextDir, key)
+	if err != nil {
+		s.logf("[discord_error] โหลด context ไม่ได้: %v\n", err)
+		_ = discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID, "ขออภัย เกิดข้อผิดพลาดในการโหลดบทสนทนา ลองใหม่อีกครั้ง")
+		return
+	}
+
+	if shouldCompactChatContext(cctx, s.compactAfter) {
+		compactChatContext(s.client, s.pcfg, s.ctxSize, cctx, s.keepRecent, s.outFile)
+	}
+
+	messages := cctx.buildMessages(s.systemPrompt)
+	messages = append(messages, ollamaMessage{Role: "user", Content: text})
+
+	s.logf("\n=== discord key=%s user=%s(%s) ===\n[user] %s\n", key, msg.Author.ID, msg.Author.Username, text)
+	answer, err := s.runChatToolLoop(messages)
+	if err != nil {
+		s.logf("[discord_error] key=%s: %v\n", key, err)
+		if s.ntfyTopic != "" {
+			sendNotification(s.ntfyTopic, truncateWords(fmt.Sprintf("[discordbot error] key=%s: %v", key, err), maxNotificationWords))
+		}
+		_ = discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID, "ขออภัย เกิดข้อผิดพลาดระหว่างประมวลผล ลองใหม่อีกครั้ง")
+		return
+	}
+	s.logf("[assistant] %s\n", answer)
+
+	cctx.Turns = append(cctx.Turns,
+		chatTurn{Role: "user", Content: text, Time: time.Now()},
+		chatTurn{Role: "assistant", Content: answer, Time: time.Now()},
+	)
+	cctx.LastActive = time.Now()
+	if err := cctx.save(s.contextDir); err != nil {
+		s.logf("[discord_error] บันทึก context ไม่ได้: %v\n", err)
+	}
+
+	if err := discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID, answer); err != nil {
+		s.logf("[discord_error] ส่งข้อความกลับไม่ได้: %v\n", err)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// ola discordbot [options]
+// ─────────────────────────────────────────────────────────────────
+
+const defaultDiscordContextDir = "discord-context"
+
+// buildDiscordHTTPClients mirrors buildTelegramHTTPClients' own reasoning
+// exactly (see that function's doc comment for the full "why") - the
+// model (Ollama/OpenAI) client must stay unbounded, only the Discord REST
+// client gets a short fail-fast timeout.
+func buildDiscordHTTPClients() (rest, model *http.Client) {
+	rest = &http.Client{Timeout: 30 * time.Second}
+	model = newHTTPClient()
+	return rest, model
+}
+
+func discordUsage(fs *flag.FlagSet) func() {
+	return func() {
+		fmt.Println("Usage: ola discordbot [options]")
+		fmt.Println()
+		fmt.Println("รัน ola เป็น Discord bot - เชื่อมต่อผ่าน Gateway WebSocket ค้างไว้ตลอดเวลา (Discord ไม่มี long-polling")
+		fmt.Println("แบบ Telegram - ต้องมี persistent connection เพื่อรับข้อความ) ตอบเฉพาะ user (DM) หรือ server/channel ที่")
+		fmt.Println("อยู่ใน allowlist เท่านั้น หลักการ tool/persona/knowledge-base/context เหมือน 'ola telegrambot' ทุกประการ")
+		fmt.Println("(ดู README หัวข้อ discordbot/telegrambot สำหรับรายละเอียดที่ใช้ร่วมกัน)")
+		fmt.Println()
+		fmt.Println("⚠️  ต้องเปิด \"Message Content Intent\" ใน Discord Developer Portal ด้วยมือ (Bot → Privileged Gateway")
+		fmt.Println("    Intents) มิฉะนั้นบอทจะ online ปกติแต่เพิกเฉยทุกข้อความเงียบๆ โดยไม่มี error ให้เห็นเลย")
+		fmt.Println()
+		fmt.Println("Required:")
+		fmt.Println("  OLA_DISCORD_TOKEN              (env เท่านั้น, ไม่มี flag) - bot token จาก Discord Developer Portal")
+		fmt.Println("  -m/--model หรือ OLA_OLLAMA_MODEL")
+		fmt.Println()
+		fmt.Println("Access control:")
+		fmt.Println("  --discord-allowed-users <ids>     OLA_DISCORD_ALLOWED_USERS     comma-separated user ID (DM)")
+		fmt.Println("  --discord-allowed-guilds <ids>    OLA_DISCORD_ALLOWED_GUILDS    comma-separated server ID")
+		fmt.Println("  --discord-allowed-channels <ids>  OLA_DISCORD_ALLOWED_CHANNELS  comma-separated channel ID")
+		fmt.Println("                                     (optional - จำกัดเฉพาะบาง channel ใน guild ที่อนุญาต ไม่ตั้ง = ทุก channel)")
+		fmt.Println("                                     ส่ง !whoami คุยกับบอทเพื่อดู ID ของตัวเอง (ใช้ได้แม้ยังไม่อยู่ใน allowlist)")
+		fmt.Println()
+		fmt.Println("Persona/Knowledge base/Context/Web search: เหมือน 'ola telegrambot' ทุก flag ทุกพฤติกรรม - ดู 'ola telegrambot -h'")
+		fmt.Println("  --persona, --persona-file, --knowledge-dir, --embed-model, --embed-top-k, --embed-min-score,")
+		fmt.Println("  --embed-refresh-interval, --context-dir (default: discord-context), --context-keep-recent,")
+		fmt.Println("  --context-compact-after, --searxng-url, --ollama-search-key, --no-web-search, --search-*")
+		fmt.Println()
+		fmt.Println("Runtime:")
+		fmt.Println("  -c/--ctx, -P/--provider, --api-base, -k/--key   เหมือน 'ola ask'")
+		fmt.Println("  --discord-max-concurrent <n>   จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส (default 4)")
+		fmt.Println("  -x/--topic     ntfy.sh topic (แจ้งเตือนเมื่อเกิด error ระหว่างประมวลผลข้อความ)")
+		fmt.Println("  -o/--output    log ไฟล์แบบเต็ม (default: discordbot.log, เปิดแบบ append เสมอ)")
+		fmt.Println()
+		fmt.Println("พฤติกรรมใน guild channel: ตอบเฉพาะเมื่อถูก @mention หรือขึ้นต้นด้วย !ola หรือ !ask เท่านั้น")
+		fmt.Println("คำสั่งในตัว: !whoami หรือ !start (ดู ID ของตัวเอง), !tools (เช็คสถานะ tool ปัจจุบัน - เฉพาะผู้ที่อยู่ใน allowlist)")
+		fs.PrintDefaults()
+	}
+}
+
+func cmdDiscordBot(args []string) int {
+	fs := flag.NewFlagSet("discordbot", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+
+	var model, ctxStr, outputFile, topic string
+	var flagKey, flagHelp bool
+	var providerFlag, apiBaseFlag string
+	var discordAPIBaseFlag string
+	var allowedUsers, allowedGuilds, allowedChannels string
+	var persona, personaFile string
+	var knowledgeDir string
+	var embedModel string
+	var embedTopK int
+	var embedMinScore float64
+	var embedRefreshSec int
+	var contextDir string
+	var keepRecent, compactAfter int
+	var maxConcurrent int
+	var searxngURL, ollamaSearchKey string
+	var flagNoWebSearch bool
+	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
+
+	fs.StringVar(&model, "m", "", "")
+	fs.StringVar(&model, "model", "", "")
+	fs.StringVar(&ctxStr, "c", "", "")
+	fs.StringVar(&ctxStr, "ctx", "", "")
+	fs.BoolVar(&flagKey, "k", false, "")
+	fs.BoolVar(&flagKey, "key", false, "")
+	fs.StringVar(&providerFlag, "P", "", "")
+	fs.StringVar(&providerFlag, "provider", "", "")
+	fs.StringVar(&apiBaseFlag, "api-base", "", "")
+	fs.StringVar(&discordAPIBaseFlag, "discord-api-base", "", "")
+	fs.StringVar(&allowedUsers, "discord-allowed-users", "", "")
+	fs.StringVar(&allowedGuilds, "discord-allowed-guilds", "", "")
+	fs.StringVar(&allowedChannels, "discord-allowed-channels", "", "")
+	fs.StringVar(&persona, "persona", "", "")
+	fs.StringVar(&personaFile, "persona-file", "", "")
+	fs.StringVar(&knowledgeDir, "knowledge-dir", "", "")
+	fs.StringVar(&embedModel, "embed-model", "", "")
+	fs.IntVar(&embedTopK, "embed-top-k", 0, "")
+	fs.Float64Var(&embedMinScore, "embed-min-score", 0, "")
+	fs.IntVar(&embedRefreshSec, "embed-refresh-interval", 0, "")
+	fs.StringVar(&contextDir, "context-dir", "", "")
+	fs.IntVar(&keepRecent, "context-keep-recent", 0, "")
+	fs.IntVar(&compactAfter, "context-compact-after", 0, "")
+	fs.IntVar(&maxConcurrent, "discord-max-concurrent", 0, "")
+	fs.StringVar(&searxngURL, "searxng-url", "", "")
+	fs.StringVar(&ollamaSearchKey, "ollama-search-key", "", "")
+	fs.BoolVar(&flagNoWebSearch, "no-web-search", false, "")
+	fs.IntVar(&searchMaxResults, "search-max-results", 0, "")
+	fs.IntVar(&searchConcurrency, "search-concurrency", 0, "")
+	fs.IntVar(&fetchConcurrency, "fetch-concurrency", 0, "")
+	fs.IntVar(&searchTimeoutSec, "search-timeout", 0, "")
+	fs.IntVar(&fetchTimeoutSec, "fetch-timeout", 0, "")
+	fs.StringVar(&topic, "x", "", "")
+	fs.StringVar(&topic, "topic", "", "")
+	fs.StringVar(&outputFile, "o", "", "")
+	fs.StringVar(&outputFile, "output", "", "")
+	fs.BoolVar(&flagHelp, "h", false, "")
+	fs.BoolVar(&flagHelp, "help", false, "")
+
+	usage := discordUsage(fs)
+	fs.Usage = usage
+
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	if flagHelp {
+		usage()
+		return 0
+	}
+
+	quietMode = true // headless daemon - see cmdTelegramBot's own comment on this exact line for the full reasoning
+
+	token := strings.TrimSpace(os.Getenv("OLA_DISCORD_TOKEN"))
+	if token == "" {
+		fmt.Fprintln(os.Stderr, "error: ต้องตั้งค่า OLA_DISCORD_TOKEN (env เท่านั้น - ไม่มี flag รับ token โดยตรง เพื่อไม่ให้หลุดไปอยู่ใน shell history/ps)")
+		return 1
+	}
+
+	pcfg, err := resolveProviderConfig(providerFlag, apiBaseFlag, model, flagKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
+	if ctxStr == "" {
+		ctxStr = os.Getenv("OLA_OLLAMA_CONTEXT_SIZE")
+	}
+	if ctxStr == "" {
+		ctxStr = "16384"
+	}
+	if !regexp.MustCompile(`^[0-9]+$`).MatchString(ctxStr) {
+		fmt.Fprintf(os.Stderr, "error: ctx ต้องเป็นตัวเลข (got: %s)\n", ctxStr)
+		return 1
+	}
+	ctxSize, _ := strconv.Atoi(ctxStr)
+
+	if contextDir == "" {
+		contextDir = os.Getenv("OLA_DISCORD_CONTEXT_DIR")
+	}
+	if contextDir == "" {
+		contextDir = defaultDiscordContextDir
+	}
+	if keepRecent <= 0 {
+		keepRecent = defaultTelegramKeepRecentTurns
+	}
+	if compactAfter <= 0 {
+		compactAfter = defaultTelegramCompactAfterTurns
+	}
+	if compactAfter <= keepRecent {
+		fmt.Fprintf(os.Stderr, "error: --context-compact-after (%d) ต้องมากกว่า --context-keep-recent (%d)\n", compactAfter, keepRecent)
+		return 1
+	}
+	if maxConcurrent <= 0 {
+		maxConcurrent = defaultTelegramMaxConcurrent
+	}
+
+	access, accessWarnings := resolveDiscordAccessConfig(allowedUsers, allowedGuilds, allowedChannels)
+	for _, w := range accessWarnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
+	if access.empty() {
+		fmt.Fprintln(os.Stderr, "error: ไม่มีใครอยู่ใน allowlist เลย (--discord-allowed-users/--discord-allowed-guilds หรือ OLA_DISCORD_ALLOWED_USERS/_GUILDS ว่างเปล่าทั้งคู่) - บอทจะปฏิเสธทุกคน ตั้งอย่างน้อยหนึ่งอย่าง")
+		return 1
+	}
+
+	persona, err = resolveTelegramPersona(persona, personaFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
+	knowledgeCfg, knowledgeWarnings := resolveKnowledgeConfig(knowledgeDir)
+	for _, w := range knowledgeWarnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
+
+	embedCfg := resolveEmbedConfig(embedModel, embedTopK, embedMinScore, embedRefreshSec)
+	if embedCfg.enabled() {
+		if !knowledgeCfg.enabled() {
+			fmt.Fprintln(os.Stderr, "error: --embed-model ตั้งไว้แต่ไม่มี --knowledge-dir - embedding search ใช้กับฐานความรู้เท่านั้น ไม่มีอะไรให้ index")
+			return 1
+		}
+		if pcfg.Provider != providerOllama {
+			fmt.Fprintln(os.Stderr, "error: --embed-model รองรับเฉพาะ --provider ollama ในตอนนี้ (เรียก Ollama's /api/embed โดยตรง)")
+			return 1
+		}
+	}
+
+	searchCfg := resolveSearchConfig(searxngURL, searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec, flagNoWebSearch)
+	if !flagNoWebSearch {
+		searchCfg.OllamaAPIKey, searchCfg.OllamaBase = resolveOllamaSearchConfig(ollamaSearchKey)
+	}
+
+	tools := filterTools(builtinTools, "get_current_time", "delay")
+	if knowledgeCfg.enabled() {
+		tools = append(tools, searchKnowledgeTool, readKnowledgeTool)
+	}
+	if searchCfg.searchEnabled() {
+		tools = append(tools, webSearchTool)
+	}
+	if searchCfg.fetchEnabled() {
+		tools = append(tools, webFetchTool)
+	}
+
+	systemPrompt := buildDiscordSystemPrompt(persona)
+
+	if outputFile == "" {
+		outputFile = os.Getenv("OLA_OUTPUT_FILE")
+	}
+	if outputFile == "" {
+		outputFile = "discordbot.log"
+	}
+	outFile, err := os.OpenFile(outputFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: เปิดไฟล์ log %s ไม่ได้: %v\n", outputFile, err)
+		return 1
+	}
+	defer outFile.Close()
+
+	ntfyTopic := topic
+	if ntfyTopic == "" {
+		ntfyTopic = os.Getenv("OLA_TOPIC")
+	}
+
+	discordAPIBaseResolved := discordAPIBaseFlag
+	if discordAPIBaseResolved == "" {
+		discordAPIBaseResolved = os.Getenv("OLA_DISCORD_API_BASE")
+	}
+	if discordAPIBaseResolved == "" {
+		discordAPIBaseResolved = discordAPIBase
+	}
+
+	restClient, modelClient := buildDiscordHTTPClients()
+
+	me, err := discordGetMe(restClient, discordAPIBaseResolved, token)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: เชื่อมต่อ Discord API ไม่ได้ (เช็ค OLA_DISCORD_TOKEN และการเชื่อมต่อเน็ต): %v\n", err)
+		return 1
+	}
+
+	session := &discordSession{
+		chatBotCore: chatBotCore{
+			client:           modelClient,
+			systemPrompt:     systemPrompt,
+			tools:            tools,
+			knowledgeCfg:     knowledgeCfg,
+			embedCfg:         embedCfg,
+			knowledgeIdx:     &knowledgeIndexStore{},
+			knowledgeIdxPath: knowledgeIndexPath(contextDir),
+			searchCfg:        searchCfg,
+			pcfg:             pcfg,
+			ctxSize:          ctxSize,
+			contextDir:       contextDir,
+			keepRecent:       keepRecent,
+			compactAfter:     compactAfter,
+			ntfyTopic:        ntfyTopic,
+			outFile:          outFile,
+		},
+		restClient:  restClient,
+		apiBase:     discordAPIBaseResolved,
+		token:       token,
+		botUserID:   me.ID,
+		botUsername: me.Username,
+		access:      access,
+		sem:         make(chan struct{}, maxConcurrent),
+		chanLocks:   map[string]*sync.Mutex{},
+	}
+
+	if embedCfg.enabled() {
+		if prevIdx, err := loadKnowledgeIndex(session.knowledgeIdxPath); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: โหลด knowledge index เดิม (%s) ไม่ได้ (%v) - จะสร้างใหม่ทั้งหมด\n", session.knowledgeIdxPath, err)
+		} else {
+			session.knowledgeIdx.set(prevIdx)
+		}
+		fmt.Println("กำลัง embed ฐานความรู้ (embed-model: " + embedCfg.Model + ")...")
+		session.refreshKnowledgeIndex()
+		fmt.Printf("  embed เสร็จแล้ว: %d chunk(s) ใน index (%s)\n", len(session.knowledgeIdx.get().Chunks), session.knowledgeIdxPath)
+		session.startKnowledgeIndexRefresher(embedCfg.RefreshInterval)
+	}
+
+	fmt.Printf("ola discordbot: เชื่อมต่อสำเร็จเป็น @%s (model: %s, provider: %s)\n", me.Username, pcfg.Model, pcfg.Provider)
+	fmt.Printf("  allowlist: %d user(s), %d guild(s), %d channel(s) restricted\n", len(access.Users), len(access.Guilds), len(access.Channels))
+	fmt.Println("  " + strings.ReplaceAll(session.toolsStatusText(), "\n", "\n  "))
+	fmt.Printf("  context: %s (compact เมื่อเกิน %d turn, เหลือ %d turn ล่าสุด)\n", contextDir, compactAfter, keepRecent)
+	fmt.Printf("  log: %s (append)\n", outputFile)
+	fmt.Println("กด Ctrl-C เพื่อหยุด")
+	fmt.Fprintf(outFile, "\n=== ola discordbot เริ่มทำงาน %s (bot: @%s) ===\n%s\n",
+		time.Now().Format(time.RFC3339), me.Username, session.toolsStatusText())
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	stopCh := make(chan struct{})
+
+	gw := &discordGatewaySession{
+		token:      token,
+		intents:    discordDefaultIntents,
+		dial:       dialDiscordGateway,
+		gatewayURL: func() (string, error) { return discordGetGatewayURL(restClient, discordAPIBaseResolved, token) },
+		onMessage:  session.handleDiscordMessage,
+		outFile:    outFile,
+	}
+	// onMessage is called synchronously from the Gateway read loop, so it
+	// must never block that loop for long (a slow model call would delay
+	// heartbeats and every other incoming message) - hand off to its own
+	// goroutine immediately, same as cmdTelegramBot does per update.
+	gw.onMessage = func(msg *discordMessage) { go session.handleDiscordMessage(msg) }
+
+	go gw.run(stopCh)
+
+	<-sigCh
+	fmt.Println("\nกำลังหยุด ola discordbot...")
+	fmt.Fprintf(outFile, "=== ola discordbot หยุดทำงาน %s ===\n", time.Now().Format(time.RFC3339))
+	close(stopCh)
+	return 0
 }

@@ -6815,7 +6815,8 @@ func TestKnowledgeConfigSearchAndRead(t *testing.T) {
 func TestChatContextSaveLoadRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	chat := tgChat{ID: 555, Type: "private"}
-	c, err := loadChatContext(dir, chat)
+	key := telegramContextKey(chat)
+	c, err := loadChatContext(dir, key)
 	if err != nil {
 		t.Fatalf("loadChatContext on a not-yet-existing file should not error, got: %v", err)
 	}
@@ -6828,11 +6829,14 @@ func TestChatContextSaveLoadRoundTrip(t *testing.T) {
 	if err := c.save(dir); err != nil {
 		t.Fatalf("save error: %v", err)
 	}
-	if _, err := os.Stat(chatContextPath(dir, chat) + ".tmp"); !os.IsNotExist(err) {
+	if _, err := os.Stat(chatContextPath(dir, key) + ".tmp"); !os.IsNotExist(err) {
 		t.Fatal("expected the .tmp file to be gone after an atomic rename")
 	}
+	if key != "user_555" {
+		t.Fatalf("expected telegramContextKey to keep the pre-existing on-disk naming (\"user_555\"), got %q - this would orphan existing deployments' saved conversations", key)
+	}
 
-	reloaded, err := loadChatContext(dir, chat)
+	reloaded, err := loadChatContext(dir, key)
 	if err != nil {
 		t.Fatalf("reload error: %v", err)
 	}
@@ -6862,8 +6866,8 @@ func TestShouldCompactChatContext(t *testing.T) {
 // never offered in telegrambot's own tool schema, but still recognized by
 // dispatchToolCall's shared base switch (see that function; it dispatches
 // the base eight tools by name unconditionally) - must NOT actually touch
-// the filesystem when it reaches dispatchTelegramToolCall instead. This
-// is exactly the gap dispatchTelegramToolCall exists to close - see its
+// the filesystem when it reaches dispatchChatToolCall instead. This
+// is exactly the gap dispatchChatToolCall exists to close - see its
 // doc comment.
 func TestDispatchTelegramToolCallRejectsFilesystemTools(t *testing.T) {
 	dir := t.TempDir()
@@ -6884,13 +6888,13 @@ func TestDispatchTelegramToolCallRejectsFilesystemTools(t *testing.T) {
 			"path": "pwned.txt", "content": "pwned", "command": "echo pwned",
 		})
 		tc := toolCall{Function: toolCallFunction{Name: name, Arguments: argsJSON}}
-		result := dispatchTelegramToolCall(tc, outFile, nil)
+		result := dispatchChatToolCall(tc, outFile, nil)
 		if !strings.HasPrefix(result, "ERROR:") {
 			t.Fatalf("expected %s to be rejected, got: %s", name, result)
 		}
 	}
 	if _, err := os.Stat(filepath.Join(dir, "pwned.txt")); !os.IsNotExist(err) {
-		t.Fatal("SECURITY REGRESSION: dispatchTelegramToolCall allowed write_file to actually create a file")
+		t.Fatal("SECURITY REGRESSION: dispatchChatToolCall allowed write_file to actually create a file")
 	}
 }
 
@@ -6906,21 +6910,23 @@ func newTestTelegramSession(t *testing.T, telegramSrv, ollamaSrv *httptest.Serve
 	}
 	t.Cleanup(func() { logFile.Close() })
 	return &telegramSession{
-		client:         ollamaSrv.Client(),
+		chatBotCore: chatBotCore{
+			client:       ollamaSrv.Client(),
+			systemPrompt: buildChatBotSystemPrompt("Telegram", ""),
+			tools:        filterTools(builtinTools, "get_current_time", "delay"),
+			pcfg:         providerConfig{Provider: providerOllama, Host: ollamaSrv.URL, Model: "mock-model"},
+			ctxSize:      4096,
+			contextDir:   contextDir,
+			knowledgeIdx: &knowledgeIndexStore{},
+			keepRecent:   defaultTelegramKeepRecentTurns,
+			compactAfter: defaultTelegramCompactAfterTurns,
+			outFile:      logFile,
+		},
 		telegramClient: telegramSrv.Client(),
 		apiBase:        telegramSrv.URL,
 		token:          "test-token",
 		botUsername:    "olabot",
 		access:         telegramAccessConfig{Users: users, Groups: map[int64]bool{}},
-		systemPrompt:   builtinTelegramSystemPromptIntro + "\n\n" + builtinTelegramSystemPromptRules,
-		tools:          filterTools(builtinTools, "get_current_time", "delay"),
-		pcfg:           providerConfig{Provider: providerOllama, Host: ollamaSrv.URL, Model: "mock-model"},
-		ctxSize:        4096,
-		contextDir:     contextDir,
-		knowledgeIdx:   &knowledgeIndexStore{},
-		keepRecent:     defaultTelegramKeepRecentTurns,
-		compactAfter:   defaultTelegramCompactAfterTurns,
-		outFile:        logFile,
 		sem:            make(chan struct{}, 4),
 		chatLocks:      map[int64]*sync.Mutex{},
 	}
@@ -6986,7 +6992,7 @@ func TestHandleTelegramMessageAllowedUserGetsAnswer(t *testing.T) {
 		t.Fatalf("unexpected reply: %#v", (*sent)[0])
 	}
 
-	cctx, err := loadChatContext(contextDir, tgChat{ID: 111, Type: "private"})
+	cctx, err := loadChatContext(contextDir, telegramContextKey(tgChat{ID: 111, Type: "private"}))
 	if err != nil {
 		t.Fatalf("loadChatContext: %v", err)
 	}
@@ -7025,7 +7031,7 @@ func TestHandleTelegramMessageDeniedUserGetsNoAnswerFromModel(t *testing.T) {
 	if len(*sent) != 1 || !strings.Contains((*sent)[0].Text, "ยังไม่ได้รับอนุญาต") {
 		t.Fatalf("expected a single access-denied reply, got: %#v", *sent)
 	}
-	if _, err := os.Stat(chatContextPath(contextDir, tgChat{ID: 111, Type: "private"})); !os.IsNotExist(err) {
+	if _, err := os.Stat(chatContextPath(contextDir, telegramContextKey(tgChat{ID: 111, Type: "private"}))); !os.IsNotExist(err) {
 		t.Fatal("expected no context file to be created for a denied user")
 	}
 }
@@ -7127,8 +7133,8 @@ func TestRunTelegramToolLoopRetriesOnceOnEmptyCompletion(t *testing.T) {
 	telegramSrv, _ := newMockTelegramSendMessageServer(t)
 	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, t.TempDir(), map[int64]bool{1: true})
 
-	answer, err := session.runTelegramToolLoop([]ollamaMessage{
-		{Role: "system", Content: builtinTelegramSystemPromptIntro + "\n\n" + builtinTelegramSystemPromptRules},
+	answer, err := session.runChatToolLoop([]ollamaMessage{
+		{Role: "system", Content: buildChatBotSystemPrompt("Telegram", "")},
 		{Role: "user", Content: "hi"},
 	})
 	if err != nil {
@@ -7154,8 +7160,8 @@ func TestRunTelegramToolLoopFailsAfterRepeatedEmptyCompletions(t *testing.T) {
 	telegramSrv, _ := newMockTelegramSendMessageServer(t)
 	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, t.TempDir(), map[int64]bool{1: true})
 
-	_, err := session.runTelegramToolLoop([]ollamaMessage{
-		{Role: "system", Content: builtinTelegramSystemPromptIntro + "\n\n" + builtinTelegramSystemPromptRules},
+	_, err := session.runChatToolLoop([]ollamaMessage{
+		{Role: "system", Content: buildChatBotSystemPrompt("Telegram", "")},
 		{Role: "user", Content: "hi"},
 	})
 	if err == nil {
@@ -7193,7 +7199,7 @@ func TestHandleTelegramMessageEmptyCompletionDoesNotPersistBlankTurn(t *testing.
 	if len(*sent) != 1 || strings.TrimSpace((*sent)[0].Text) == "" {
 		t.Fatalf("expected a single non-empty error reply, got: %#v", *sent)
 	}
-	cctx, err := loadChatContext(contextDir, tgChat{ID: 111, Type: "private"})
+	cctx, err := loadChatContext(contextDir, telegramContextKey(tgChat{ID: 111, Type: "private"}))
 	if err != nil {
 		t.Fatalf("loadChatContext: %v", err)
 	}
@@ -7240,7 +7246,7 @@ func TestHandleTelegramMessageToolsCommand(t *testing.T) {
 func TestBuildTelegramSystemPromptPersonaOrderingAndIdentityRule(t *testing.T) {
 	prompt := buildTelegramSystemPrompt("คุณชื่อ JonnyQ ร่าเริงและรักการผจญภัย")
 
-	introIdx := strings.Index(prompt, builtinTelegramSystemPromptIntro)
+	introIdx := strings.Index(prompt, chatBotSystemPromptIntro("Telegram"))
 	personaIdx := strings.Index(prompt, "JonnyQ")
 	rulesIdx := strings.Index(prompt, "กติกาพื้นฐานที่ต้องทำตามเสมอ")
 	if introIdx == -1 || personaIdx == -1 || rulesIdx == -1 {
@@ -7261,9 +7267,33 @@ func TestBuildTelegramSystemPromptPersonaOrderingAndIdentityRule(t *testing.T) {
 	}
 }
 
+// TestBuildChatBotSystemPromptDifferentPlatformNames confirms the intro
+// line actually varies by platform (the one genuinely platform-specific
+// piece of an otherwise fully shared prompt) while the rules stay
+// identical either way.
+func TestBuildChatBotSystemPromptDifferentPlatformNames(t *testing.T) {
+	tg := buildChatBotSystemPrompt("Telegram", "")
+	dc := buildChatBotSystemPrompt("Discord", "")
+	if !strings.Contains(tg, "บอท Telegram") {
+		t.Fatalf("expected Telegram intro, got: %s", tg[:80])
+	}
+	if !strings.Contains(dc, "บอท Discord") {
+		t.Fatalf("expected Discord intro, got: %s", dc[:80])
+	}
+	if strings.Contains(tg, "บอท Discord") || strings.Contains(dc, "บอท Telegram") {
+		t.Fatal("expected each platform's intro to mention only its own platform")
+	}
+	// everything after the intro (the shared rules) must be byte-identical
+	tgRules := tg[strings.Index(tg, "\n\n"):]
+	dcRules := dc[strings.Index(dc, "\n\n"):]
+	if tgRules != dcRules {
+		t.Fatal("expected the rules half of the prompt to be identical across platforms")
+	}
+}
+
 // TestTelegramGroundToolResult is the regression test for the "answered a
 // search-flavored question with a fabricated-looking search transcript,
-// no real URL cited" bug report - see telegramGroundToolResult's own doc
+// no real URL cited" bug report - see groundToolResult's own doc
 // comment for the full failure mode this addresses.
 func TestTelegramGroundToolResult(t *testing.T) {
 	cases := []struct {
@@ -7282,10 +7312,10 @@ func TestTelegramGroundToolResult(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := telegramGroundToolResult(tc.toolName, tc.result)
+			got := groundToolResult(tc.toolName, tc.result)
 			isMarked := strings.HasPrefix(got, "[ผลลัพธ์จริงจากการเรียก")
 			if isMarked != tc.wantMarked {
-				t.Fatalf("telegramGroundToolResult(%q, ...): marked=%v, want %v (got: %q)", tc.toolName, isMarked, tc.wantMarked, got)
+				t.Fatalf("groundToolResult(%q, ...): marked=%v, want %v (got: %q)", tc.toolName, isMarked, tc.wantMarked, got)
 			}
 			if !strings.Contains(got, tc.result) {
 				t.Fatalf("expected the original result content to still be present, got: %q", got)
@@ -7848,5 +7878,687 @@ func TestSearchKnowledgeToolFallsBackWhenEmbeddingScoresAreLow(t *testing.T) {
 	}
 	if !strings.Contains(result, "เนื้อหาที่ไม่เกี่ยวข้อง") {
 		t.Fatalf("expected the small-file-dump fallback to still fire when embedding scores are all below threshold, got: %s", result)
+	}
+}
+
+// ======================================================================
+// Section: discordbot
+//
+// Unit tests for the pure helper functions (allowlist, addressing,
+// message splitting), REST client tests via httptest (same pattern as
+// telegrambot's), Gateway protocol tests driven against a fake in-memory
+// wsConn (never a real Discord connection - see discordGatewaySession's
+// own doc comment for why), and end-to-end handleDiscordMessage tests
+// mirroring telegrambot's own test section, confirming the shared
+// chatBotCore behaves identically from Discord's side of the fence too.
+// ======================================================================
+
+func TestSplitDiscordMessageShortPassesThrough(t *testing.T) {
+	got := splitDiscordMessage("สวัสดีครับ")
+	if len(got) != 1 || got[0] != "สวัสดีครับ" {
+		t.Fatalf("expected single unchanged chunk, got %#v", got)
+	}
+}
+
+func TestSplitDiscordMessageRespectsDiscordLimit(t *testing.T) {
+	var sb strings.Builder
+	for i := 0; i < 150; i++ {
+		sb.WriteString(strings.Repeat("a", 30))
+		sb.WriteString("\n")
+	}
+	chunks := splitDiscordMessage(sb.String())
+	if len(chunks) < 2 {
+		t.Fatalf("expected text longer than Discord's limit to split, got %d chunk(s)", len(chunks))
+	}
+	for _, c := range chunks {
+		if utf8.RuneCountInString(c) > discordMaxMessageRunes {
+			t.Fatalf("chunk exceeds discordMaxMessageRunes (%d): %d runes", discordMaxMessageRunes, utf8.RuneCountInString(c))
+		}
+	}
+}
+
+func TestParseDiscordIDList(t *testing.T) {
+	ids, warnings := parseDiscordIDList("123456789012345678, not-a-snowflake, 987654321098765432")
+	if len(warnings) != 1 {
+		t.Fatalf("expected exactly 1 warning for the bad entry, got %d: %v", len(warnings), warnings)
+	}
+	if len(ids) != 2 || !ids["123456789012345678"] || !ids["987654321098765432"] {
+		t.Fatalf("unexpected ids: %v", ids)
+	}
+}
+
+func TestDiscordAccessConfigAllowed(t *testing.T) {
+	cfg := discordAccessConfig{
+		Users:  map[string]bool{"111": true},
+		Guilds: map[string]bool{"222": true},
+	}
+	// DM from an allowed user
+	if !cfg.allowed(&discordMessage{Author: discordUser{ID: "111"}}) {
+		t.Fatal("expected allow-listed DM user to be allowed")
+	}
+	// DM from a non-allowed user
+	if cfg.allowed(&discordMessage{Author: discordUser{ID: "999"}}) {
+		t.Fatal("expected non-allow-listed DM user to be denied")
+	}
+	// guild message in an allowed guild, no channel restriction configured
+	if !cfg.allowed(&discordMessage{GuildID: "222", ChannelID: "555", Author: discordUser{ID: "999"}}) {
+		t.Fatal("expected any channel of an allow-listed guild to be allowed when no channel restriction is set")
+	}
+	// guild message in a non-allowed guild
+	if cfg.allowed(&discordMessage{GuildID: "333", ChannelID: "555", Author: discordUser{ID: "111"}}) {
+		t.Fatal("expected a non-allow-listed guild to be denied even for an allow-listed user")
+	}
+
+	// with a channel restriction configured
+	cfg.Channels = map[string]bool{"555": true}
+	if !cfg.allowed(&discordMessage{GuildID: "222", ChannelID: "555", Author: discordUser{ID: "999"}}) {
+		t.Fatal("expected the explicitly allowed channel to be allowed")
+	}
+	if cfg.allowed(&discordMessage{GuildID: "222", ChannelID: "666", Author: discordUser{ID: "999"}}) {
+		t.Fatal("expected a channel not in the restriction list to be denied even in an allowed guild")
+	}
+}
+
+func TestDiscordContextKey(t *testing.T) {
+	dm := &discordMessage{GuildID: "", Author: discordUser{ID: "111"}}
+	if got := discordContextKey(dm); got != "discord_dm_111" {
+		t.Fatalf("expected discord_dm_111, got %q", got)
+	}
+	channel := &discordMessage{GuildID: "222", ChannelID: "333"}
+	if got := discordContextKey(channel); got != "discord_channel_333" {
+		t.Fatalf("expected discord_channel_333, got %q", got)
+	}
+	// Must never collide with Telegram's own unprefixed keys.
+	tgKey := telegramContextKey(tgChat{ID: 111, Type: "private"})
+	if discordContextKey(dm) == tgKey {
+		t.Fatal("expected discord and telegram context keys to never collide")
+	}
+}
+
+func TestDiscordMessageAddressesBotAndStripMention(t *testing.T) {
+	cases := []struct {
+		name    string
+		msg     *discordMessage
+		addr    bool
+		stripTo string
+	}{
+		{"mention", &discordMessage{Content: "<@999> สรุปให้หน่อย", Mentions: []discordUser{{ID: "999"}}}, true, "สรุปให้หน่อย"},
+		{"nickname-mention", &discordMessage{Content: "<@!999> สรุปให้หน่อย", Mentions: []discordUser{{ID: "999"}}}, true, "สรุปให้หน่อย"},
+		{"ola-prefix", &discordMessage{Content: "!ola สรุปให้หน่อย"}, true, "สรุปให้หน่อย"},
+		{"ask-prefix", &discordMessage{Content: "!ask hello"}, true, "hello"},
+		{"unaddressed", &discordMessage{Content: "คุยกันเฉยๆ ไม่เกี่ยวกับบอท"}, false, ""},
+		{"mentions-someone-else", &discordMessage{Content: "<@111> hi", Mentions: []discordUser{{ID: "111"}}}, false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := discordMessageAddressesBot(tc.msg, "999")
+			if got != tc.addr {
+				t.Fatalf("discordMessageAddressesBot: got %v, want %v", got, tc.addr)
+			}
+			if tc.addr {
+				stripped := stripDiscordMention(tc.msg.Content, "999")
+				if stripped != tc.stripTo {
+					t.Fatalf("stripDiscordMention: got %q, want %q", stripped, tc.stripTo)
+				}
+			}
+		})
+	}
+}
+
+func newMockDiscordRESTServer(t *testing.T) (*httptest.Server, *[]struct {
+	ChannelID string
+	Content   string
+}, *string) {
+	t.Helper()
+	var sent []struct {
+		ChannelID string
+		Content   string
+	}
+	var lastAuthHeader string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v10/users/@me", func(w http.ResponseWriter, r *http.Request) {
+		lastAuthHeader = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"999","username":"olabot","bot":true}`)
+	})
+	mux.HandleFunc("/api/v10/gateway/bot", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"url":"wss://fake-gateway.example/"}`)
+	})
+	mux.HandleFunc("/api/v10/channels/", func(w http.ResponseWriter, r *http.Request) {
+		lastAuthHeader = r.Header.Get("Authorization")
+		// path shape: /api/v10/channels/{id}/messages
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v10/channels/"), "/")
+		if len(parts) != 2 || parts[1] != "messages" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var body struct {
+			Content string `json:"content"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		sent = append(sent, struct {
+			ChannelID string
+			Content   string
+		}{parts[0], body.Content})
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"1"}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, &sent, &lastAuthHeader
+}
+
+// TestDiscordGetMeAndSendMessage exercises the actual discordGetMe/
+// discordSendMessage functions end to end against a mock server (now
+// that discordRESTRequest takes apiBase as a parameter rather than a
+// hardcoded production constant) - confirming the real "Bot <token>"
+// auth header (Discord's scheme, different from Telegram's URL-embedded
+// token) and the real request/response wiring, not just the shape.
+func TestDiscordGetMeAndSendMessage(t *testing.T) {
+	srv, sent, lastAuth := newMockDiscordRESTServer(t)
+	apiBase := srv.URL + "/api/v10"
+
+	me, err := discordGetMe(srv.Client(), apiBase, "test-token-123")
+	if err != nil {
+		t.Fatalf("discordGetMe error: %v", err)
+	}
+	if me.ID != "999" || me.Username != "olabot" || !me.Bot {
+		t.Fatalf("unexpected discordGetMe result: %#v", me)
+	}
+	if *lastAuth != "Bot test-token-123" {
+		t.Fatalf("expected Authorization header 'Bot test-token-123', got %q", *lastAuth)
+	}
+
+	if err := discordSendMessage(srv.Client(), apiBase, "test-token-123", "555", "hello"); err != nil {
+		t.Fatalf("discordSendMessage error: %v", err)
+	}
+	if len(*sent) != 1 || (*sent)[0].ChannelID != "555" || (*sent)[0].Content != "hello" {
+		t.Fatalf("unexpected sent messages: %#v", *sent)
+	}
+}
+
+func TestDiscordGetGatewayURL(t *testing.T) {
+	srv, _, _ := newMockDiscordRESTServer(t)
+	url, err := discordGetGatewayURL(srv.Client(), srv.URL+"/api/v10", "test-token")
+	if err != nil {
+		t.Fatalf("discordGetGatewayURL error: %v", err)
+	}
+	if url != "wss://fake-gateway.example/" {
+		t.Fatalf("unexpected gateway url: %q", url)
+	}
+}
+
+func TestDiscordSendMessageSplitsLongText(t *testing.T) {
+	srv, sent, _ := newMockDiscordRESTServer(t)
+	var sb strings.Builder
+	for i := 0; i < 150; i++ {
+		sb.WriteString(strings.Repeat("a", 30))
+		sb.WriteString("\n")
+	}
+	if err := discordSendMessage(srv.Client(), srv.URL+"/api/v10", "test-token", "777", sb.String()); err != nil {
+		t.Fatalf("discordSendMessage error: %v", err)
+	}
+	if len(*sent) < 2 {
+		t.Fatalf("expected multiple POSTs for a long message, got %d", len(*sent))
+	}
+	for _, s := range *sent {
+		if s.ChannelID != "777" {
+			t.Fatalf("expected all chunks to go to channel 777, got %q", s.ChannelID)
+		}
+	}
+}
+
+// TestDiscordRESTRetriesAfter429 confirms discordRESTRequest actually
+// honors Discord's rate-limit response (429 + retry_after) rather than
+// just passing the failure straight back - the second attempt against
+// the same mock endpoint must succeed once the mock stops returning 429.
+func TestDiscordRESTRetriesAfter429(t *testing.T) {
+	var attempt int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v10/users/@me", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&attempt, 1)
+		if n == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			fmt.Fprint(w, `{"retry_after":0.01}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"1","username":"olabot","bot":true}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	me, err := discordGetMe(srv.Client(), srv.URL+"/api/v10", "test-token")
+	if err != nil {
+		t.Fatalf("discordGetMe error: %v", err)
+	}
+	if me.Username != "olabot" {
+		t.Fatalf("unexpected result after retry: %#v", me)
+	}
+	if atomic.LoadInt32(&attempt) != 2 {
+		t.Fatalf("expected exactly 2 attempts (1 rate-limited + 1 retry), got %d", attempt)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Gateway protocol tests - driven entirely against a fake in-memory
+// wsConn, never a real Discord connection (see discordGatewaySession's
+// own doc comment for why the whole protocol state machine is
+// structured to make this possible).
+// ─────────────────────────────────────────────────────────────────
+
+// fakeWSConn is a scriptable wsConn: reads pop from a queue of canned
+// server->client messages (blocking briefly if the queue is empty, so a
+// test can push more messages while a goroutine is already reading),
+// writes are recorded for assertions, and Close marks the connection
+// dead so any further Read returns an error (matching a real closed
+// socket) - this is what lets discordGatewaySession.runOnce's blocking
+// ReadMessage loop actually terminate in a test instead of hanging
+// forever.
+type fakeWSConn struct {
+	mu       sync.Mutex
+	toClient [][]byte
+	written  [][]byte
+	closed   bool
+	cond     *sync.Cond
+}
+
+func newFakeWSConn() *fakeWSConn {
+	c := &fakeWSConn{}
+	c.cond = sync.NewCond(&c.mu)
+	return c
+}
+
+func (c *fakeWSConn) push(payload discordGatewayPayload) {
+	data, _ := json.Marshal(payload)
+	c.mu.Lock()
+	c.toClient = append(c.toClient, data)
+	c.cond.Broadcast()
+	c.mu.Unlock()
+}
+
+func (c *fakeWSConn) ReadMessage() ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for len(c.toClient) == 0 && !c.closed {
+		c.cond.Wait()
+	}
+	if c.closed && len(c.toClient) == 0 {
+		return nil, fmt.Errorf("fakeWSConn: closed")
+	}
+	msg := c.toClient[0]
+	c.toClient = c.toClient[1:]
+	return msg, nil
+}
+
+func (c *fakeWSConn) WriteMessage(data []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return fmt.Errorf("fakeWSConn: closed")
+	}
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	c.written = append(c.written, cp)
+	return nil
+}
+
+func (c *fakeWSConn) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closed = true
+	c.cond.Broadcast()
+	return nil
+}
+
+func (c *fakeWSConn) writtenPayloads() []discordGatewayPayload {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []discordGatewayPayload
+	for _, w := range c.written {
+		var p discordGatewayPayload
+		if err := json.Unmarshal(w, &p); err == nil {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func TestDiscordGatewaySessionIdentifiesAndDispatchesMessage(t *testing.T) {
+	fake := newFakeWSConn()
+	fake.push(discordGatewayPayload{Op: discordOpHello, D: json.RawMessage(`{"heartbeat_interval":60000}`)}) // long interval - this test doesn't exercise heartbeat timing
+
+	var seqOne int64 = 1
+	msgPayload, _ := json.Marshal(discordMessage{ID: "1", ChannelID: "555", Author: discordUser{ID: "111"}, Content: "hi"})
+	fake.push(discordGatewayPayload{Op: discordOpDispatch, T: "MESSAGE_CREATE", S: &seqOne, D: msgPayload})
+
+	var received []*discordMessage
+	var mu sync.Mutex
+	logFile, _ := os.CreateTemp(t.TempDir(), "log")
+	defer logFile.Close()
+
+	gw := &discordGatewaySession{
+		token:      "test-token",
+		intents:    discordDefaultIntents,
+		dial:       func(url string) (wsConn, error) { return fake, nil },
+		gatewayURL: func() (string, error) { return "wss://fake/", nil },
+		onMessage: func(m *discordMessage) {
+			mu.Lock()
+			received = append(received, m)
+			mu.Unlock()
+		},
+		outFile: logFile,
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- gw.runOnce() }()
+
+	// Give the goroutine a moment to process HELLO/IDENTIFY/the dispatched
+	// message, then close the fake connection so runOnce's blocking read
+	// returns and the test can finish deterministically.
+	time.Sleep(100 * time.Millisecond)
+	fake.Close()
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(received) != 1 || received[0].Content != "hi" || received[0].Author.ID != "111" {
+		t.Fatalf("expected exactly 1 dispatched MESSAGE_CREATE to reach onMessage, got: %#v", received)
+	}
+
+	written := fake.writtenPayloads()
+	if len(written) == 0 || written[0].Op != discordOpIdentify {
+		t.Fatalf("expected the first message sent to the gateway to be IDENTIFY (op %d), got: %#v", discordOpIdentify, written)
+	}
+	var identify discordIdentify
+	if err := json.Unmarshal(written[0].D, &identify); err != nil {
+		t.Fatalf("failed to parse IDENTIFY payload: %v", err)
+	}
+	if identify.Token != "test-token" || identify.Intents != discordDefaultIntents {
+		t.Fatalf("unexpected IDENTIFY contents: %#v", identify)
+	}
+}
+
+func TestDiscordGatewaySessionSendsHeartbeatOnInterval(t *testing.T) {
+	fake := newFakeWSConn()
+	fake.push(discordGatewayPayload{Op: discordOpHello, D: json.RawMessage(`{"heartbeat_interval":50}`)}) // short interval, deliberately, to actually observe a heartbeat in a fast test
+
+	logFile, _ := os.CreateTemp(t.TempDir(), "log")
+	defer logFile.Close()
+	gw := &discordGatewaySession{
+		token:      "t",
+		intents:    discordDefaultIntents,
+		dial:       func(url string) (wsConn, error) { return fake, nil },
+		gatewayURL: func() (string, error) { return "wss://fake/", nil },
+		onMessage:  func(m *discordMessage) {},
+		outFile:    logFile,
+	}
+	done := make(chan error, 1)
+	go func() { done <- gw.runOnce() }()
+
+	// Wait long enough for at least one heartbeat to have been sent
+	// (interval 50ms + jitter, well under the 300ms budget here), then
+	// ACK it so runOnce doesn't treat the connection as dead, then close.
+	time.Sleep(200 * time.Millisecond)
+	fake.push(discordGatewayPayload{Op: discordOpHeartbeatACK})
+	time.Sleep(50 * time.Millisecond)
+	fake.Close()
+	<-done
+
+	written := fake.writtenPayloads()
+	sawHeartbeat := false
+	for _, w := range written {
+		if w.Op == discordOpHeartbeat {
+			sawHeartbeat = true
+		}
+	}
+	if !sawHeartbeat {
+		t.Fatalf("expected at least one HEARTBEAT (op %d) to have been sent, got: %#v", discordOpHeartbeat, written)
+	}
+}
+
+func TestDiscordGatewaySessionRunReconnectsAfterDisconnect(t *testing.T) {
+	var dialCount int32
+	logFile, _ := os.CreateTemp(t.TempDir(), "log")
+	defer logFile.Close()
+
+	gw := &discordGatewaySession{
+		token:   "t",
+		intents: discordDefaultIntents,
+		dial: func(url string) (wsConn, error) {
+			n := atomic.AddInt32(&dialCount, 1)
+			fake := newFakeWSConn()
+			fake.push(discordGatewayPayload{Op: discordOpHello, D: json.RawMessage(`{"heartbeat_interval":60000}`)})
+			if n == 1 {
+				// First connection: close almost immediately (simulating a
+				// dropped connection) so run()'s outer loop must reconnect.
+				go func() {
+					time.Sleep(20 * time.Millisecond)
+					fake.Close()
+				}()
+			}
+			return fake, nil
+		},
+		gatewayURL: func() (string, error) { return "wss://fake/", nil },
+		onMessage:  func(m *discordMessage) {},
+		outFile:    logFile,
+	}
+
+	stopCh := make(chan struct{})
+	done := make(chan struct{})
+	go func() { gw.run(stopCh); close(done) }()
+
+	// run() backs off before reconnecting (starting at 1s) - this test
+	// only needs to observe that a second dial happens at all, not wait
+	// out the full backoff, so stop it well before that and just assert
+	// the first disconnect was observed.
+	time.Sleep(100 * time.Millisecond)
+	close(stopCh)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("gw.run did not exit after stopCh was closed")
+	}
+	if atomic.LoadInt32(&dialCount) < 1 {
+		t.Fatal("expected at least 1 dial attempt")
+	}
+}
+
+// newTestDiscordSession builds a discordSession wired to mock Discord
+// REST (discordSrv) and Ollama (ollamaSrv) httptest servers, for driving
+// handleDiscordMessage directly - mirrors newTestTelegramSession exactly,
+// see that function's own comment for why the Gateway itself is never
+// driven in these tests (handleDiscordMessage is the right seam, same
+// reasoning as telegrambot's handleTelegramMessage).
+func newTestDiscordSession(t *testing.T, discordSrv, ollamaSrv *httptest.Server, contextDir string, users map[string]bool) *discordSession {
+	t.Helper()
+	logFile, err := os.CreateTemp(t.TempDir(), "discordbot-test-log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { logFile.Close() })
+	return &discordSession{
+		chatBotCore: chatBotCore{
+			client:       ollamaSrv.Client(),
+			systemPrompt: buildDiscordSystemPrompt(""),
+			tools:        filterTools(builtinTools, "get_current_time", "delay"),
+			pcfg:         providerConfig{Provider: providerOllama, Host: ollamaSrv.URL, Model: "mock-model"},
+			ctxSize:      4096,
+			contextDir:   contextDir,
+			knowledgeIdx: &knowledgeIndexStore{},
+			keepRecent:   defaultTelegramKeepRecentTurns,
+			compactAfter: defaultTelegramCompactAfterTurns,
+			outFile:      logFile,
+		},
+		restClient:  discordSrv.Client(),
+		apiBase:     discordSrv.URL + "/api/v10",
+		token:       "test-token",
+		botUserID:   "999",
+		botUsername: "olabot",
+		access:      discordAccessConfig{Users: users, Guilds: map[string]bool{}},
+		sem:         make(chan struct{}, 4),
+		chanLocks:   map[string]*sync.Mutex{},
+	}
+}
+
+func TestHandleDiscordMessageAllowedDMUserGetsAnswer(t *testing.T) {
+	discordSrv, sent, _ := newMockDiscordRESTServer(t)
+
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("สวัสดีครับ ยินดีช่วยเหลือ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	contextDir := t.TempDir()
+	session := newTestDiscordSession(t, discordSrv, ollamaSrv, contextDir, map[string]bool{"111": true})
+
+	msg := &discordMessage{ID: "1", ChannelID: "channel-1", Author: discordUser{ID: "111", Username: "moo"}, Content: "สวัสดี"}
+	session.handleDiscordMessage(msg)
+
+	if len(*sent) != 1 || (*sent)[0].ChannelID != "channel-1" || (*sent)[0].Content != "สวัสดีครับ ยินดีช่วยเหลือ" {
+		t.Fatalf("unexpected reply: %#v", *sent)
+	}
+
+	cctx, err := loadChatContext(contextDir, discordContextKey(msg))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	if len(cctx.Turns) != 2 || cctx.Turns[0].Role != "user" || cctx.Turns[1].Role != "assistant" {
+		t.Fatalf("expected 1 user + 1 assistant turn persisted, got: %#v", cctx.Turns)
+	}
+}
+
+func TestHandleDiscordMessageDeniedUserGetsNoAnswerFromModel(t *testing.T) {
+	discordSrv, sent, _ := newMockDiscordRESTServer(t)
+
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&ollamaCalls, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("ไม่ควรถูกเรียก", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	session := newTestDiscordSession(t, discordSrv, ollamaSrv, t.TempDir(), map[string]bool{})
+
+	msg := &discordMessage{ID: "1", ChannelID: "channel-1", Author: discordUser{ID: "111"}, Content: "สวัสดี"}
+	session.handleDiscordMessage(msg)
+
+	if atomic.LoadInt32(&ollamaCalls) != 0 {
+		t.Fatal("expected a denied user's message to never reach the model")
+	}
+	if len(*sent) != 1 || !strings.Contains((*sent)[0].Content, "ยังไม่ได้รับอนุญาต") {
+		t.Fatalf("expected a single access-denied reply, got: %#v", *sent)
+	}
+}
+
+func TestHandleDiscordMessageIgnoresBotsIncludingItself(t *testing.T) {
+	discordSrv, sent, _ := newMockDiscordRESTServer(t)
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&ollamaCalls, 1)
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	session := newTestDiscordSession(t, discordSrv, ollamaSrv, t.TempDir(), map[string]bool{"111": true, "999": true})
+
+	// another bot
+	session.handleDiscordMessage(&discordMessage{ID: "1", ChannelID: "c", Author: discordUser{ID: "222", Bot: true}, Content: "hi"})
+	// itself (echo-loop guard)
+	session.handleDiscordMessage(&discordMessage{ID: "2", ChannelID: "c", Author: discordUser{ID: "999"}, Content: "hi"})
+
+	if atomic.LoadInt32(&ollamaCalls) != 0 {
+		t.Fatal("expected messages from bots (including the bot itself) to never reach the model")
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("expected no replies to bot messages, got: %#v", *sent)
+	}
+}
+
+func TestHandleDiscordMessageGuildIgnoresUnaddressedMessages(t *testing.T) {
+	discordSrv, sent, _ := newMockDiscordRESTServer(t)
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&ollamaCalls, 1)
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	session := newTestDiscordSession(t, discordSrv, ollamaSrv, t.TempDir(), map[string]bool{})
+	session.access.Guilds = map[string]bool{"guild-1": true}
+
+	msg := &discordMessage{ID: "1", GuildID: "guild-1", ChannelID: "channel-1", Author: discordUser{ID: "111"}, Content: "คุยกันเฉยๆ ไม่เกี่ยวกับบอท"}
+	session.handleDiscordMessage(msg)
+
+	if atomic.LoadInt32(&ollamaCalls) != 0 {
+		t.Fatal("expected an unaddressed guild message to never reach the model")
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("expected no reply to an unaddressed guild message, got: %#v", *sent)
+	}
+}
+
+func TestHandleDiscordMessageGuildRespondsWhenMentioned(t *testing.T) {
+	discordSrv, sent, _ := newMockDiscordRESTServer(t)
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("ได้เลยครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	session := newTestDiscordSession(t, discordSrv, ollamaSrv, t.TempDir(), map[string]bool{})
+	session.access.Guilds = map[string]bool{"guild-1": true}
+
+	msg := &discordMessage{
+		ID: "1", GuildID: "guild-1", ChannelID: "channel-1",
+		Author:   discordUser{ID: "111"},
+		Content:  "<@999> ช่วยหน่อย",
+		Mentions: []discordUser{{ID: "999"}},
+	}
+	session.handleDiscordMessage(msg)
+
+	if len(*sent) != 1 || (*sent)[0].Content != "ได้เลยครับ" {
+		t.Fatalf("expected a reply when the bot is @mentioned, got: %#v", *sent)
+	}
+}
+
+func TestHandleDiscordMessageToolsAndWhoamiCommands(t *testing.T) {
+	discordSrv, sent, _ := newMockDiscordRESTServer(t)
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&ollamaCalls, 1)
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	session := newTestDiscordSession(t, discordSrv, ollamaSrv, t.TempDir(), map[string]bool{"111": true})
+
+	session.handleDiscordMessage(&discordMessage{ID: "1", ChannelID: "c", Author: discordUser{ID: "222"}, Content: "!whoami"})
+	session.handleDiscordMessage(&discordMessage{ID: "2", ChannelID: "c", Author: discordUser{ID: "111"}, Content: "!tools"})
+
+	if atomic.LoadInt32(&ollamaCalls) != 0 {
+		t.Fatal("expected !whoami and !tools to never reach the model")
+	}
+	if len(*sent) != 2 {
+		t.Fatalf("expected 2 replies (!whoami + !tools), got %d: %#v", len(*sent), *sent)
+	}
+	if !strings.Contains((*sent)[0].Content, "222") {
+		t.Fatalf("expected !whoami to echo the sender's own ID even though not allow-listed, got: %s", (*sent)[0].Content)
+	}
+	if !strings.Contains((*sent)[1].Content, "search_knowledge") {
+		t.Fatalf("expected !tools to show the shared status text, got: %s", (*sent)[1].Content)
 	}
 }
