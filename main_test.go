@@ -6641,3 +6641,619 @@ func TestCmdAskOpenAIProviderEndToEndToolCallRoundTrip(t *testing.T) {
 		t.Fatalf("expected the log header to record provider: openai, got:\n%s", log)
 	}
 }
+
+// ======================================================================
+// Section: telegrambot
+//
+// Unit tests for the pure helper functions (message splitting, ID-list
+// parsing, access control, group-addressing, the knowledge-base tools,
+// context persistence/compaction-threshold), plus end-to-end tests that
+// drive telegramSession.handleTelegramMessage against a mocked Telegram
+// Bot API (just the one sendMessage endpoint it needs) and a mocked
+// Ollama /api/chat, the same httptest pattern the rest of this file uses
+// for cmdAsk/cmdCoding. Deliberately testing at the handleTelegramMessage
+// level rather than driving cmdTelegramBot's own infinite getUpdates loop
+// end to end: that loop's shutdown path listens for OS signals on the
+// whole process (see cmdTelegramBot), which would be unsafe to trigger
+// from inside a test binary that may be running other tests concurrently.
+// ======================================================================
+
+func TestSplitTelegramMessageShortPassesThrough(t *testing.T) {
+	got := splitTelegramMessage("สวัสดีครับ")
+	if len(got) != 1 || got[0] != "สวัสดีครับ" {
+		t.Fatalf("expected single unchanged chunk, got %#v", got)
+	}
+}
+
+func TestSplitTelegramMessageEmptyFallsBack(t *testing.T) {
+	got := splitTelegramMessage("   ")
+	if len(got) != 1 || got[0] == "" {
+		t.Fatalf("expected a single non-empty fallback chunk, got %#v", got)
+	}
+}
+
+func TestSplitTelegramMessageLongSplitsAtBoundary(t *testing.T) {
+	var sb strings.Builder
+	for i := 0; i < 200; i++ {
+		sb.WriteString(strings.Repeat("a", 30))
+		sb.WriteString("\n")
+	}
+	long := sb.String()
+	chunks := splitTelegramMessage(long)
+	if len(chunks) < 2 {
+		t.Fatalf("expected text longer than the limit to split into multiple chunks, got %d", len(chunks))
+	}
+	var rejoined strings.Builder
+	for _, c := range chunks {
+		if utf8.RuneCountInString(c) > telegramMaxMessageRunes {
+			t.Fatalf("chunk exceeds telegramMaxMessageRunes: %d runes", utf8.RuneCountInString(c))
+		}
+		rejoined.WriteString(c)
+	}
+	if !strings.Contains(rejoined.String(), strings.TrimSpace(long)[:100]) {
+		t.Fatalf("rejoined chunks lost content from the start of the original text")
+	}
+}
+
+func TestParseTelegramIDList(t *testing.T) {
+	ids, warnings := parseTelegramIDList("123, -100456, not-a-number, 789")
+	if len(warnings) != 1 {
+		t.Fatalf("expected exactly 1 warning for the bad entry, got %d: %v", len(warnings), warnings)
+	}
+	for _, want := range []int64{123, -100456, 789} {
+		if !ids[want] {
+			t.Fatalf("expected id %d to be parsed, got %v", want, ids)
+		}
+	}
+	if len(ids) != 3 {
+		t.Fatalf("expected exactly 3 parsed ids, got %d: %v", len(ids), ids)
+	}
+}
+
+func TestTelegramAccessConfigAllowed(t *testing.T) {
+	cfg := telegramAccessConfig{
+		Users:  map[int64]bool{111: true},
+		Groups: map[int64]bool{-222: true},
+	}
+	if !cfg.allowed(tgChat{ID: 111, Type: "private"}, tgUser{ID: 111}) {
+		t.Fatal("expected allow-listed private user to be allowed")
+	}
+	if cfg.allowed(tgChat{ID: 999, Type: "private"}, tgUser{ID: 999}) {
+		t.Fatal("expected non-allow-listed private user to be denied")
+	}
+	if !cfg.allowed(tgChat{ID: -222, Type: "supergroup"}, tgUser{ID: 111}) {
+		t.Fatal("expected allow-listed group chat to be allowed regardless of sender")
+	}
+	if cfg.allowed(tgChat{ID: -333, Type: "group"}, tgUser{ID: 111}) {
+		t.Fatal("expected non-allow-listed group chat to be denied even for an allow-listed user")
+	}
+}
+
+func TestTelegramMessageAddressesBotAndStripBotMention(t *testing.T) {
+	cases := []struct {
+		name    string
+		msg     *tgMessage
+		addr    bool
+		stripTo string
+	}{
+		{"mention", &tgMessage{Text: "@olabot สรุปให้หน่อย"}, true, "สรุปให้หน่อย"},
+		{"ola-prefix", &tgMessage{Text: "/ola สรุปให้หน่อย"}, true, "สรุปให้หน่อย"},
+		{"ask-prefix", &tgMessage{Text: "/ask hello"}, true, "hello"},
+		{"reply-to-bot", &tgMessage{Text: "อันนี้ล่ะ", ReplyToMessage: &tgMessage{From: tgUser{Username: "olabot"}}}, true, "อันนี้ล่ะ"},
+		{"unaddressed", &tgMessage{Text: "คุยกันเฉยๆ ไม่เกี่ยวกับบอท"}, false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := telegramMessageAddressesBot(tc.msg, "olabot")
+			if got != tc.addr {
+				t.Fatalf("telegramMessageAddressesBot: got %v, want %v", got, tc.addr)
+			}
+			if tc.addr {
+				stripped := stripBotMention(tc.msg.Text, "olabot")
+				if stripped != tc.stripTo {
+					t.Fatalf("stripBotMention: got %q, want %q", stripped, tc.stripTo)
+				}
+			}
+		})
+	}
+}
+
+func TestKnowledgeConfigSearchAndRead(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "lecture1.md"), []byte("Network Security บทที่ 1\nfirewall คือ..."), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "lecture2.md"), []byte("Network Security บทที่ 2"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, warnings := resolveKnowledgeConfig(dir)
+	if len(warnings) != 0 {
+		t.Fatalf("unexpected warnings: %v", warnings)
+	}
+	if !cfg.enabled() {
+		t.Fatal("expected knowledge config to be enabled")
+	}
+
+	result, err := toolSearchKnowledge(map[string]interface{}{"pattern": "*.md"}, cfg)
+	if err != nil {
+		t.Fatalf("toolSearchKnowledge error: %v", err)
+	}
+	if !strings.Contains(result, "lecture1.md") || !strings.Contains(result, "lecture2.md") {
+		t.Fatalf("expected both files listed, got: %s", result)
+	}
+
+	grep, err := toolSearchKnowledge(map[string]interface{}{"pattern": "*.md", "query": "firewall"}, cfg)
+	if err != nil {
+		t.Fatalf("toolSearchKnowledge (grep) error: %v", err)
+	}
+	if !strings.Contains(grep, "lecture1.md") || strings.Contains(grep, "lecture2.md") {
+		t.Fatalf("expected only lecture1.md's matching line, got: %s", grep)
+	}
+
+	// path returned by search_knowledge is "<label>/lecture1.md" - read_knowledge must accept exactly that shape.
+	label := cfg.Labels[0]
+	content, err := toolReadKnowledge(map[string]interface{}{"path": label + "/lecture1.md"}, cfg)
+	if err != nil {
+		t.Fatalf("toolReadKnowledge error: %v", err)
+	}
+	if !strings.Contains(content, "firewall") {
+		t.Fatalf("expected full file content, got: %s", content)
+	}
+
+	// Path traversal / escaping the configured root must be rejected -
+	// same sandboxedPathIn guard read_file/scp_copy rely on.
+	if _, err := toolReadKnowledge(map[string]interface{}{"path": label + "/../../etc/passwd"}, cfg); err == nil {
+		t.Fatal("expected path traversal outside the knowledge root to be rejected")
+	}
+	if _, err := toolReadKnowledge(map[string]interface{}{"path": "unknown-label/lecture1.md"}, cfg); err == nil {
+		t.Fatal("expected an unknown label to be rejected")
+	}
+}
+
+func TestChatContextSaveLoadRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	chat := tgChat{ID: 555, Type: "private"}
+	c, err := loadChatContext(dir, chat)
+	if err != nil {
+		t.Fatalf("loadChatContext on a not-yet-existing file should not error, got: %v", err)
+	}
+	if len(c.Turns) != 0 {
+		t.Fatalf("expected a fresh context to have no turns, got %d", len(c.Turns))
+	}
+
+	c.Turns = append(c.Turns, chatTurn{Role: "user", Content: "สวัสดี", Time: time.Now()})
+	c.Summary = "ผู้ใช้ทักทาย"
+	if err := c.save(dir); err != nil {
+		t.Fatalf("save error: %v", err)
+	}
+	if _, err := os.Stat(chatContextPath(dir, chat) + ".tmp"); !os.IsNotExist(err) {
+		t.Fatal("expected the .tmp file to be gone after an atomic rename")
+	}
+
+	reloaded, err := loadChatContext(dir, chat)
+	if err != nil {
+		t.Fatalf("reload error: %v", err)
+	}
+	if reloaded.Summary != "ผู้ใช้ทักทาย" || len(reloaded.Turns) != 1 || reloaded.Turns[0].Content != "สวัสดี" {
+		t.Fatalf("round-trip mismatch: %#v", reloaded)
+	}
+}
+
+func TestShouldCompactChatContext(t *testing.T) {
+	c := &chatContext{}
+	for i := 0; i < 5; i++ {
+		c.Turns = append(c.Turns, chatTurn{Role: "user", Content: "x"})
+	}
+	if shouldCompactChatContext(c, 10) {
+		t.Fatal("5 turns should not trigger compaction at threshold 10")
+	}
+	if !shouldCompactChatContext(c, 4) {
+		t.Fatal("5 turns should trigger compaction at threshold 4")
+	}
+	if shouldCompactChatContext(c, 0) {
+		t.Fatal("threshold 0 (disabled) should never trigger compaction")
+	}
+}
+
+// TestDispatchTelegramToolCallRejectsFilesystemTools is the key security
+// regression test for this section: a model call naming "write_file" -
+// never offered in telegrambot's own tool schema, but still recognized by
+// dispatchToolCall's shared base switch (see that function; it dispatches
+// the base eight tools by name unconditionally) - must NOT actually touch
+// the filesystem when it reaches dispatchTelegramToolCall instead. This
+// is exactly the gap dispatchTelegramToolCall exists to close - see its
+// doc comment.
+func TestDispatchTelegramToolCallRejectsFilesystemTools(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	outFile, err := os.CreateTemp(dir, "log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+
+	for _, name := range []string{"write_file", "edit_file", "create_folder", "read_file", "search_files", "ask_user", "run_command"} {
+		argsJSON, _ := json.Marshal(map[string]interface{}{
+			"path": "pwned.txt", "content": "pwned", "command": "echo pwned",
+		})
+		tc := toolCall{Function: toolCallFunction{Name: name, Arguments: argsJSON}}
+		result := dispatchTelegramToolCall(tc, outFile, nil)
+		if !strings.HasPrefix(result, "ERROR:") {
+			t.Fatalf("expected %s to be rejected, got: %s", name, result)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "pwned.txt")); !os.IsNotExist(err) {
+		t.Fatal("SECURITY REGRESSION: dispatchTelegramToolCall allowed write_file to actually create a file")
+	}
+}
+
+// newTestTelegramSession builds a telegramSession wired to mock Telegram
+// (telegramSrv) and Ollama (ollamaSrv) httptest servers, for driving
+// handleTelegramMessage directly (see this section's own header comment
+// for why the full cmdTelegramBot polling loop is not exercised here).
+func newTestTelegramSession(t *testing.T, telegramSrv, ollamaSrv *httptest.Server, contextDir string, users map[int64]bool) *telegramSession {
+	t.Helper()
+	logFile, err := os.CreateTemp(t.TempDir(), "telegrambot-test-log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { logFile.Close() })
+	return &telegramSession{
+		client:       ollamaSrv.Client(),
+		apiBase:      telegramSrv.URL,
+		token:        "test-token",
+		botUsername:  "olabot",
+		access:       telegramAccessConfig{Users: users, Groups: map[int64]bool{}},
+		systemPrompt: builtinTelegramSystemPromptIntro + "\n\n" + builtinTelegramSystemPromptRules,
+		tools:        filterTools(builtinTools, "get_current_time", "delay"),
+		pcfg:         providerConfig{Provider: providerOllama, Host: ollamaSrv.URL, Model: "mock-model"},
+		ctxSize:      4096,
+		contextDir:   contextDir,
+		keepRecent:   defaultTelegramKeepRecentTurns,
+		compactAfter: defaultTelegramCompactAfterTurns,
+		outFile:      logFile,
+		sem:          make(chan struct{}, 4),
+		chatLocks:    map[int64]*sync.Mutex{},
+	}
+}
+
+// newMockTelegramSendMessageServer returns an httptest.Server that only
+// implements sendMessage (all handleTelegramMessage needs on the Telegram
+// side) and records every chat_id/text pair it receives.
+func newMockTelegramSendMessageServer(t *testing.T) (*httptest.Server, *[]struct {
+	ChatID int64
+	Text   string
+}) {
+	t.Helper()
+	var sent []struct {
+		ChatID int64
+		Text   string
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/bottest-token/sendMessage", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ChatID int64  `json:"chat_id"`
+			Text   string `json:"text"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		sent = append(sent, struct {
+			ChatID int64
+			Text   string
+		}{body.ChatID, body.Text})
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":true}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, &sent
+}
+
+func TestHandleTelegramMessageAllowedUserGetsAnswer(t *testing.T) {
+	telegramSrv, sent := newMockTelegramSendMessageServer(t)
+
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("สวัสดีครับ ยินดีช่วยเหลือ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	contextDir := t.TempDir()
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, contextDir, map[int64]bool{111: true})
+
+	msg := &tgMessage{
+		MessageID: 1,
+		From:      tgUser{ID: 111, Username: "moo"},
+		Chat:      tgChat{ID: 111, Type: "private"},
+		Text:      "สวัสดี",
+	}
+	session.handleTelegramMessage(msg)
+
+	if len(*sent) != 1 {
+		t.Fatalf("expected exactly 1 sendMessage call, got %d", len(*sent))
+	}
+	if (*sent)[0].ChatID != 111 || (*sent)[0].Text != "สวัสดีครับ ยินดีช่วยเหลือ" {
+		t.Fatalf("unexpected reply: %#v", (*sent)[0])
+	}
+
+	cctx, err := loadChatContext(contextDir, tgChat{ID: 111, Type: "private"})
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	if len(cctx.Turns) != 2 || cctx.Turns[0].Role != "user" || cctx.Turns[1].Role != "assistant" {
+		t.Fatalf("expected 1 user + 1 assistant turn persisted, got: %#v", cctx.Turns)
+	}
+}
+
+func TestHandleTelegramMessageDeniedUserGetsNoAnswerFromModel(t *testing.T) {
+	telegramSrv, sent := newMockTelegramSendMessageServer(t)
+
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&ollamaCalls, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("ไม่ควรถูกเรียก", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	contextDir := t.TempDir()
+	// 111 is NOT in the allowlist (empty map).
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, contextDir, map[int64]bool{})
+
+	msg := &tgMessage{
+		From: tgUser{ID: 111, Username: "moo"},
+		Chat: tgChat{ID: 111, Type: "private"},
+		Text: "สวัสดี",
+	}
+	session.handleTelegramMessage(msg)
+
+	if atomic.LoadInt32(&ollamaCalls) != 0 {
+		t.Fatal("expected a denied user's message to never reach the model")
+	}
+	if len(*sent) != 1 || !strings.Contains((*sent)[0].Text, "ยังไม่ได้รับอนุญาต") {
+		t.Fatalf("expected a single access-denied reply, got: %#v", *sent)
+	}
+	if _, err := os.Stat(chatContextPath(contextDir, tgChat{ID: 111, Type: "private"})); !os.IsNotExist(err) {
+		t.Fatal("expected no context file to be created for a denied user")
+	}
+}
+
+func TestHandleTelegramMessageGroupIgnoresUnaddressedMessages(t *testing.T) {
+	telegramSrv, sent := newMockTelegramSendMessageServer(t)
+
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&ollamaCalls, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("ไม่ควรถูกเรียก", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	contextDir := t.TempDir()
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, contextDir, map[int64]bool{})
+	session.access.Groups = map[int64]bool{-999: true}
+
+	msg := &tgMessage{
+		From: tgUser{ID: 111, Username: "moo"},
+		Chat: tgChat{ID: -999, Type: "group", Title: "ห้องเรียน"},
+		Text: "คุยกันเฉยๆ ไม่เกี่ยวกับบอท",
+	}
+	session.handleTelegramMessage(msg)
+
+	if atomic.LoadInt32(&ollamaCalls) != 0 {
+		t.Fatal("expected an unaddressed group message to never reach the model")
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("expected no reply to an unaddressed group message, got: %#v", *sent)
+	}
+}
+
+func TestHandleTelegramMessageUsesSearchKnowledgeTool(t *testing.T) {
+	telegramSrv, sent := newMockTelegramSendMessageServer(t)
+
+	knowledgeDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(knowledgeDir, "syllabus.md"), []byte("วิชา Network Security สอนทุกวันจันทร์"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	knowledgeCfg, warnings := resolveKnowledgeConfig(knowledgeDir)
+	if len(warnings) != 0 {
+		t.Fatalf("unexpected warnings: %v", warnings)
+	}
+
+	var round int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&round, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		switch n {
+		case 1:
+			fmt.Fprint(w, streamLine("", "search_knowledge", `{"pattern":"*.md"}`, true))
+		case 2:
+			fmt.Fprint(w, streamLine("วิชานี้สอนทุกวันจันทร์ครับ (จาก syllabus.md)", "", "", true))
+		}
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	contextDir := t.TempDir()
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, contextDir, map[int64]bool{111: true})
+	session.knowledgeCfg = knowledgeCfg
+	session.tools = append(session.tools, searchKnowledgeTool, readKnowledgeTool)
+
+	msg := &tgMessage{
+		From: tgUser{ID: 111},
+		Chat: tgChat{ID: 111, Type: "private"},
+		Text: "วิชา Network Security สอนวันไหน",
+	}
+	session.handleTelegramMessage(msg)
+
+	if atomic.LoadInt32(&round) != 2 {
+		t.Fatalf("expected the model to call search_knowledge then answer (2 rounds), got %d round(s)", round)
+	}
+	if len(*sent) != 1 || !strings.Contains((*sent)[0].Text, "วันจันทร์") {
+		t.Fatalf("expected the final answer to reach the chat, got: %#v", *sent)
+	}
+}
+
+func TestRunTelegramToolLoopRetriesOnceOnEmptyCompletion(t *testing.T) {
+	var round int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&round, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if n == 1 {
+			fmt.Fprint(w, streamLine("", "", "", true)) // simulates a model that returned nothing at all
+			return
+		}
+		fmt.Fprint(w, streamLine("คำตอบจริงหลัง retry", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	telegramSrv, _ := newMockTelegramSendMessageServer(t)
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, t.TempDir(), map[int64]bool{1: true})
+
+	answer, err := session.runTelegramToolLoop([]ollamaMessage{
+		{Role: "system", Content: builtinTelegramSystemPromptIntro + "\n\n" + builtinTelegramSystemPromptRules},
+		{Role: "user", Content: "hi"},
+	})
+	if err != nil {
+		t.Fatalf("expected the retry to eventually succeed, got error: %v", err)
+	}
+	if answer != "คำตอบจริงหลัง retry" {
+		t.Fatalf("unexpected answer: %q", answer)
+	}
+	if atomic.LoadInt32(&round) != 2 {
+		t.Fatalf("expected exactly 2 rounds (1 empty + 1 retry), got %d", round)
+	}
+}
+
+func TestRunTelegramToolLoopFailsAfterRepeatedEmptyCompletions(t *testing.T) {
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("", "", "", true)) // always empty
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	telegramSrv, _ := newMockTelegramSendMessageServer(t)
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, t.TempDir(), map[int64]bool{1: true})
+
+	_, err := session.runTelegramToolLoop([]ollamaMessage{
+		{Role: "system", Content: builtinTelegramSystemPromptIntro + "\n\n" + builtinTelegramSystemPromptRules},
+		{Role: "user", Content: "hi"},
+	})
+	if err == nil {
+		t.Fatal("expected an error after repeated empty completions, got nil")
+	}
+}
+
+// TestHandleTelegramMessageEmptyCompletionDoesNotPersistBlankTurn is the
+// end-to-end regression test for the bug this was written to fix: a chat
+// where the model's very first reply comes back empty must NOT end up
+// with a blank "" assistant turn silently saved to that chat's context
+// file - the user gets a clear error message instead, and nothing is
+// persisted for that exchange.
+func TestHandleTelegramMessageEmptyCompletionDoesNotPersistBlankTurn(t *testing.T) {
+	telegramSrv, sent := newMockTelegramSendMessageServer(t)
+
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("", "", "", true)) // always empty, exhausts the retry
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	contextDir := t.TempDir()
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, contextDir, map[int64]bool{111: true})
+
+	msg := &tgMessage{
+		From: tgUser{ID: 111},
+		Chat: tgChat{ID: 111, Type: "private"},
+		Text: "Hi",
+	}
+	session.handleTelegramMessage(msg)
+
+	if len(*sent) != 1 || strings.TrimSpace((*sent)[0].Text) == "" {
+		t.Fatalf("expected a single non-empty error reply, got: %#v", *sent)
+	}
+	cctx, err := loadChatContext(contextDir, tgChat{ID: 111, Type: "private"})
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	if len(cctx.Turns) != 0 {
+		t.Fatalf("expected no turns persisted after a failed (empty-completion) exchange, got %#v", cctx.Turns)
+	}
+}
+
+func TestHandleTelegramMessageToolsCommand(t *testing.T) {
+	telegramSrv, sent := newMockTelegramSendMessageServer(t)
+
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&ollamaCalls, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("ไม่ควรถูกเรียก", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, t.TempDir(), map[int64]bool{111: true})
+
+	msg := &tgMessage{From: tgUser{ID: 111}, Chat: tgChat{ID: 111, Type: "private"}, Text: "/tools"}
+	session.handleTelegramMessage(msg)
+
+	if atomic.LoadInt32(&ollamaCalls) != 0 {
+		t.Fatal("expected /tools to never reach the model")
+	}
+	if len(*sent) != 1 || !strings.Contains((*sent)[0].Text, "search_knowledge") {
+		t.Fatalf("expected a /tools status reply mentioning search_knowledge, got: %#v", *sent)
+	}
+}
+
+// TestBuildTelegramSystemPromptPersonaOrderingAndIdentityRule is a
+// structural regression test for the "asked its name, answered generic
+// 'I'm a bot' instead of the persona's name" bug report: it can't verify
+// an LLM will actually comply (that's inherently model-dependent), but it
+// does pin down the two things that ARE fully within ola's control -
+// persona appears BEFORE the rule bullets (not appended after
+// everything, competing with a wall of rules for the model's attention),
+// and the explicit "your name is whatever PERSONA says, never answer
+// generically" rule is present whenever a persona is set.
+func TestBuildTelegramSystemPromptPersonaOrderingAndIdentityRule(t *testing.T) {
+	prompt := buildTelegramSystemPrompt("คุณชื่อ JonnyQ ร่าเริงและรักการผจญภัย")
+
+	introIdx := strings.Index(prompt, builtinTelegramSystemPromptIntro)
+	personaIdx := strings.Index(prompt, "JonnyQ")
+	rulesIdx := strings.Index(prompt, "กติกาพื้นฐานที่ต้องทำตามเสมอ")
+	if introIdx == -1 || personaIdx == -1 || rulesIdx == -1 {
+		t.Fatalf("expected intro, persona, and rules all present in the prompt")
+	}
+	if !(introIdx < personaIdx && personaIdx < rulesIdx) {
+		t.Fatalf("expected order intro < persona < rules, got indices %d, %d, %d", introIdx, personaIdx, rulesIdx)
+	}
+	if !strings.Contains(prompt, "ฉันชื่อบอท") {
+		t.Fatal("expected the explicit anti-generic-answer example to be present in the rules")
+	}
+
+	// No persona configured: the prompt must still be well-formed (no
+	// dangling "PERSONA" header with nothing under it).
+	noPersonaPrompt := buildTelegramSystemPrompt("")
+	if strings.Contains(noPersonaPrompt, "PERSONA (กำหนดโดยผู้ดูแล") {
+		t.Fatal("expected no PERSONA section when no persona is configured")
+	}
+}

@@ -201,6 +201,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -208,6 +209,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 )
@@ -461,6 +463,8 @@ func main() {
 		os.Exit(cmdAsk(os.Args[2:]))
 	case "coding":
 		os.Exit(cmdCoding(os.Args[2:]))
+	case "telegrambot":
+		os.Exit(cmdTelegramBot(os.Args[2:]))
 	case "-h", "--help", "help":
 		printTopUsage()
 		os.Exit(0)
@@ -484,7 +488,12 @@ func printTopUsage() {
 	fmt.Println("          current directory until the project's own build/test command")
 	fmt.Println("          actually passes, or a round/time cap is hit.")
 	fmt.Println()
-	fmt.Println("Run 'ola ask -h' or 'ola coding -h' for command-specific help.")
+	fmt.Println("  telegrambot  Run ola as a long-lived Telegram bot (long polling, no")
+	fmt.Println("          webhook needed). Answers allow-listed users/groups only, with a")
+	fmt.Println("          much smaller read-only toolset than ask/coding (no filesystem/")
+	fmt.Println("          shell access) plus persistent, auto-compacted per-chat context.")
+	fmt.Println()
+	fmt.Println("Run 'ola ask -h', 'ola coding -h', or 'ola telegrambot -h' for command-specific help.")
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -8715,4 +8724,1480 @@ func marshalDryRunPayload(provider llmProvider, req ollamaRequest) ([]byte, erro
 		return json.Marshal(toOpenAIRequest(req))
 	}
 	return json.Marshal(req)
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Section: telegrambot (originally telegram.go)
+//
+// "ola telegrambot" runs ola as a long-lived Telegram bot: it long-polls
+// Telegram's getUpdates endpoint (no external Go dependency - talks to the
+// Bot API with net/http the same way integrations.go talks to SearXNG/
+// Ollama's Web Search API), and for every incoming message from an
+// allow-listed user (in a private chat) or an allow-listed group answers
+// using the same tool-calling loop primitives (doChatRound) "ask"/"coding"
+// already use.
+//
+// This is a DIFFERENT TRUST MODEL than "ask"/"coding": those subcommands
+// run in the operator's own terminal, so the person driving the model IS
+// the person who decided what tools it gets. telegrambot answers messages
+// from other people over the network. Its base tool list is therefore
+// deliberately much smaller than "ask"'s - no read_file/write_file/
+// edit_file/create_folder/run_command/scp_copy/api_request/ask_user - only
+// read-only lookups: search_knowledge/read_knowledge (a configured,
+// read-only document folder set - never the bot process's own cwd) and,
+// if configured, web_search/web_fetch. See dispatchTelegramToolCall's own
+// doc comment for why this subcommand does NOT reuse dispatchToolCall.
+// ─────────────────────────────────────────────────────────────────
+
+const defaultTelegramAPIBase = "https://api.telegram.org"
+const defaultTelegramPollTimeoutSec = 30
+const defaultTelegramContextDir = "telegram-context"
+const defaultTelegramKeepRecentTurns = 20
+const defaultTelegramCompactAfterTurns = 40
+const defaultTelegramMaxConcurrent = 4
+
+// telegramMaxMessageRunes stays a little under Telegram's hard 4096-UTF-16-
+// unit sendMessage cap (see splitTelegramMessage) - counting runes rather
+// than UTF-16 units is a conservative-enough approximation (every rune
+// ola's own Thai/English output produces is at most one UTF-16 unit;
+// only astral-plane code points - not used in ola's own text - would need
+// two) that keeps this simple without pulling in a UTF-16-aware counter.
+const telegramMaxMessageRunes = 3900
+
+// ─────────────────────────────────────────────────────────────────
+// Telegram Bot API client (plain net/http - no external dependency)
+// ─────────────────────────────────────────────────────────────────
+
+type tgUser struct {
+	ID        int64  `json:"id"`
+	IsBot     bool   `json:"is_bot"`
+	FirstName string `json:"first_name"`
+	Username  string `json:"username,omitempty"`
+}
+
+type tgChat struct {
+	ID       int64  `json:"id"`
+	Type     string `json:"type"` // "private", "group", "supergroup", "channel"
+	Title    string `json:"title,omitempty"`
+	Username string `json:"username,omitempty"`
+}
+
+type tgMessage struct {
+	MessageID      int64      `json:"message_id"`
+	From           tgUser     `json:"from"`
+	Chat           tgChat     `json:"chat"`
+	Text           string     `json:"text"`
+	Date           int64      `json:"date"`
+	ReplyToMessage *tgMessage `json:"reply_to_message,omitempty"`
+}
+
+type tgUpdate struct {
+	UpdateID int64      `json:"update_id"`
+	Message  *tgMessage `json:"message"`
+}
+
+type tgGetUpdatesResponse struct {
+	OK          bool       `json:"ok"`
+	Result      []tgUpdate `json:"result"`
+	Description string     `json:"description,omitempty"`
+}
+
+type tgSendMessageResponse struct {
+	OK          bool   `json:"ok"`
+	Description string `json:"description,omitempty"`
+}
+
+type tgGetMeResponse struct {
+	OK          bool   `json:"ok"`
+	Result      tgUser `json:"result"`
+	Description string `json:"description,omitempty"`
+}
+
+func tgAPIURL(apiBase, token, method string) string {
+	return strings.TrimRight(apiBase, "/") + "/bot" + token + "/" + method
+}
+
+// tgGetMe resolves the bot's own username once at startup, so group-chat
+// messages can be checked for an "@botname" mention (see
+// telegramMessageAddressesBot).
+func tgGetMe(client *http.Client, apiBase, token string) (tgUser, error) {
+	resp, err := client.Get(tgAPIURL(apiBase, token, "getMe"))
+	if err != nil {
+		return tgUser{}, err
+	}
+	defer resp.Body.Close()
+	var out tgGetMeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return tgUser{}, fmt.Errorf("decode getMe response: %v", err)
+	}
+	if !out.OK {
+		return tgUser{}, fmt.Errorf("getMe ล้มเหลว: %s", out.Description)
+	}
+	return out.Result, nil
+}
+
+// tgGetUpdates long-polls for new messages. The HTTP client passed in must
+// have a Timeout comfortably longer than timeoutSec (see cmdTelegramBot)
+// or every long poll would be killed by the client itself before Telegram
+// had a chance to answer.
+func tgGetUpdates(client *http.Client, apiBase, token string, offset int64, timeoutSec int) ([]tgUpdate, error) {
+	q := url.Values{}
+	q.Set("timeout", strconv.Itoa(timeoutSec))
+	q.Set("allowed_updates", `["message"]`)
+	if offset > 0 {
+		q.Set("offset", strconv.FormatInt(offset, 10))
+	}
+	resp, err := client.Get(tgAPIURL(apiBase, token, "getUpdates") + "?" + q.Encode())
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var out tgGetUpdatesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode getUpdates response: %v", err)
+	}
+	if !out.OK {
+		return nil, fmt.Errorf("getUpdates ล้มเหลว: %s", out.Description)
+	}
+	return out.Result, nil
+}
+
+// tgSendMessage sends text back to chatID, splitting it across multiple
+// sendMessage calls if it exceeds Telegram's per-message length limit (see
+// splitTelegramMessage). Stops at the first chunk that fails to send.
+func tgSendMessage(client *http.Client, apiBase, token string, chatID int64, text string) error {
+	for _, chunk := range splitTelegramMessage(text) {
+		payload, err := json.Marshal(map[string]interface{}{
+			"chat_id": chatID,
+			"text":    chunk,
+		})
+		if err != nil {
+			return fmt.Errorf("marshal sendMessage payload ไม่ได้: %v", err)
+		}
+		httpReq, err := http.NewRequest(http.MethodPost, tgAPIURL(apiBase, token, "sendMessage"), bytes.NewReader(payload))
+		if err != nil {
+			return err
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			return err
+		}
+		var out tgSendMessageResponse
+		decErr := json.NewDecoder(resp.Body).Decode(&out)
+		resp.Body.Close()
+		if decErr != nil {
+			return fmt.Errorf("decode sendMessage response: %v", decErr)
+		}
+		if !out.OK {
+			return fmt.Errorf("sendMessage ล้มเหลว: %s", out.Description)
+		}
+	}
+	return nil
+}
+
+// splitTelegramMessage breaks text into chunks no longer than
+// telegramMaxMessageRunes, preferring to cut at the last newline within
+// the window (so a chunk doesn't split mid-paragraph when a nearby break
+// is available) rather than always cutting at the hard limit.
+func splitTelegramMessage(text string) []string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		text = "(ไม่มีคำตอบ)"
+	}
+	runes := []rune(text)
+	if len(runes) <= telegramMaxMessageRunes {
+		return []string{text}
+	}
+	var chunks []string
+	for len(runes) > 0 {
+		n := telegramMaxMessageRunes
+		if n > len(runes) {
+			n = len(runes)
+		}
+		cut := n
+		if n == telegramMaxMessageRunes {
+			for i := n - 1; i > n/2; i-- {
+				if runes[i] == '\n' {
+					cut = i + 1
+					break
+				}
+			}
+		}
+		chunk := strings.TrimSpace(string(runes[:cut]))
+		if chunk != "" {
+			chunks = append(chunks, chunk)
+		}
+		runes = runes[cut:]
+	}
+	if len(chunks) == 0 {
+		chunks = []string{"(ไม่มีคำตอบ)"}
+	}
+	return chunks
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Access control: allow-listed users (private chats) / groups
+// ─────────────────────────────────────────────────────────────────
+
+type telegramAccessConfig struct {
+	Users  map[int64]bool
+	Groups map[int64]bool
+}
+
+func (c telegramAccessConfig) allowed(chat tgChat, from tgUser) bool {
+	if chat.Type == "private" {
+		return c.Users[from.ID]
+	}
+	return c.Groups[chat.ID]
+}
+
+func (c telegramAccessConfig) empty() bool {
+	return len(c.Users) == 0 && len(c.Groups) == 0
+}
+
+// parseTelegramIDList parses a comma-separated list of numeric Telegram
+// IDs (user IDs are always positive; group/supergroup chat IDs are
+// negative - both parse fine as int64). Usernames are deliberately not
+// accepted here: a Telegram @username can be changed by its owner at any
+// time, so an allowlist keyed on it could silently start matching a
+// different person later - the numeric id is the only stable identifier
+// Telegram guarantees. A bad entry is a warning (skipped), not fatal, same
+// shape as resolveSCPConfig/resolveAPIRequestConfig's own per-entry
+// warnings.
+func parseTelegramIDList(raw string) (map[int64]bool, []string) {
+	ids := map[int64]bool{}
+	var warnings []string
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(part, 10, 64)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("ไม่สามารถแปลง %q เป็น Telegram ID ที่เป็นตัวเลขได้ - ข้าม", part))
+			continue
+		}
+		ids[id] = true
+	}
+	return ids, warnings
+}
+
+func resolveTelegramAccessConfig(usersFlag, groupsFlag string) (telegramAccessConfig, []string) {
+	usersRaw := usersFlag
+	if usersRaw == "" {
+		usersRaw = os.Getenv("OLA_TELEGRAM_ALLOWED_USERS")
+	}
+	groupsRaw := groupsFlag
+	if groupsRaw == "" {
+		groupsRaw = os.Getenv("OLA_TELEGRAM_ALLOWED_GROUPS")
+	}
+	users, uw := parseTelegramIDList(usersRaw)
+	groups, gw := parseTelegramIDList(groupsRaw)
+	return telegramAccessConfig{Users: users, Groups: groups}, append(uw, gw...)
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Group-chat addressing: don't answer every message in a group, only ones
+// clearly directed at the bot (mention, reply to the bot's own message, or
+// an explicit /ola or /ask prefix) - a group is a shared space with other
+// humans talking to each other, not a 1:1 session the way a private chat
+// is.
+// ─────────────────────────────────────────────────────────────────
+
+func telegramMessageAddressesBot(msg *tgMessage, botUsername string) bool {
+	trimmed := strings.TrimSpace(msg.Text)
+	if strings.HasPrefix(trimmed, "/ola") || strings.HasPrefix(trimmed, "/ask") {
+		return true
+	}
+	if botUsername != "" && strings.Contains(msg.Text, "@"+botUsername) {
+		return true
+	}
+	if msg.ReplyToMessage != nil && botUsername != "" && msg.ReplyToMessage.From.Username == botUsername {
+		return true
+	}
+	return false
+}
+
+func stripBotMention(text, botUsername string) string {
+	if botUsername != "" {
+		text = strings.ReplaceAll(text, "@"+botUsername, "")
+	}
+	trimmed := strings.TrimSpace(text)
+	trimmed = strings.TrimPrefix(trimmed, "/ola")
+	trimmed = strings.TrimPrefix(trimmed, "/ask")
+	return strings.TrimSpace(trimmed)
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Knowledge base: read-only document search over operator-configured
+// folders (--knowledge-dir/OLA_TELEGRAM_KNOWLEDGE_DIR) - deliberately
+// separate from read_file/search_files (sandboxed to the bot process's
+// own current directory, which has nothing to do with what a Telegram
+// user should be able to read) and with no write_knowledge/edit_knowledge
+// counterpart at all: the knowledge base is meant to be curated from
+// outside the bot, never mutated through it.
+// ─────────────────────────────────────────────────────────────────
+
+const knowledgeSearchLimit = 200
+
+// knowledgeConfig resolves each configured directory to an absolute path
+// and a short, stable "label" (used as the first path segment the model
+// sees and must echo back to read_knowledge) instead of ever exposing the
+// bot host's real absolute filesystem paths in tool results that might
+// end up quoted back into a Telegram chat. The label is the directory's
+// own base name, disambiguated with a numeric suffix if two configured
+// directories happen to share one.
+type knowledgeConfig struct {
+	Roots  map[string]string // label -> absolute directory
+	Labels []string          // labels, in --knowledge-dir order
+}
+
+func (c knowledgeConfig) enabled() bool { return len(c.Roots) > 0 }
+
+func resolveKnowledgeDirs(flagVal string) []string {
+	raw := flagVal
+	if raw == "" {
+		raw = os.Getenv("OLA_TELEGRAM_KNOWLEDGE_DIR")
+	}
+	if raw == "" {
+		return nil
+	}
+	var dirs []string
+	for _, d := range strings.Split(raw, ",") {
+		d = strings.TrimSpace(d)
+		if d != "" {
+			dirs = append(dirs, d)
+		}
+	}
+	return dirs
+}
+
+func knowledgeDirLabel(dirs []string, idx int) string {
+	base := filepath.Base(filepath.Clean(dirs[idx]))
+	if base == "." || base == string(os.PathSeparator) || base == "" {
+		base = fmt.Sprintf("kb%d", idx)
+	}
+	dup := 0
+	for i := 0; i < idx; i++ {
+		if filepath.Base(filepath.Clean(dirs[i])) == base {
+			dup++
+		}
+	}
+	if dup > 0 {
+		return fmt.Sprintf("%s~%d", base, dup)
+	}
+	return base
+}
+
+func resolveKnowledgeConfig(flagVal string) (knowledgeConfig, []string) {
+	dirs := resolveKnowledgeDirs(flagVal)
+	cfg := knowledgeConfig{Roots: map[string]string{}}
+	var warnings []string
+	for i, d := range dirs {
+		abs, err := filepath.Abs(d)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("knowledge-dir %s: หา absolute path ไม่ได้ (%v) - ข้าม", d, err))
+			continue
+		}
+		if info, err := os.Stat(abs); err != nil || !info.IsDir() {
+			warnings = append(warnings, fmt.Sprintf("knowledge-dir %s: ไม่ใช่ directory ที่อ่านได้ - ข้าม", d))
+			continue
+		}
+		label := knowledgeDirLabel(dirs, i)
+		cfg.Roots[label] = abs
+		cfg.Labels = append(cfg.Labels, label)
+	}
+	return cfg, warnings
+}
+
+func toolSearchKnowledge(args map[string]interface{}, cfg knowledgeConfig) (string, error) {
+	if !cfg.enabled() {
+		return "", fmt.Errorf("search_knowledge ไม่ได้ถูกตั้งค่าสำหรับเซสชันนี้")
+	}
+	pattern, _ := args["pattern"].(string)
+	if pattern == "" {
+		return "", fmt.Errorf("ต้องระบุ pattern")
+	}
+	query, _ := args["query"].(string)
+
+	var matches []string
+	var grepHits []string
+	limitHit := false
+
+	for _, label := range cfg.Labels {
+		if limitHit {
+			break
+		}
+		root := cfg.Roots[label]
+		walkErr := filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if info.IsDir() {
+				if p != root && skipDirNames[info.Name()] {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			ok, matchErr := filepath.Match(pattern, info.Name())
+			if matchErr != nil {
+				return matchErr
+			}
+			if !ok {
+				return nil
+			}
+			binary := looksBinaryFile(p, info)
+			if binary && !alwaysListExts[strings.ToLower(filepath.Ext(info.Name()))] {
+				return nil
+			}
+			rel, relErr := filepath.Rel(root, p)
+			if relErr != nil {
+				rel = info.Name()
+			}
+			display := label + "/" + filepath.ToSlash(rel)
+			matches = append(matches, display)
+			if query != "" && !binary {
+				data, readErr := os.ReadFile(p)
+				if readErr == nil {
+					for i, line := range strings.Split(string(data), "\n") {
+						if strings.Contains(line, query) {
+							grepHits = append(grepHits, fmt.Sprintf("%s:%d: %s", display, i+1, strings.TrimSpace(line)))
+						}
+					}
+				}
+			}
+			if len(matches) >= knowledgeSearchLimit {
+				limitHit = true
+				return errWalkLimit
+			}
+			return nil
+		})
+		if walkErr != nil && walkErr != errWalkLimit {
+			continue
+		}
+	}
+
+	if len(matches) == 0 {
+		return "ไม่พบไฟล์ที่ตรงกับ pattern ในฐานความรู้", nil
+	}
+	suffix := ""
+	if limitHit {
+		suffix = fmt.Sprintf("\n(หยุดค้นหาที่ %d ไฟล์ ผลลัพธ์อาจไม่ครบ ลอง pattern ที่เจาะจงกว่านี้)", knowledgeSearchLimit)
+	}
+	if query != "" {
+		if len(grepHits) == 0 {
+			return fmt.Sprintf("พบไฟล์ %d ไฟล์ตรงกับ pattern แต่ไม่มีบรรทัดใดตรงกับ query %q%s", len(matches), query, suffix), nil
+		}
+		return strings.Join(grepHits, "\n") + suffix, nil
+	}
+	return strings.Join(matches, "\n") + suffix, nil
+}
+
+func toolReadKnowledge(args map[string]interface{}, cfg knowledgeConfig) (string, error) {
+	if !cfg.enabled() {
+		return "", fmt.Errorf("read_knowledge ไม่ได้ถูกตั้งค่าสำหรับเซสชันนี้")
+	}
+	p, _ := args["path"].(string)
+	if p == "" {
+		return "", fmt.Errorf("ต้องระบุ path")
+	}
+	p = strings.TrimPrefix(p, "/")
+	parts := strings.SplitN(p, "/", 2)
+	if len(parts) < 2 {
+		example := ""
+		if len(cfg.Labels) > 0 {
+			example = cfg.Labels[0] + "/example.md"
+		}
+		return "", fmt.Errorf("path ต้องอยู่ในรูปแบบ \"<label>/<relative-path>\" ตามที่ search_knowledge คืนมา เช่น %q", example)
+	}
+	root, ok := cfg.Roots[parts[0]]
+	if !ok {
+		return "", fmt.Errorf("ไม่รู้จัก label %q - label ที่มีอยู่: %s", parts[0], strings.Join(cfg.Labels, ", "))
+	}
+	full, err := sandboxedPathIn(root, parts[1])
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(full)
+	if err != nil {
+		return "", fmt.Errorf("ไม่พบไฟล์: %s", p)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("%s เป็น directory ไม่ใช่ไฟล์", p)
+	}
+	if strings.ToLower(filepath.Ext(full)) == ".pdf" {
+		return "", fmt.Errorf("%s เป็นไฟล์ PDF - read_knowledge ยังไม่รองรับ PDF ในตอนนี้ (ต่างจาก read_file ที่มี read_pdf ช่วยแปลงเป็นภาพ)", p)
+	}
+	data, err := os.ReadFile(full)
+	if err != nil {
+		return "", fmt.Errorf("อ่านไฟล์ %s ไม่ได้: %v", p, err)
+	}
+	return string(data), nil
+}
+
+var searchKnowledgeTool = ollamaTool{
+	Type: "function",
+	Function: ollamaToolFunction{
+		Name:        "search_knowledge",
+		Description: "ค้นหาเอกสารในฐานความรู้ (read-only, ตั้งค่าไว้ล่วงหน้าโดยผู้ดูแล) ตาม glob pattern ของชื่อไฟล์ (เช่น \"*.md\" หรือ \"*\" เพื่อดูทุกไฟล์) และ query แบบ substring ในเนื้อหาไฟล์ (ถ้าระบุ) ผลลัพธ์คืนเป็น path ที่ต้องใช้กับ read_knowledge ต่อ",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": orderedProps{
+				{"pattern", map[string]interface{}{
+					"type":        "string",
+					"description": "Glob pattern จับคู่กับชื่อไฟล์ เช่น \"*.md\" หรือ \"*\"",
+				}},
+				{"query", map[string]interface{}{
+					"type":        "string",
+					"description": "Optional: substring ที่ต้องการค้นในเนื้อหาไฟล์ - ถ้าระบุจะคืนบรรทัดที่ตรงแทนรายชื่อไฟล์เฉยๆ",
+				}},
+			},
+			"required": []string{"pattern"},
+		},
+	},
+}
+
+var readKnowledgeTool = ollamaTool{
+	Type: "function",
+	Function: ollamaToolFunction{
+		Name:        "read_knowledge",
+		Description: "อ่านเนื้อหาไฟล์เต็มจากฐานความรู้ (read-only) - path ต้องเป็นค่าที่ได้จาก search_knowledge เท่านั้น (รูปแบบ \"<label>/<relative-path>\")",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"path": map[string]interface{}{
+					"type":        "string",
+					"description": "Path ของไฟล์ตามที่ search_knowledge คืนมา เช่น \"docs/lecture1.md\"",
+				},
+			},
+			"required": []string{"path"},
+		},
+	},
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Persona: purely additive, same principle as skills' "AVAILABLE SKILLS"
+// section (see buildSkillsPromptSection) - telegrambot keeps the same
+// "system prompt is fixed/built-in" rule the rest of ola follows (see the
+// package doc comment at the top of this file). --persona/--persona-file
+// can only ever APPEND tone/personality/operator instructions after the
+// fixed safety+tool-usage contract below; it cannot replace or weaken it.
+// ─────────────────────────────────────────────────────────────────
+
+func resolveTelegramPersona(personaFlag, personaFile string) (string, error) {
+	if personaFile == "" {
+		personaFile = os.Getenv("OLA_TELEGRAM_PERSONA_FILE")
+	}
+	if personaFile != "" {
+		data, err := os.ReadFile(personaFile)
+		if err != nil {
+			return "", fmt.Errorf("อ่านไฟล์ --persona-file %s ไม่ได้: %v", personaFile, err)
+		}
+		return strings.TrimSpace(string(data)), nil
+	}
+	persona := personaFlag
+	if persona == "" {
+		persona = os.Getenv("OLA_TELEGRAM_PERSONA")
+	}
+	return strings.TrimSpace(persona), nil
+}
+
+// builtinTelegramSystemPrompt is split into an intro and a rules half
+// (rather than one block) specifically so persona can be inserted BETWEEN
+// them - see cmdTelegramBot's assembly of the final systemPrompt. Putting
+// persona right after the identity-establishing opening line, before the
+// rule bullets, matters in practice: a persona appended only at the very
+// end (after a generic "you are an AI assistant" framing plus a long list
+// of rules) was observed to sometimes lose out to that generic framing -
+// a model asked "what's your name" would answer "I'm a bot" instead of
+// the persona's own name, even though the persona text was present
+// somewhere in the same system prompt the whole time. Naming/personality
+// is presented here as the FIRST thing established, and
+// builtinTelegramSystemPromptRules' own last bullet explicitly calls out
+// this exact failure mode - separate from (but still just as additive/
+// non-overridable-of-the-safety-rules as) the persona mechanism itself;
+// see resolveTelegramPersona and this section's header comment.
+const builtinTelegramSystemPromptIntro = `คุณคือผู้ช่วย AI ที่ตอบคำถามผ่านบอท Telegram`
+
+// builtinTelegramSystemPromptRules is telegrambot's own fixed base prompt
+// - separate from builtinSystemPrompt/builtinCodingSystemPrompt because
+// the tool contract is genuinely different (no filesystem/shell tools at
+// all; read-only knowledge/web lookups only - see this section's header
+// comment) and because replies here are chat messages on a phone screen,
+// not terminal output.
+const builtinTelegramSystemPromptRules = `กติกาพื้นฐานที่ต้องทำตามเสมอ:
+- ตอบเป็นข้อความแชทธรรมดา กระชับ อ่านง่ายบนมือถือ - ไม่ใช่รายงานยาวเป็นหน้าๆ เว้นแต่ผู้ใช้ขอรายละเอียดเจาะจง
+- ทุกคำตอบสุดท้ายต้องมีเนื้อความเสมอ ห้ามตอบข้อความว่างเปล่าเด็ดขาด ถ้าไม่แน่ใจว่าจะตอบอะไร ให้ถามกลับหรือบอกตรงๆ ว่าไม่มีข้อมูลพอ ดีกว่าปล่อยว่าง
+- คุณไม่มีเครื่องมือแก้ไฟล์ รันคำสั่ง หรือเข้าถึงระบบปฏิบัติการใดๆ ทั้งสิ้น เครื่องมือที่อาจมีให้ (ถ้าตั้งค่าไว้ - เช็คได้จาก tool list ที่แนบมากับ request นี้) มีแค่: search_knowledge/read_knowledge (ฐานความรู้ที่ผู้ดูแลกำหนดไว้ล่วงหน้า, read-only), web_search/web_fetch (ค้นอินเทอร์เน็ต, ถ้าเปิดใช้), get_current_time, delay
+- ห้ามอ้างว่าคุณทำสิ่งที่ไม่มีเครื่องมือให้ทำจริง (เช่น "แก้ไฟล์ให้แล้ว", "รันคำสั่งให้แล้ว", "บันทึกลงระบบแล้ว") และห้ามอ้างว่า "ค้นแล้วไม่เจอ" ถ้าไม่ได้เรียก tool จริงๆ
+- ถ้ามี search_knowledge อยู่ใน tool list: คำถามเกี่ยวกับชื่อคน สัตว์เลี้ยง สถานที่ เหตุการณ์ หรือรายละเอียดเฉพาะเจาะจงใดๆ ที่ไม่ใช่ความรู้ทั่วไป ให้เรียก search_knowledge ก่อนเสมอแล้วค่อยตอบ (ลอง pattern "*" ถ้าไม่แน่ใจว่าไฟล์ชื่ออะไร) ห้ามตอบว่า "ไม่รู้จัก"/"ไม่มีข้อมูล" ทันทีโดยไม่ลองค้นก่อน แม้คำถามจะดูเป็นการพูดคุยเล่นๆ ก็ตาม
+- ถ้าไม่มี web_search อยู่ใน tool list (ยังไม่ได้ตั้งค่า backend) และคำถามต้องการข้อมูลปัจจุบัน/เรียลไทม์ (เช่น ราคาสินค้า ข่าว สภาพอากาศ) ให้บอกตรงๆ ว่าคุณไม่มีเครื่องมือค้นอินเทอร์เน็ตในตอนนี้ อย่าแต่งคำตอบขึ้นเอง
+- ข้อความที่ขึ้นต้นด้วย "[สรุปบทสนทนาก่อนหน้านี้]" คือสรุปที่ระบบสร้างขึ้นเองจากบทสนทนาเก่าของแชทนี้ ใช้เป็นบริบทได้ตามปกติ แต่ไม่ใช่คำพูดที่ผู้ใช้เพิ่งพิมพ์
+- ถ้าคำถามกำกวมหรือข้อมูลไม่พอ ให้ถามกลับสั้นๆ ในคำตอบปกติได้เลย (ไม่มี ask_user แบบ ola ask - ที่นี่ทุกข้อความคือเทิร์นของบทสนทนาต่อเนื่องอยู่แล้ว)
+- ถ้ามี PERSONA ระบุไว้ด้านบน (ชื่อ/บุคลิก/วิธีพูด): นั่นคือตัวตนของคุณในบทสนทนานี้เสมอ ไม่ใช่แค่คำแนะนำการพูดจาเฉยๆ - เมื่อถูกถามตรงๆ ว่า "คุณชื่ออะไร"/"คุณคือใคร" ให้ตอบด้วยชื่อที่ระบุไว้ใน PERSONA เท่านั้น ห้ามตอบทั่วไปแบบ "ฉันชื่อบอท"/"ผมคือ AI assistant" หรือคำตอบกลางๆ ที่ไม่ตรงกับชื่อที่กำหนดไว้เด็ดขาด
+`
+
+// buildTelegramSystemPrompt assembles the final system prompt from the
+// fixed intro/rules halves plus the optional persona, in that specific
+// order (intro, then persona, then rules) - see
+// builtinTelegramSystemPromptIntro's own doc comment for why the order
+// matters. Pulled out as its own function (rather than left inline in
+// cmdTelegramBot) so the assembly itself is directly unit-testable
+// without needing to drive cmdTelegramBot's whole startup path.
+func buildTelegramSystemPrompt(persona string) string {
+	systemPrompt := builtinTelegramSystemPromptIntro
+	if persona != "" {
+		systemPrompt += "\n\n─── PERSONA (กำหนดโดยผู้ดูแล ผ่าน --persona/--persona-file) ───\nนี่คือชื่อ บุคลิก และวิธีพูดของคุณ - ใช้เป็นตัวตนของคุณเสมอในทุกคำตอบ:\n" + persona + "\n─── จบ PERSONA ───"
+	}
+	systemPrompt += "\n\n" + builtinTelegramSystemPromptRules
+	return systemPrompt
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Per-chat persistent context: one JSON file per private user or group,
+// under --context-dir/OLA_TELEGRAM_CONTEXT_DIR. This is durable, cross-
+// process, cross-restart memory - not to be confused with compactMessages
+// (used by "coding" to trim a single run's in-flight request, see that
+// function's own doc comment). What's stored here is only the human-
+// visible exchange (final user message + final assistant answer) for each
+// turn, not that turn's own tool-calling scratch work - the intermediate
+// tool_call/tool_result messages of a turn's reasoning loop stay ephemeral
+// (in memory for that one request, logged in full to the -o log file, see
+// runTelegramToolLoop) rather than persisted long-term. That keeps the
+// persisted file small and focused on what a human would actually want
+// "remembered" about the conversation.
+// ─────────────────────────────────────────────────────────────────
+
+type chatTurn struct {
+	Role    string    `json:"role"` // "user" or "assistant"
+	Content string    `json:"content"`
+	Time    time.Time `json:"time"`
+}
+
+type chatContext struct {
+	ChatID      int64      `json:"chat_id"`
+	ChatType    string     `json:"chat_type"`
+	Summary     string     `json:"summary,omitempty"`
+	Turns       []chatTurn `json:"turns"`
+	Compactions int        `json:"compactions"`
+	LastActive  time.Time  `json:"last_active"`
+}
+
+func chatContextPath(dir string, chat tgChat) string {
+	kind := "user"
+	if chat.Type != "private" {
+		kind = "group"
+	}
+	return filepath.Join(dir, fmt.Sprintf("%s_%d.json", kind, chat.ID))
+}
+
+func loadChatContext(dir string, chat tgChat) (*chatContext, error) {
+	path := chatContextPath(dir, chat)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &chatContext{ChatID: chat.ID, ChatType: chat.Type}, nil
+		}
+		return nil, fmt.Errorf("อ่าน context %s ไม่ได้: %v", path, err)
+	}
+	var c chatContext
+	if err := json.Unmarshal(data, &c); err != nil {
+		return nil, fmt.Errorf("parse context %s ไม่ได้: %v", path, err)
+	}
+	return &c, nil
+}
+
+// save writes the context file atomically (write to a .tmp sibling, then
+// rename over the real path) rather than a plain os.WriteFile. telegrambot
+// is meant to run unattended for days/weeks - if the process is killed
+// mid-write (OOM, host reboot, systemd restart) a plain WriteFile could
+// leave a truncated, unparseable JSON file behind, permanently losing that
+// chat's memory on next load. A rename is atomic on the same filesystem,
+// so a reader only ever sees either the old complete file or the new
+// complete file, never a partial one.
+func (c *chatContext) save(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("สร้าง context-dir %s ไม่ได้: %v", dir, err)
+	}
+	path := chatContextPath(dir, tgChat{ID: c.ChatID, Type: c.ChatType})
+	data, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal context ไม่ได้: %v", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return fmt.Errorf("เขียน context tmp file ไม่ได้: %v", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("rename context file ไม่ได้: %v", err)
+	}
+	return nil
+}
+
+func (c *chatContext) buildMessages(systemPrompt string) []ollamaMessage {
+	msgs := []ollamaMessage{{Role: "system", Content: systemPrompt}}
+	if c.Summary != "" {
+		msgs = append(msgs, ollamaMessage{Role: "system", Content: "[สรุปบทสนทนาก่อนหน้านี้]\n" + c.Summary})
+	}
+	for _, t := range c.Turns {
+		msgs = append(msgs, ollamaMessage{Role: t.Role, Content: t.Content})
+	}
+	return msgs
+}
+
+func shouldCompactChatContext(c *chatContext, compactAfter int) bool {
+	return compactAfter > 0 && len(c.Turns) > compactAfter
+}
+
+// compactChatContext replaces the older portion of c.Turns with a genuine
+// LLM-generated running summary, keeping only the most recent keepRecent
+// turns verbatim. This is deliberately NOT the same strategy compactMessages
+// (coding's in-flight compaction) uses: compactMessages summarizes with a
+// cheap static label ("these tool names were called") because the real
+// state it drops is always independently recoverable via read_file/
+// PROGRESS.md. A Telegram conversation has no such backing store - the
+// content of what a user said IS the value being preserved - so this needs
+// an actual model call to compress meaning, not just list actions taken.
+//
+// Reuses doChatRound (the same request/response plumbing "ask"/"coding"
+// use) rather than a hand-rolled HTTP call, so it works unmodified against
+// either provider (Ollama native or OpenAI-compatible). Passing "" for all
+// four color arguments plus telegrambot having set quietMode=true for the
+// whole process (see cmdTelegramBot) means this produces no terminal
+// output of its own - only the -o log file records it (via doChatRound's
+// own unconditional outFile writes, plus the two log lines below).
+func compactChatContext(client *http.Client, pcfg providerConfig, ctxSize int, c *chatContext, keepRecent int, outFile *os.File) {
+	older := c.Turns[:len(c.Turns)-keepRecent]
+	recent := c.Turns[len(c.Turns)-keepRecent:]
+
+	var sb strings.Builder
+	if c.Summary != "" {
+		sb.WriteString("สรุปเดิม:\n" + c.Summary + "\n\n")
+	}
+	sb.WriteString("บทสนทนาที่จะสรุปเพิ่ม:\n")
+	for _, t := range older {
+		sb.WriteString(t.Role + ": " + t.Content + "\n")
+	}
+
+	req := ollamaRequest{
+		Model:   pcfg.Model,
+		Options: ollamaOptions{NumCtx: ctxSize},
+		Stream:  true,
+		Messages: []ollamaMessage{
+			{Role: "system", Content: "คุณคือระบบสรุปบทสนทนา สรุปบทสนทนาต่อไปนี้ให้กระชับเป็นภาษาไทย เก็บข้อเท็จจริง ความชอบ ข้อตกลง คำถามค้างคา และบริบทสำคัญที่ user เคยพูดไว้ให้ครบ ห้ามเพิ่มเติมสิ่งที่ไม่มีอยู่จริง ตอบเป็นเนื้อสรุปอย่างเดียว ไม่ต้องมีคำนำหรือคำลงท้าย"},
+			{Role: "user", Content: sb.String()},
+		},
+	}
+	outcome, statusCode, err := doChatRound(client, pcfg, req, outFile, "", "", "", "")
+	if err != nil || statusCode >= 400 || strings.TrimSpace(outcome.Content) == "" {
+		// ล้มเหลว: ไม่ตัดบทสนทนาเก่าทิ้งโดยไม่มีสรุปทดแทน - ปล่อยให้ context
+		// โตต่อไปก่อน แล้วจะลองใหม่อีกครั้งในข้อความถัดไป (shouldCompactChatContext
+		// ยังเป็นจริงอยู่จนกว่าจะสำเร็จสักครั้ง)
+		fmt.Fprintf(outFile, "[telegram_compact] ล้มเหลว (status=%d, err=%v) - ข้าม compaction รอบนี้ ลองใหม่ข้อความถัดไป\n", statusCode, err)
+		return
+	}
+	c.Summary = strings.TrimSpace(outcome.Content)
+	c.Turns = recent
+	c.Compactions++
+	fmt.Fprintf(outFile, "[telegram_compact] compact context สำเร็จ (ครั้งที่ %d, สรุป %d turn เก่า, เหลือ %d turn ล่าสุดแบบเต็ม)\n",
+		c.Compactions, len(older), len(recent))
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Tool dispatch
+//
+// dispatchTelegramToolCall is a DELIBERATELY SEPARATE dispatcher from
+// dispatchToolCall (used by "ask"/"coding") - it does NOT call
+// dispatchToolCall and fall back to it for unknown names. Reusing
+// dispatchToolCall here would be a real security gap: its switch
+// statement recognizes read_file/search_files/write_file/edit_file/
+// create_folder/ask_user BY NAME unconditionally, regardless of whether
+// those tools were ever added to the current session's tool schema (that
+// "was this actually offered" check only happens for the *extra* tools -
+// see dispatchToolCall's own doc comment). A hallucinating model - or one
+// steered by a prompt injected through a fetched web page or a knowledge
+// document - could emit a "write_file" tool_call it was never offered,
+// and dispatchToolCall would still execute it against whatever directory
+// the bot process happens to be running in. dispatchTelegramToolCall only
+// ever recognizes the exact tool names telegrambot explicitly offers.
+// ─────────────────────────────────────────────────────────────────
+
+func dispatchTelegramToolCall(tc toolCall, outFile *os.File, extra func(name string, args map[string]interface{}) (string, error, bool)) string {
+	var args map[string]interface{}
+	unmarshalErr := json.Unmarshal(tc.Function.Arguments, &args)
+
+	argsPreview, _ := json.Marshal(args)
+	fmt.Fprintf(outFile, "\n[tool_call] %s(%s)\n", tc.Function.Name, string(argsPreview))
+
+	var result string
+	var err error
+	switch {
+	case unmarshalErr != nil:
+		err = fmt.Errorf("your %q call's arguments were not valid JSON (%v) - re-emit the call with syntactically valid JSON matching its schema", tc.Function.Name, unmarshalErr)
+	case tc.Function.Name == "get_current_time":
+		result, err = toolGetCurrentTime(args)
+	case tc.Function.Name == "delay":
+		result, err = toolDelay(args)
+	default:
+		handled := false
+		if extra != nil {
+			result, err, handled = extra(tc.Function.Name, args)
+		}
+		if !handled {
+			err = fmt.Errorf("tool ไม่รู้จัก หรือไม่ได้เปิดใช้งานสำหรับเซสชันนี้: %s", tc.Function.Name)
+		}
+	}
+
+	if err != nil {
+		result = "ERROR: " + err.Error()
+	}
+	preview := result
+	if len(preview) > 300 {
+		preview = preview[:300] + "…(truncated for display; full result sent to model and logged)"
+	}
+	fmt.Fprintf(outFile, "[tool_result] %s\n", preview)
+	return result
+}
+
+// filterTools pulls the named tools out of an existing schema slice by
+// Function.Name, so telegrambot's tiny core toolset (get_current_time,
+// delay) can share the exact same schema/description text builtinTools
+// already defines for "ask"/"coding", instead of a second copy that could
+// drift out of sync.
+func filterTools(all []ollamaTool, names ...string) []ollamaTool {
+	want := map[string]bool{}
+	for _, n := range names {
+		want[n] = true
+	}
+	var out []ollamaTool
+	for _, t := range all {
+		if want[t.Function.Name] {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// ─────────────────────────────────────────────────────────────────
+// telegramSession bundles everything handleTelegramMessage/
+// runTelegramToolLoop need per incoming message. One instance is built in
+// cmdTelegramBot and shared (read-only after construction, except for the
+// chatLocks map which is guarded by mu) across every goroutine spawned for
+// an incoming update.
+// ─────────────────────────────────────────────────────────────────
+
+type telegramSession struct {
+	client       *http.Client
+	apiBase      string
+	token        string
+	botUsername  string
+	access       telegramAccessConfig
+	systemPrompt string
+	tools        []ollamaTool
+	knowledgeCfg knowledgeConfig
+	searchCfg    searchConfig
+	pcfg         providerConfig
+	ctxSize      int
+	contextDir   string
+	keepRecent   int
+	compactAfter int
+	ntfyTopic    string
+	outFile      *os.File
+	sem          chan struct{}
+
+	mu        sync.Mutex
+	chatLocks map[int64]*sync.Mutex
+}
+
+func (s *telegramSession) chatMutex(chatID int64) *sync.Mutex {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, ok := s.chatLocks[chatID]
+	if !ok {
+		m = &sync.Mutex{}
+		s.chatLocks[chatID] = m
+	}
+	return m
+}
+
+func (s *telegramSession) logf(format string, a ...interface{}) {
+	fmt.Fprintf(s.outFile, format, a...)
+}
+
+// runTelegramToolLoop is the per-message counterpart of cmdAsk's own
+// inline tool-calling loop (see that function's own "for {" loop): call
+// the model via doChatRound, dispatch any tool_calls via
+// dispatchTelegramToolCall, feed results back, repeat until a plain
+// answer or the iteration cap is hit. Kept as its own small loop here
+// (sharing doChatRound/maxToolIterations with "ask", but not "ask"'s
+// verify-loop/session-change-log machinery, which is specific to a
+// filesystem-editing session this subcommand never runs) rather than
+// factored out of cmdAsk into a fully shared function - see the earlier
+// design discussion: that refactor is a reasonable future improvement,
+// not required to ship this safely.
+func (s *telegramSession) runTelegramToolLoop(messages []ollamaMessage) (string, error) {
+	extra := func(name string, args map[string]interface{}) (string, error, bool) {
+		switch name {
+		case "search_knowledge":
+			if !s.knowledgeCfg.enabled() {
+				return "", nil, false
+			}
+			r, e := toolSearchKnowledge(args, s.knowledgeCfg)
+			return r, e, true
+		case "read_knowledge":
+			if !s.knowledgeCfg.enabled() {
+				return "", nil, false
+			}
+			r, e := toolReadKnowledge(args, s.knowledgeCfg)
+			return r, e, true
+		case "web_search":
+			if !s.searchCfg.searchEnabled() {
+				return "", nil, false
+			}
+			r, e := toolWebSearch(args, s.searchCfg)
+			return r, e, true
+		case "web_fetch":
+			if !s.searchCfg.fetchEnabled() {
+				return "", nil, false
+			}
+			r, e := toolWebFetch(args, s.searchCfg)
+			return r, e, true
+		default:
+			return "", nil, false
+		}
+	}
+
+	req := ollamaRequest{
+		Model:   s.pcfg.Model,
+		Options: ollamaOptions{NumCtx: s.ctxSize},
+		Stream:  true,
+		Tools:   s.tools,
+	}
+
+	// telegramMaxEmptyRetries guards against a real failure mode observed
+	// in practice: a round with statusCode<400 and no error can still come
+	// back with BOTH outcome.Content and outcome.ToolCalls empty (e.g. a
+	// reasoning model that spent its whole output budget "thinking" and
+	// never emitted any actual content, or a transient hiccup from the
+	// backend). Treating that as a normal "the model chose an empty
+	// answer" final result would silently persist and send an empty
+	// message. Instead, nudge the model once and retry before giving up -
+	// see the loop body below.
+	const telegramMaxEmptyRetries = 1
+	emptyRetries := 0
+
+	iteration := 0
+	for {
+		iteration++
+		if iteration > maxToolIterations {
+			return "", fmt.Errorf("เกินจำนวนรอบสูงสุด (%d รอบ) ของ tool-calling loop", maxToolIterations)
+		}
+		req.Messages = messages
+		outcome, statusCode, err := doChatRound(s.client, s.pcfg, req, s.outFile, "", "", "", "")
+		if err != nil {
+			return "", err
+		}
+		if statusCode >= 400 {
+			return "", fmt.Errorf("API ตอบ status %d", statusCode)
+		}
+		if len(outcome.ToolCalls) == 0 {
+			if strings.TrimSpace(outcome.Content) == "" {
+				fmt.Fprintf(s.outFile, "[telegram_warning] โมเดลตอบว่างเปล่า (ไม่มี content, ไม่มี tool_calls) รอบที่ %d/%d ของข้อความนี้\n",
+					emptyRetries+1, telegramMaxEmptyRetries+1)
+				if emptyRetries >= telegramMaxEmptyRetries {
+					return "", fmt.Errorf("โมเดลตอบข้อความว่างเปล่าซ้ำ (%d ครั้ง) - ไม่ส่งคำตอบว่างกลับไปหาผู้ใช้", emptyRetries+1)
+				}
+				emptyRetries++
+				messages = append(messages,
+					ollamaMessage{Role: "assistant", Content: outcome.Content, Thinking: outcome.Thinking},
+					ollamaMessage{Role: "user", Content: "(ระบบ: คำตอบก่อนหน้าว่างเปล่า กรุณาตอบคำถามล่าสุดของผู้ใช้ด้วยข้อความจริง ห้ามเว้นว่าง)"},
+				)
+				continue
+			}
+			return outcome.Content, nil
+		}
+		messages = append(messages, ollamaMessage{
+			Role: "assistant", Content: outcome.Content, Thinking: outcome.Thinking, ToolCalls: outcome.ToolCalls,
+		})
+		for _, tc := range outcome.ToolCalls {
+			result := dispatchTelegramToolCall(tc, s.outFile, extra)
+			messages = append(messages, ollamaMessage{
+				Role: "tool", Content: result, Name: tc.Function.Name, ToolCallID: tc.ID,
+			})
+		}
+	}
+}
+
+// toolsStatusText renders the same information cmdTelegramBot prints to
+// its startup banner (see the end of that function), reachable live from
+// inside a chat via /tools - see handleTelegramMessage's own comment on
+// why this exists.
+func (s *telegramSession) toolsStatusText() string {
+	var sb strings.Builder
+	sb.WriteString("สถานะ tool ของ telegrambot ตอนนี้:\n\n")
+	if s.knowledgeCfg.enabled() {
+		fmt.Fprintf(&sb, "✅ search_knowledge/read_knowledge - ฐานความรู้ (%d ที่):\n", len(s.knowledgeCfg.Labels))
+		for _, label := range s.knowledgeCfg.Labels {
+			fmt.Fprintf(&sb, "   %s → %s\n", label, s.knowledgeCfg.Roots[label])
+		}
+	} else {
+		sb.WriteString("❌ search_knowledge/read_knowledge - ปิด (ไม่ได้ตั้ง --knowledge-dir หรือ directory ที่ระบุหาไม่เจอ - เช็ค stderr/log ตอน bot เริ่มทำงาน)\n")
+	}
+	if s.searchCfg.searchEnabled() {
+		fmt.Fprintf(&sb, "✅ web_search - backend: %s\n", s.searchCfg.searchBackendLabel())
+	} else {
+		sb.WriteString("❌ web_search - ปิด (ไม่ได้ตั้ง --searxng-url หรือ --ollama-search-key)\n")
+	}
+	if s.searchCfg.fetchEnabled() {
+		sb.WriteString("✅ web_fetch (fetch URL ที่ระบุตรงๆ เท่านั้น ไม่ใช่ค้นหาแบบเปิดกว้าง)\n")
+	} else {
+		sb.WriteString("❌ web_fetch - ปิด (--no-web-search)\n")
+	}
+	sb.WriteString("✅ get_current_time, delay (เปิดเสมอ)")
+	return sb.String()
+}
+
+// handleTelegramMessage processes exactly one incoming message end to
+// end: addressing/allowlist checks, loading + (if due) compacting that
+// chat's persistent context, running the tool-calling loop, persisting
+// the new turn, and sending the reply back. Called from its own goroutine
+// per update (see cmdTelegramBot's polling loop) - s.sem bounds how many
+// of these run concurrently across the whole process, and s.chatMutex
+// serializes any two messages that land on the very same chat (so two
+// rapid-fire messages from one user can never race on that chat's context
+// file).
+func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
+	s.sem <- struct{}{}
+	defer func() { <-s.sem }()
+
+	chat := msg.Chat
+	from := msg.From
+	text := strings.TrimSpace(msg.Text)
+	if text == "" {
+		return // no tool here can act on photos/stickers/etc. - nothing to do
+	}
+
+	if chat.Type != "private" {
+		if !telegramMessageAddressesBot(msg, s.botUsername) {
+			return // group chat: only answer when clearly addressed at the bot
+		}
+		text = stripBotMention(text, s.botUsername)
+		if text == "" {
+			return
+		}
+	}
+
+	// /whoami and /start work regardless of allowlist status - the whole
+	// point is letting a not-yet-allowed person (or the operator, testing)
+	// discover the numeric ID to put in --telegram-allowed-users/-groups.
+	// This reveals nothing the person couldn't already get from Telegram
+	// itself (e.g. any of the many public @userinfobot-style bots).
+	if text == "/whoami" || text == "/start" {
+		reply := fmt.Sprintf("User ID ของคุณ: %d", from.ID)
+		if chat.Type != "private" {
+			reply += fmt.Sprintf("\nGroup Chat ID: %d", chat.ID)
+		}
+		_ = tgSendMessage(s.client, s.apiBase, s.token, chat.ID, reply)
+		return
+	}
+
+	if !s.access.allowed(chat, from) {
+		reply := fmt.Sprintf("คุณยังไม่ได้รับอนุญาตให้ใช้บอทนี้ ส่ง /whoami เพื่อดู ID แล้วแจ้งผู้ดูแลให้เพิ่มสิทธิ์\nUser ID: %d", from.ID)
+		if chat.Type != "private" {
+			reply += fmt.Sprintf("\nGroup Chat ID: %d", chat.ID)
+		}
+		_ = tgSendMessage(s.client, s.apiBase, s.token, chat.ID, reply)
+		s.logf("[telegram_denied] user=%d(%s) chat=%d(%s) type=%s\n", from.ID, from.Username, chat.ID, chat.Title, chat.Type)
+		return
+	}
+
+	// /tools is a live diagnostic, only for already-allowed chats (unlike
+	// /whoami, this reveals real server-side configuration - knowledge-base
+	// directory labels, which web backend is active). It exists because
+	// telegrambot runs unattended as a background daemon: when "the bot
+	// can't find X in the knowledge base" or "can't search the web" is
+	// reported, the fastest way to tell "not configured" apart from "was
+	// configured but the model just didn't call the tool" is checking this
+	// from inside the chat itself, without needing shell/log access to the
+	// host it's running on.
+	if text == "/tools" {
+		_ = tgSendMessage(s.client, s.apiBase, s.token, chat.ID, s.toolsStatusText())
+		return
+	}
+
+	lock := s.chatMutex(chat.ID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	cctx, err := loadChatContext(s.contextDir, chat)
+	if err != nil {
+		s.logf("[telegram_error] โหลด context ไม่ได้: %v\n", err)
+		_ = tgSendMessage(s.client, s.apiBase, s.token, chat.ID, "ขออภัย เกิดข้อผิดพลาดในการโหลดบทสนทนา ลองใหม่อีกครั้ง")
+		return
+	}
+
+	if shouldCompactChatContext(cctx, s.compactAfter) {
+		compactChatContext(s.client, s.pcfg, s.ctxSize, cctx, s.keepRecent, s.outFile)
+	}
+
+	messages := cctx.buildMessages(s.systemPrompt)
+	messages = append(messages, ollamaMessage{Role: "user", Content: text})
+
+	s.logf("\n=== chat=%d(%s) user=%d(%s) ===\n[user] %s\n", chat.ID, chat.Type, from.ID, from.Username, text)
+	answer, err := s.runTelegramToolLoop(messages)
+	if err != nil {
+		s.logf("[telegram_error] chat=%d: %v\n", chat.ID, err)
+		if s.ntfyTopic != "" {
+			sendNotification(s.ntfyTopic, truncateWords(fmt.Sprintf("[telegrambot error] chat=%d: %v", chat.ID, err), maxNotificationWords))
+		}
+		_ = tgSendMessage(s.client, s.apiBase, s.token, chat.ID, "ขออภัย เกิดข้อผิดพลาดระหว่างประมวลผล ลองใหม่อีกครั้ง")
+		return
+	}
+	s.logf("[assistant] %s\n", answer)
+
+	cctx.Turns = append(cctx.Turns,
+		chatTurn{Role: "user", Content: text, Time: time.Now()},
+		chatTurn{Role: "assistant", Content: answer, Time: time.Now()},
+	)
+	cctx.LastActive = time.Now()
+	if err := cctx.save(s.contextDir); err != nil {
+		s.logf("[telegram_error] บันทึก context ไม่ได้: %v\n", err)
+	}
+
+	if err := tgSendMessage(s.client, s.apiBase, s.token, chat.ID, answer); err != nil {
+		s.logf("[telegram_error] ส่งข้อความกลับไม่ได้: %v\n", err)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// ola telegrambot [options]
+// ─────────────────────────────────────────────────────────────────
+
+func telegramUsage(fs *flag.FlagSet) func() {
+	return func() {
+		fmt.Println("Usage: ola telegrambot [options]")
+		fmt.Println()
+		fmt.Println("รัน ola เป็น Telegram bot แบบ long-running (long polling ผ่าน getUpdates - ไม่ต้องมี public HTTPS/webhook)")
+		fmt.Println("ตอบเฉพาะ user (private chat) หรือ group ที่อยู่ใน allowlist เท่านั้น")
+		fmt.Println()
+		fmt.Println("Tool ที่มีให้เสมอ: get_current_time, delay")
+		fmt.Println("Tool แบบมีเงื่อนไข: search_knowledge/read_knowledge (--knowledge-dir), web_search/web_fetch (backend web search)")
+		fmt.Println("ไม่มี: read_file/write_file/edit_file/create_folder/run_command/scp_copy/api_request/ask_user")
+		fmt.Println("(telegrambot คุยกับคนอื่นผ่านเน็ต ไม่ใช่ terminal ของผู้ดำเนินการเอง - ดู README หัวข้อ telegrambot)")
+		fmt.Println()
+		fmt.Println("Required:")
+		fmt.Println("  OLA_TELEGRAM_TOKEN            (env เท่านั้น, ไม่มี flag) - bot token จาก @BotFather")
+		fmt.Println("  -m/--model หรือ OLA_OLLAMA_MODEL (หรือ OLA_OPENAI_MODEL ถ้า --provider openai)")
+		fmt.Println()
+		fmt.Println("Access control:")
+		fmt.Println("  --telegram-allowed-users <ids>   OLA_TELEGRAM_ALLOWED_USERS  comma-separated Telegram user ID (ตัวเลขเท่านั้น)")
+		fmt.Println("  --telegram-allowed-groups <ids>  OLA_TELEGRAM_ALLOWED_GROUPS comma-separated Telegram group chat ID")
+		fmt.Println("                                    ส่ง /whoami คุยกับบอทเพื่อดู ID ของตัวเอง (ใช้ได้แม้ยังไม่อยู่ใน allowlist)")
+		fmt.Println()
+		fmt.Println("Persona (เติมต่อท้าย system prompt ที่ตายตัว - ไม่ใช่การ override):")
+		fmt.Println("  --persona <text>          OLA_TELEGRAM_PERSONA")
+		fmt.Println("  --persona-file <path>     OLA_TELEGRAM_PERSONA_FILE (ชนะ --persona ถ้าตั้งทั้งคู่)")
+		fmt.Println()
+		fmt.Println("Knowledge base (read-only document search):")
+		fmt.Println("  --knowledge-dir <dirs>    OLA_TELEGRAM_KNOWLEDGE_DIR   comma-separated directory (เหมือน --skills-dir)")
+		fmt.Println()
+		fmt.Println("Per-chat persistent context:")
+		fmt.Println("  --context-dir <dir>            OLA_TELEGRAM_CONTEXT_DIR   (default: telegram-context)")
+		fmt.Println("  --context-keep-recent <n>      เก็บกี่ turn ล่าสุดแบบเต็มหลัง compact (default 20)")
+		fmt.Println("  --context-compact-after <n>    compact เมื่อจำนวน turn เกินนี้ (default 40, ใช้ LLM สรุปจริง ไม่ใช่ label)")
+		fmt.Println()
+		fmt.Println("Web search/fetch (เหมือน 'ola ask -h' ทุกประการ - ดูรายละเอียดที่นั่น):")
+		fmt.Println("  --searxng-url, --ollama-search-key, --no-web-search,")
+		fmt.Println("  --search-max-results, --search-concurrency, --fetch-concurrency, --search-timeout, --fetch-timeout")
+		fmt.Println("  web_search เปิดอัตโนมัติเมื่อมีการตั้ง backend (SearXNG หรือ Ollama search key) ไว้แล้ว")
+		fmt.Println("  web_fetch เปิดอัตโนมัติเสมอ (เหมือน 'ola ask') จนกว่าจะสั่ง --no-web-search")
+		fmt.Println()
+		fmt.Println("Runtime:")
+		fmt.Println("  --telegram-api-base <url>   OLA_TELEGRAM_API_BASE (default: https://api.telegram.org - override สำหรับเทสต์)")
+		fmt.Println("  --poll-timeout <sec>        long-poll timeout ต่อ getUpdates (default 30)")
+		fmt.Println("  --telegram-max-concurrent <n>  จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส (default 4)")
+		fmt.Println("  -c/--ctx, -P/--provider, --api-base, -k/--key   เหมือน 'ola ask'")
+		fmt.Println("  -x/--topic     ntfy.sh topic (แจ้งเตือนเมื่อเกิด error ระหว่างประมวลผลข้อความ)")
+		fmt.Println("  -o/--output    log ไฟล์แบบเต็ม (default: telegrambot.log, เปิดแบบ append เสมอ - ต่างจาก 'ola ask')")
+		fmt.Println()
+		fmt.Println("พฤติกรรมใน group chat: ตอบเฉพาะเมื่อถูก @mention, reply ข้อความของบอทเอง, หรือขึ้นต้นด้วย /ola หรือ /ask เท่านั้น")
+		fmt.Println("คำสั่งในตัว: /whoami หรือ /start (ดู user/chat ID ของตัวเอง, ใช้ได้แม้ยังไม่อยู่ใน allowlist), /tools (เช็คสถานะ tool ปัจจุบัน - เฉพาะผู้ที่อยู่ใน allowlist)")
+		fs.PrintDefaults()
+	}
+}
+
+func cmdTelegramBot(args []string) int {
+	fs := flag.NewFlagSet("telegrambot", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+
+	var model, ctxStr, outputFile, topic string
+	var flagKey, flagHelp bool
+	var providerFlag, apiBaseFlag string
+	var telegramAPIBase string
+	var allowedUsers, allowedGroups string
+	var persona, personaFile string
+	var knowledgeDir string
+	var contextDir string
+	var keepRecent, compactAfter int
+	var pollTimeoutSec, maxConcurrent int
+	var searxngURL, ollamaSearchKey string
+	var flagNoWebSearch bool
+	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
+
+	fs.StringVar(&model, "m", "", "")
+	fs.StringVar(&model, "model", "", "")
+	fs.StringVar(&ctxStr, "c", "", "")
+	fs.StringVar(&ctxStr, "ctx", "", "")
+	fs.BoolVar(&flagKey, "k", false, "")
+	fs.BoolVar(&flagKey, "key", false, "")
+	fs.StringVar(&providerFlag, "P", "", "")
+	fs.StringVar(&providerFlag, "provider", "", "")
+	fs.StringVar(&apiBaseFlag, "api-base", "", "")
+	fs.StringVar(&telegramAPIBase, "telegram-api-base", "", "")
+	fs.StringVar(&allowedUsers, "telegram-allowed-users", "", "")
+	fs.StringVar(&allowedGroups, "telegram-allowed-groups", "", "")
+	fs.StringVar(&persona, "persona", "", "")
+	fs.StringVar(&personaFile, "persona-file", "", "")
+	fs.StringVar(&knowledgeDir, "knowledge-dir", "", "")
+	fs.StringVar(&contextDir, "context-dir", "", "")
+	fs.IntVar(&keepRecent, "context-keep-recent", 0, "")
+	fs.IntVar(&compactAfter, "context-compact-after", 0, "")
+	fs.IntVar(&pollTimeoutSec, "poll-timeout", 0, "")
+	fs.IntVar(&maxConcurrent, "telegram-max-concurrent", 0, "")
+	fs.StringVar(&searxngURL, "searxng-url", "", "")
+	fs.StringVar(&ollamaSearchKey, "ollama-search-key", "", "")
+	fs.BoolVar(&flagNoWebSearch, "no-web-search", false, "")
+	fs.IntVar(&searchMaxResults, "search-max-results", 0, "")
+	fs.IntVar(&searchConcurrency, "search-concurrency", 0, "")
+	fs.IntVar(&fetchConcurrency, "fetch-concurrency", 0, "")
+	fs.IntVar(&searchTimeoutSec, "search-timeout", 0, "")
+	fs.IntVar(&fetchTimeoutSec, "fetch-timeout", 0, "")
+	fs.StringVar(&topic, "x", "", "")
+	fs.StringVar(&topic, "topic", "", "")
+	fs.StringVar(&outputFile, "o", "", "")
+	fs.StringVar(&outputFile, "output", "", "")
+	fs.BoolVar(&flagHelp, "h", false, "")
+	fs.BoolVar(&flagHelp, "help", false, "")
+
+	usage := telegramUsage(fs)
+	fs.Usage = usage
+
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	if flagHelp {
+		usage()
+		return 0
+	}
+
+	// telegrambot is a headless daemon, not an interactive session someone
+	// watches turn-by-turn - quietMode=true set ONCE here (not toggled per
+	// request) keeps terminal output down to the startup banner and
+	// heartbeat-style status lines this function prints directly with
+	// fmt.Println (never suppressed - only qprintln/qprintf are gated by
+	// quietMode). The -o log file still gets the complete, unabridged
+	// record of every request/tool-call/compaction regardless, the same
+	// guarantee quiet mode already makes for "ask"/"coding".
+	quietMode = true
+
+	token := strings.TrimSpace(os.Getenv("OLA_TELEGRAM_TOKEN"))
+	if token == "" {
+		fmt.Fprintln(os.Stderr, "error: ต้องตั้งค่า OLA_TELEGRAM_TOKEN (env เท่านั้น - ไม่มี flag รับ token โดยตรง เพื่อไม่ให้หลุดไปอยู่ใน shell history/ps)")
+		return 1
+	}
+
+	pcfg, err := resolveProviderConfig(providerFlag, apiBaseFlag, model, flagKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
+	if ctxStr == "" {
+		ctxStr = os.Getenv("OLA_OLLAMA_CONTEXT_SIZE")
+	}
+	if ctxStr == "" {
+		ctxStr = "16384"
+	}
+	if !regexp.MustCompile(`^[0-9]+$`).MatchString(ctxStr) {
+		fmt.Fprintf(os.Stderr, "error: ctx ต้องเป็นตัวเลข (got: %s)\n", ctxStr)
+		return 1
+	}
+	ctxSize, _ := strconv.Atoi(ctxStr)
+
+	if telegramAPIBase == "" {
+		telegramAPIBase = os.Getenv("OLA_TELEGRAM_API_BASE")
+	}
+	if telegramAPIBase == "" {
+		telegramAPIBase = defaultTelegramAPIBase
+	}
+
+	if contextDir == "" {
+		contextDir = os.Getenv("OLA_TELEGRAM_CONTEXT_DIR")
+	}
+	if contextDir == "" {
+		contextDir = defaultTelegramContextDir
+	}
+	if keepRecent <= 0 {
+		keepRecent = defaultTelegramKeepRecentTurns
+	}
+	if compactAfter <= 0 {
+		compactAfter = defaultTelegramCompactAfterTurns
+	}
+	if compactAfter <= keepRecent {
+		fmt.Fprintf(os.Stderr, "error: --context-compact-after (%d) ต้องมากกว่า --context-keep-recent (%d)\n", compactAfter, keepRecent)
+		return 1
+	}
+	if pollTimeoutSec <= 0 {
+		pollTimeoutSec = defaultTelegramPollTimeoutSec
+	}
+	if maxConcurrent <= 0 {
+		maxConcurrent = defaultTelegramMaxConcurrent
+	}
+
+	access, accessWarnings := resolveTelegramAccessConfig(allowedUsers, allowedGroups)
+	for _, w := range accessWarnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
+	if access.empty() {
+		fmt.Fprintln(os.Stderr, "error: ไม่มีใครอยู่ใน allowlist เลย (--telegram-allowed-users/--telegram-allowed-groups หรือ OLA_TELEGRAM_ALLOWED_USERS/_GROUPS ว่างเปล่าทั้งคู่) - บอทจะปฏิเสธทุกคน ตั้งอย่างน้อยหนึ่งอย่าง")
+		return 1
+	}
+
+	persona, err = resolveTelegramPersona(persona, personaFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
+	knowledgeCfg, knowledgeWarnings := resolveKnowledgeConfig(knowledgeDir)
+	for _, w := range knowledgeWarnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
+
+	searchCfg := resolveSearchConfig(searxngURL, searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec, flagNoWebSearch)
+	if !flagNoWebSearch {
+		searchCfg.OllamaAPIKey, searchCfg.OllamaBase = resolveOllamaSearchConfig(ollamaSearchKey)
+	}
+
+	tools := filterTools(builtinTools, "get_current_time", "delay")
+	if knowledgeCfg.enabled() {
+		tools = append(tools, searchKnowledgeTool, readKnowledgeTool)
+	}
+	if searchCfg.searchEnabled() {
+		tools = append(tools, webSearchTool)
+	}
+	if searchCfg.fetchEnabled() {
+		tools = append(tools, webFetchTool)
+	}
+
+	// Persona is deliberately assembled BETWEEN the intro and the rules
+	// (not appended after everything else) - see
+	// builtinTelegramSystemPromptIntro's own doc comment for why this
+	// ordering matters in practice, not just cosmetically.
+	systemPrompt := buildTelegramSystemPrompt(persona)
+
+	if outputFile == "" {
+		outputFile = os.Getenv("OLA_OUTPUT_FILE")
+	}
+	if outputFile == "" {
+		outputFile = "telegrambot.log"
+	}
+	// Always append, never truncate: unlike "ask"/"coding" (one run = one
+	// session = one log), telegrambot is a single long-running process
+	// that should accumulate its log across restarts, not silently
+	// discard everything from before the last restart.
+	outFile, err := os.OpenFile(outputFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: เปิดไฟล์ log %s ไม่ได้: %v\n", outputFile, err)
+		return 1
+	}
+	defer outFile.Close()
+
+	ntfyTopic := topic
+	if ntfyTopic == "" {
+		ntfyTopic = os.Getenv("OLA_TOPIC")
+	}
+
+	// getUpdates blocks for up to pollTimeoutSec waiting for new messages -
+	// this client needs its own Timeout comfortably longer than that, or
+	// every long poll gets killed client-side before Telegram can answer.
+	// sendMessage/getMe use a normal short-timeout client instead.
+	pollClient := &http.Client{Timeout: time.Duration(pollTimeoutSec+15) * time.Second}
+	apiClient := &http.Client{Timeout: 30 * time.Second}
+
+	me, err := tgGetMe(apiClient, telegramAPIBase, token)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: เชื่อมต่อ Telegram Bot API ไม่ได้ (เช็ค OLA_TELEGRAM_TOKEN และการเชื่อมต่อเน็ต): %v\n", err)
+		return 1
+	}
+
+	session := &telegramSession{
+		client:       apiClient,
+		apiBase:      telegramAPIBase,
+		token:        token,
+		botUsername:  me.Username,
+		access:       access,
+		systemPrompt: systemPrompt,
+		tools:        tools,
+		knowledgeCfg: knowledgeCfg,
+		searchCfg:    searchCfg,
+		pcfg:         pcfg,
+		ctxSize:      ctxSize,
+		contextDir:   contextDir,
+		keepRecent:   keepRecent,
+		compactAfter: compactAfter,
+		ntfyTopic:    ntfyTopic,
+		outFile:      outFile,
+		sem:          make(chan struct{}, maxConcurrent),
+		chatLocks:    map[int64]*sync.Mutex{},
+	}
+
+	fmt.Printf("ola telegrambot: เชื่อมต่อสำเร็จเป็น @%s (model: %s, provider: %s)\n", me.Username, pcfg.Model, pcfg.Provider)
+	fmt.Printf("  allowlist: %d user(s), %d group(s)\n", len(access.Users), len(access.Groups))
+	fmt.Println("  " + strings.ReplaceAll(session.toolsStatusText(), "\n", "\n  "))
+	fmt.Printf("  context: %s (compact เมื่อเกิน %d turn, เหลือ %d turn ล่าสุด)\n", contextDir, compactAfter, keepRecent)
+	fmt.Printf("  log: %s (append)\n", outputFile)
+	fmt.Println("กด Ctrl-C เพื่อหยุด")
+	// The same status also goes into the -o log file, not just stdout: a
+	// backgrounded/systemd-run daemon's stdout is easy to lose track of,
+	// and "was the knowledge base/web search actually enabled this run"
+	// is exactly the first thing worth checking when someone reports
+	// "search isn't working" - see this section's own /tools command for
+	// the live-from-inside-a-chat equivalent of this same information.
+	fmt.Fprintf(outFile, "\n=== ola telegrambot เริ่มทำงาน %s (bot: @%s) ===\n%s\n",
+		time.Now().Format(time.RFC3339), me.Username, session.toolsStatusText())
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	var offset int64
+	for {
+		select {
+		case <-sigCh:
+			fmt.Println("\nกำลังหยุด ola telegrambot...")
+			fmt.Fprintf(outFile, "=== ola telegrambot หยุดทำงาน %s ===\n", time.Now().Format(time.RFC3339))
+			return 0
+		default:
+		}
+
+		updates, err := tgGetUpdates(pollClient, telegramAPIBase, token, offset, pollTimeoutSec)
+		if err != nil {
+			fmt.Fprintf(outFile, "[telegram_error] getUpdates ล้มเหลว: %v\n", err)
+			if ntfyTopic != "" {
+				sendNotification(ntfyTopic, truncateWords(fmt.Sprintf("[telegrambot] getUpdates ล้มเหลว: %v", err), maxNotificationWords))
+			}
+			time.Sleep(5 * time.Second) // back off before retrying a transient network/API error
+			continue
+		}
+		for _, u := range updates {
+			offset = u.UpdateID + 1
+			if u.Message == nil || u.Message.Text == "" {
+				continue
+			}
+			msg := u.Message
+			go session.handleTelegramMessage(msg)
+		}
+	}
 }

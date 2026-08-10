@@ -2,14 +2,15 @@
 
 **ola** เป็น CLI (คำสั่งเดียว, ไบนารีเดียว, เขียนด้วย Go ล้วน ไม่พึ่งพา `curl`/`jq`/`perl`/`base64` ภายนอก) สำหรับคุยกับ LLM ผ่าน Ollama (หรือ endpoint แบบ OpenAI-compatible ใดก็ได้) พร้อม **tool calling ที่เปิดใช้งานเสมอ** — โมเดลไม่ได้แค่ตอบข้อความ แต่ *อ่าน/เขียน/แก้ไฟล์จริงบนดิสก์*, รันคำสั่ง shell, ค้นเว็บ, เรียก API, โอนไฟล์ข้าม host, และถามคุณกลับเมื่อจำเป็น ทั้งหมดนี้ sandbox อยู่ใน current directory ที่คุณรัน `ola` เท่านั้น
 
-โปรเจกต์นี้มีสองคำสั่งย่อย:
+โปรเจกต์นี้มีสามคำสั่งย่อย:
 
 | คำสั่ง | ใช้เมื่อไหร่ |
 |---|---|
 | [`ola ask`](#ola-ask) | ถามคำถามครั้งเดียว มี human คอยตอบโต้ระหว่างทางได้ (เหมือนคุยกับ AI assistant ทั่วไป แต่มันแก้ไฟล์ให้จริง) |
 | [`ola coding`](#ola-coding) | ให้ทำงานยาว ๆ แบบไม่มีคนเฝ้า: ป้อนไฟล์ requirements แล้วปล่อยให้มันวางแผน → เขียนโค้ด → build/test เอง → แก้จนผ่านจริง |
+| [`ola telegrambot`](#ola-telegrambot) | รัน ola เป็น Telegram bot แบบ long-running ตอบเฉพาะ user/group ที่กำหนดไว้ล่วงหน้า ใช้ toolset แบบ read-only (ไม่แตะไฟล์/shell) พร้อมความจำต่อแชทที่ persist ข้าม process |
 
-> ทั้งสองคำสั่งพูดได้สองภาษา (protocol): Ollama's native `/api/chat` (ค่าเริ่มต้น) หรือ endpoint แบบ OpenAI chat-completions (`-P openai`) — ดู [Provider](#provider-ollama-vs-openai-compatible)
+> ทั้งสามคำสั่งพูดได้สองภาษา (protocol): Ollama's native `/api/chat` (ค่าเริ่มต้น) หรือ endpoint แบบ OpenAI chat-completions (`-P openai`) — ดู [Provider](#provider-ollama-vs-openai-compatible)
 
 ---
 
@@ -21,17 +22,18 @@
 4. [ตัวแปรสภาพแวดล้อม (Environment Variables) ทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด)
 5. [`ola ask`](#ola-ask)
 6. [`ola coding`](#ola-coding)
-7. [Provider: ollama vs openai-compatible](#provider-ollama-vs-openai-compatible)
-8. [Web search / web fetch](#web-search--web-fetch)
-9. [ตั้งค่า SearXNG ด้วย `websearch.yml`](#ตั้งค่า-searxng-ด้วย-websearchyml)
-10. [Skills system](#skills-system)
-11. [scp_copy — โอนไฟล์ข้าม host](#scp_copy--โอนไฟล์ข้าม-host)
-12. [api_request — เรียก HTTP API](#api_request--เรียก-http-api)
-13. [Quiet mode](#quiet-mode)
-14. [ntfy.sh push notifications](#ntfysh-push-notifications)
-15. [ไฟล์แพลตฟอร์ม (`platform_linux.go` / `platform_other.go`)](#ไฟล์แพลตฟอร์ม)
-16. [การรันเทสต์](#การรันเทสต์)
-17. [ข้อจำกัด/สิ่งที่ควรรู้](#ข้อจำกัดสิ่งที่ควรรู้)
+7. [`ola telegrambot`](#ola-telegrambot)
+8. [Provider: ollama vs openai-compatible](#provider-ollama-vs-openai-compatible)
+9. [Web search / web fetch](#web-search--web-fetch)
+10. [ตั้งค่า SearXNG ด้วย `websearch.yml`](#ตั้งค่า-searxng-ด้วย-websearchyml)
+11. [Skills system](#skills-system)
+12. [scp_copy — โอนไฟล์ข้าม host](#scp_copy--โอนไฟล์ข้าม-host)
+13. [api_request — เรียก HTTP API](#api_request--เรียก-http-api)
+14. [Quiet mode](#quiet-mode)
+15. [ntfy.sh push notifications](#ntfysh-push-notifications)
+16. [ไฟล์แพลตฟอร์ม (`platform_linux.go` / `platform_other.go`)](#ไฟล์แพลตฟอร์ม)
+17. [การรันเทสต์](#การรันเทสต์)
+18. [ข้อจำกัด/สิ่งที่ควรรู้](#ข้อจำกัดสิ่งที่ควรรู้)
 
 ---
 
@@ -42,7 +44,8 @@
 - **เขียนไฟล์จริง ไม่ใช่ข้อความให้ copy-paste** — ola รุ่นเก่าเคยมีกลไก marker พิเศษ (`<<<ooo FILENAME ooo>>> ... <<<xxx FILENAME xxx>>>`) กับคำสั่งย่อย `extract` ให้มนุษย์ค่อยแยกไฟล์เอาทีหลัง กลไกนั้นถูกถอดออกไปแล้ว — ตอนนี้ `write_file`/`edit_file` แก้ไฟล์บนดิสก์ทันที
 - **System prompt คงที่ ตายตัวในไบนารี** — ไม่มี `-s/--system` ให้เปลี่ยนจากภายนอกอีกต่อไป เพราะ contract ของ tool calling (tool มีอะไรบ้าง, sandbox ยังไง, เมื่อไหร่ต้องถาม user) สำคัญเกินกว่าจะให้ override แบบเสี่ยง prompt พังตอนรันจริง ข้อยกเว้นเดียวคือส่วน "AVAILABLE SKILLS" ที่ *เติมต่อ* ท้าย prompt เมื่อตั้งค่า skills เท่านั้น (ดู [Skills system](#skills-system))
 - **ไม่เชื่อคำพูดโมเดิลเปล่า ๆ** — เมื่อโมเดิลแก้ไฟล์โค้ด ola จะรัน build/test ของโปรเจกต์เองอย่างอิสระอีกครั้งก่อนยอมรับว่า "เสร็จ" (`ola ask`) หรือบังคับ gate หลายชั้น (`ola coding`) แทนที่จะเชื่อว่าโมเดิลพูดว่า "compiles/passes tests" แล้วจบ
-- **โครงสร้างซอร์สโค้ด** — โปรเจกต์รวมไฟล์ทั้งหมดเหลือน้อยไฟล์ (file-count cleanup): `main.go` (entry point + tool-calling loop ของทั้งสองคำสั่งย่อย + integrations ทั้งหมด), `main_test.go` (เทสต์ทั้งหมด), และ `platform_linux.go`/`platform_other.go` ที่แยกเฉพาะโค้ดที่ผูกกับ build tag (`//go:build linux` / `//go:build !linux`) เพราะไฟล์แบบ build-tag ต้องมี "เฉพาะ" โค้ดที่ตรงเงื่อนไขเท่านั้น เลยรวมเข้า `main.go` ไม่ได้
+- **โครงสร้างซอร์สโค้ด** — โปรเจกต์รวมไฟล์ทั้งหมดเหลือน้อยไฟล์ (file-count cleanup): `main.go` (entry point + tool-calling loop ของทั้งสามคำสั่งย่อย + integrations ทั้งหมด รวม `telegrambot`), `main_test.go` (เทสต์ทั้งหมด), และ `platform_linux.go`/`platform_other.go` ที่แยกเฉพาะโค้ดที่ผูกกับ build tag (`//go:build linux` / `//go:build !linux`) เพราะไฟล์แบบ build-tag ต้องมี "เฉพาะ" โค้ดที่ตรงเงื่อนไขเท่านั้น เลยรวมเข้า `main.go` ไม่ได้
+- **`telegrambot` เป็น trust model คนละแบบกับ `ask`/`coding`** — สองคำสั่งนั้นรันในเทอร์มินัลของผู้ดำเนินการเอง แต่ `telegrambot` รับข้อความจากคนอื่นผ่านอินเทอร์เน็ต จึงมี toolset แบบ read-only เท่านั้น (ไม่มี `read_file`/`write_file`/`run_command`/ฯลฯ) และ dispatcher tool ของตัวเอง (`dispatchTelegramToolCall`) แยกจาก `ask`/`coding` โดยเจตนา — ดู [`ola telegrambot`](#ola-telegrambot)
 
 ---
 
@@ -439,6 +442,97 @@ ola coding --no-edit-verify --cmd-timeout 300
 # ทิ้ง state เดิมแล้ววางแผนใหม่ทั้งหมด (เช่น requirements เปลี่ยนไปมาก)
 ola coding --replan
 ```
+
+---
+
+## `ola telegrambot`
+
+รัน ola เป็น Telegram bot แบบ long-running: long-poll ผ่าน `getUpdates` (ไม่ต้องมี public HTTPS/webhook หรือ TLS cert ใดๆ — ต้องการแค่ต่อ HTTPS ขาออกไปหา `api.telegram.org` ได้) ตอบเฉพาะ user (private chat) หรือ group ที่อยู่ใน allowlist เท่านั้น
+
+**นี่คือ trust model ที่ต่างจาก `ask`/`coding` โดยสิ้นเชิง** — สองคำสั่งนั้นรันในเทอร์มินัลของผู้ดำเนินการเอง คนที่คุมพรอมต์คือคนที่คุมเครื่อง แต่ `telegrambot` รับข้อความจาก**คนอื่น**ผ่านอินเทอร์เน็ต ด้วยเหตุนี้ toolset ของ `telegrambot` จึงเล็กและเป็น read-only เท่านั้น:
+
+| มีให้เสมอ | มีให้ถ้าตั้งค่าไว้ | **ไม่มีเลย** |
+|---|---|---|
+| `get_current_time`, `delay` | `search_knowledge`/`read_knowledge` (`--knowledge-dir`) | `read_file`/`write_file`/`edit_file`/`create_folder` |
+| | `web_search`/`web_fetch` (เหมือน `ask`) | `run_command`, `scp_copy`, `api_request`, `ask_user` |
+
+`search_knowledge`/`read_knowledge` sandbox อยู่ที่ไดเรกทอรีที่ตั้งค่าผ่าน `--knowledge-dir` เท่านั้น **ไม่ใช่** current directory ที่ตัว bot process รันอยู่ — คนละแนวคิดกับ `read_file`/`search_files` ของ `ask`/`coding` โดยเจตนา และไม่มี `write_knowledge`/`edit_knowledge` คู่กันเลย ฐานความรู้ต้องถูกดูแล/แก้ไขจากภายนอกเท่านั้น
+
+### เริ่มต้นใช้งาน
+
+```bash
+export OLA_TELEGRAM_TOKEN='123456:ABC-your-bot-token-from-botfather'   # env เท่านั้น ไม่มี flag รับ token ตรงๆ
+export OLA_OLLAMA_MODEL=qwen3.6:27b
+
+# ยังไม่รู้ user id ของตัวเอง? รันแบบ allow ชั่วคราวด้วย id อะไรก็ได้ แล้วทัก /whoami กับบอทเพื่อดู id จริง
+ola telegrambot --telegram-allowed-users 000000000
+
+# ใช้งานจริง
+ola telegrambot \
+  --telegram-allowed-users 111111111,222222222 \
+  --telegram-allowed-groups -1001234567890 \
+  --persona 'คุณคือผู้ช่วยตอบคำถามวิชา Network Security ของภาควิชา ตอบสุภาพ กระชับ เป็นภาษาไทย' \
+  --knowledge-dir /srv/course-docs/network-security \
+  -x mytopic
+```
+
+ทัก `/whoami` (หรือ `/start`) กับบอทเมื่อไหร่ก็ได้ (แม้ยังไม่อยู่ใน allowlist) เพื่อดู user id / group chat id ของตัวเอง — เอาไปใส่ `--telegram-allowed-users`/`--telegram-allowed-groups` ได้เลย
+
+ทัก `/tools` (เฉพาะแชทที่อยู่ใน allowlist แล้ว) เพื่อดูสถานะ tool แบบสดๆ จากในแชทเลย — บอกว่า `search_knowledge`/`web_search`/`web_fetch` แต่ละตัวเปิดอยู่ไหม, ฐานความรู้ชี้ไปที่ path ไหนจริงๆ (มีประโยชน์มากตอน debug ปัญหาแบบ "ค้นฐานความรู้/เว็บไม่ได้" เพราะ `telegrambot` มักรันเป็น background daemon ที่ log บนเทอร์มินัลอาจหลุดสายตาไปง่ายๆ)
+
+**สาเหตุที่พบบ่อยที่สุดที่ทำให้ "ค้นหาไม่ได้":**
+1. **`web_search` ต้องตั้ง backend เองเสมอ** (`--searxng-url` หรือ `--ollama-search-key`) — ถ้าไม่ตั้ง `web_search` จะถูกปิดโดยตั้งใจ (เหมือน `ola ask` ทุกประการ) `web_fetch` เปิด default ก็จริง แต่ทำได้แค่ "ดึงหน้าเว็บที่รู้ URL อยู่แล้ว" ไม่ใช่ "ค้นหา" แบบเปิดกว้าง — คำถามอย่าง "ราคาทองวันนี้เท่าไหร่" ต้องมี `web_search` เท่านั้นถึงจะตอบได้จริง
+2. **`--knowledge-dir` เป็น relative path** — `telegrambot` รันเป็น daemon อายุยืน ถ้า start ผ่าน `nohup`/systemd/script wrapper ที่ cwd ไม่ใช่ที่คิดไว้ path แบบ `km` (ไม่ใช่ `/absolute/path/km`) อาจ resolve ไปคนละที่แล้วหา directory ไม่เจอ (จะมี warning ออกทาง stderr และใน log ไฟล์ตอนเริ่มทำงาน แต่พลาดดูง่ายมากถ้ารันแบบ background) **แนะนำใช้ absolute path เสมอสำหรับ `--knowledge-dir`/`--persona-file`/`--context-dir`** เพื่อตัดปัญหานี้ทิ้งไปเลย แล้วเช็คด้วย `/tools` ว่า path ที่ resolve ได้จริงตรงกับที่ตั้งใจไหม
+3. **โมเดิลไม่ยอมเรียก tool เอง** — โดยเฉพาะกับ persona แบบ role-play/เพื่อนคุยเล่น โมเดิลอาจตอบจากความจำตัวเองทันทีโดยไม่ลองค้นก่อน ถ้าเจอปัญหานี้บ่อย ลองเพิ่มประโยคใน `--persona`/`--persona-file` ที่ย้ำชัดๆ เช่น "ถ้าถูกถามเรื่องคน/สัตว์เลี้ยง/ข้อมูลเฉพาะที่ไม่ใช่ความรู้ทั่วไป ให้ค้น search_knowledge ก่อนตอบทุกครั้ง"
+
+### พฤติกรรมใน group chat
+
+บอทจะ**ไม่ตอบทุกข้อความ**ในกลุ่ม (จะกวนคนอื่นที่คุยเรื่องอื่นอยู่) — ตอบเฉพาะเมื่อ:
+- ข้อความ mention บอท (`@botusername`)
+- ข้อความเป็นการ reply ต่อข้อความของบอทเอง
+- ข้อความขึ้นต้นด้วย `/ola` หรือ `/ask`
+
+### Persona — เติมต่อท้ายเท่านั้น ไม่ใช่ override
+
+หลักการ "system prompt คงที่ ไม่มี `-s/--system`" (ดู [ภาพรวมและปรัชญาการออกแบบ](#ภาพรวมและปรัชญาการออกแบบ)) ยังใช้กับ `telegrambot` เช่นกัน — `--persona`/`--persona-file` ถูกแทรกเข้าไป**ระหว่าง**ประโยคเปิดกับกติกาพื้นฐานของ system prompt ที่ตายตัว (ไม่ใช่ต่อท้ายทั้งหมด) เพื่อให้ชื่อ/บุคลิกที่กำหนดไว้มีน้ำหนักสูงสุดในสายตาโมเดิล — พบจากการทดสอบจริงว่าถ้า persona ถูกแปะไว้ท้ายสุด (หลังกติกายาวๆ) โมเดิลบางตัวมีแนวโน้มตอบชื่อแบบทั่วไป เช่น "ฉันชื่อบอท" แทนชื่อที่ตั้งไว้ กติกาความปลอดภัย/ขอบเขต tool ที่มีให้ ไม่สามารถถูกเปลี่ยนผ่าน persona ได้ไม่ว่าจะวางตำแหน่งไหน
+
+**ถ้ายังเจอปัญหาโมเดิลไม่ยอมใช้ชื่อ/บุคลิกตาม persona แม้ปรับตำแหน่งแล้ว** นี่มักเป็นข้อจำกัดของตัวโมเดิลเอง (พบบ่อยกับโมเดิลขนาดเล็ก/quantized ที่ instruction-following ไม่แข็งแรงพอ โดยเฉพาะกับคำถามสั้นๆ แบบ "คุณชื่ออะไร") ลองเสริมประโยคย้ำใน persona ให้ชัดขึ้นอีก หรือพิจารณาเปลี่ยนไปใช้โมเดิลที่ใหญ่ขึ้น/instruction-tuned ดีกว่า
+
+### ความจำต่อแชท (persistent, auto-compact)
+
+แต่ละ private chat / group แยกไฟล์ context ของตัวเองไว้ที่ `--context-dir` (default: `telegram-context/`) เป็น JSON หนึ่งไฟล์ต่อหนึ่งแชท (`user_<id>.json` / `group_<id>.json`) เขียนแบบ atomic (`.tmp` แล้ว rename) ป้องกันไฟล์เสียหายถ้า process โดน kill กลางคัน
+
+เมื่อจำนวน turn ในแชทหนึ่งเกิน `--context-compact-after` (default 40) ola จะเรียกโมเดิลสรุปบทสนทนาที่เก่ากว่า `--context-keep-recent` (default 20) turn ล่าสุด เก็บเป็น "สรุปบทสนทนาก่อนหน้า" แทนที่ turn ดิบทั้งหมด — **นี่คือการสรุปเนื้อหาจริงด้วยโมเดล ไม่ใช่แค่ label เหมือนที่ `ola coding` ทำกับ context ของตัวเอง**เพราะบทสนทนาไม่มี state อื่นให้ recover เนื้อหาคืนได้แบบ `PROGRESS.md`/`read_file` ของ `ola coding`
+
+### สิ่งที่ยังไม่รองรับ (รู้ไว้ก่อน)
+
+- `read_knowledge` ยังไม่รองรับไฟล์ `.pdf` (ต่างจาก `read_file` ที่มี `read_pdf` ช่วย)
+- ไม่มี `ask_user` แบบ `ola ask` — ถ้าโมเดิลพยายามถามกลับ จะได้ error กลับไปเหมือนรันแบบ non-interactive (โมเดิลต้องตัดสินใจเองหรือถามในคำตอบปกติแทน เพราะทุกข้อความในแชทคือเทิร์นของบทสนทนาต่อเนื่องอยู่แล้ว)
+- ไม่มี per-user rate limit ละเอียด — มีแค่ mutex ต่อแชท (กันสองข้อความจากแชทเดียวกันแข่งกันเขียน context) และ `--telegram-max-concurrent` (จำกัดจำนวนข้อความที่ประมวลผลพร้อมกันทั้งโปรเซส)
+
+### ถ้าโมเดิลตอบว่างเปล่า
+
+บางครั้งโมเดิล (โดยเฉพาะ reasoning model ที่ใช้ token งบประมาณไปกับ "thinking" จนหมดก่อนจะสร้างคำตอบจริง) อาจตอบกลับมาแบบไม่มีทั้งข้อความและไม่มี tool call เลย — `telegrambot` เจอกรณีนี้จะ**ลองใหม่ให้อัตโนมัติ 1 ครั้ง** (ส่งข้อความเตือนกลับไปให้โมเดิลว่าคำตอบก่อนหน้าว่างเปล่า) ถ้ายังว่างอีกจะถือเป็น error — ผู้ใช้จะได้ข้อความแจ้งปัญหากลับไปแทนที่จะได้ข้อความว่างเปล่า/ไม่มีอะไรตอบเลย และ **จะไม่มีการบันทึก turn ที่ล้มเหลวลง context ไฟล์** เช็ค log (`-o`) จะเห็นบรรทัด `[telegram_warning] โมเดลตอบว่างเปล่า` ถ้าเจอปัญหานี้บ่อย มักเป็นสัญญาณว่าโมเดิลที่ใช้อยู่เล็ก/ตั้ง `-c/--ctx` ต่ำเกินไปสำหรับ persona+ประวัติสนทนาที่ยาวขึ้นเรื่อยๆ
+
+### Flags / Environment variables
+
+| ตัวแปร | Flag | ค่าเริ่มต้น | หมายเหตุ |
+|---|---|---|---|
+| `OLA_TELEGRAM_TOKEN` | *(env เท่านั้น)* | — | **จำเป็น** — bot token จาก [@BotFather](https://t.me/BotFather) ไม่มี flag รับตรงๆ เพื่อไม่ให้หลุดไปอยู่ใน shell history/`ps` |
+| `OLA_TELEGRAM_ALLOWED_USERS` | `--telegram-allowed-users` | — | comma-separated Telegram user ID (ตัวเลขเท่านั้น ไม่รับ `@username` เพราะเปลี่ยนได้) |
+| `OLA_TELEGRAM_ALLOWED_GROUPS` | `--telegram-allowed-groups` | — | comma-separated Telegram group/supergroup chat ID |
+| `OLA_TELEGRAM_PERSONA` | `--persona` | — | ข้อความ persona/คำสั่งเพิ่มเติม เติมต่อท้าย system prompt |
+| `OLA_TELEGRAM_PERSONA_FILE` | `--persona-file` | — | ไฟล์ persona (ชนะ `--persona`/`OLA_TELEGRAM_PERSONA` ถ้าตั้งทั้งคู่) |
+| `OLA_TELEGRAM_KNOWLEDGE_DIR` | `--knowledge-dir` | — | comma-separated directory สำหรับ `search_knowledge`/`read_knowledge` |
+| `OLA_TELEGRAM_CONTEXT_DIR` | `--context-dir` | `telegram-context` | ที่เก็บไฟล์ context ราย user/group |
+| — | `--context-keep-recent` | `20` | จำนวน turn ล่าสุดที่เก็บแบบเต็มหลัง compact |
+| — | `--context-compact-after` | `40` | compact เมื่อจำนวน turn เกินนี้ (ต้องมากกว่า `--context-keep-recent`) |
+| `OLA_TELEGRAM_API_BASE` | `--telegram-api-base` | `https://api.telegram.org` | override สำหรับทดสอบกับ mock server |
+| — | `--poll-timeout` | `30` | long-poll timeout วินาทีต่อ `getUpdates` |
+| — | `--telegram-max-concurrent` | `4` | จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส |
+| — | `-o, --output` | `telegrambot.log` | log ไฟล์แบบเต็ม เปิดแบบ **append เสมอ** (ต่างจาก `ask`/`coding` ที่ overwrite เป็น default — `telegrambot` เป็น process เดียวรันยาวข้าม restart) |
+
+ตัวแปรที่เหลือ (การเชื่อมต่อโมเดล `-m/-c/-P/--api-base/-k`, `-x/--topic`, และ web search/fetch ทั้งชุด `--searxng-url`/`--ollama-search-key`/`--no-web-search`/ฯลฯ) ใช้ร่วมกับ `ola ask` ทุกประการ — ดู [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด) และ [Web search / web fetch](#web-search--web-fetch) `web_search` เปิดอัตโนมัติเมื่อมีการตั้ง backend ไว้ (SearXNG หรือ Ollama search key) ส่วน `web_fetch` เปิดอัตโนมัติเสมอเหมือน `ask` จนกว่าจะสั่ง `--no-web-search`
 
 ---
 
