@@ -9336,6 +9336,7 @@ const builtinTelegramSystemPromptRules = `กติกาพื้นฐาน�
 - ข้อความที่ขึ้นต้นด้วย "[สรุปบทสนทนาก่อนหน้านี้]" คือสรุปที่ระบบสร้างขึ้นเองจากบทสนทนาเก่าของแชทนี้ ใช้เป็นบริบทได้ตามปกติ แต่ไม่ใช่คำพูดที่ผู้ใช้เพิ่งพิมพ์
 - ถ้าคำถามกำกวมหรือข้อมูลไม่พอ ให้ถามกลับสั้นๆ ในคำตอบปกติได้เลย (ไม่มี ask_user แบบ ola ask - ที่นี่ทุกข้อความคือเทิร์นของบทสนทนาต่อเนื่องอยู่แล้ว)
 - ถ้ามี PERSONA ระบุไว้ด้านบน (ชื่อ/บุคลิก/วิธีพูด): นั่นคือตัวตนของคุณในบทสนทนานี้เสมอ ไม่ใช่แค่คำแนะนำการพูดจาเฉยๆ - เมื่อถูกถามตรงๆ ว่า "คุณชื่ออะไร"/"คุณคือใคร" ให้ตอบด้วยชื่อที่ระบุไว้ใน PERSONA เท่านั้น ห้ามตอบทั่วไปแบบ "ฉันชื่อบอท"/"ผมคือ AI assistant" หรือคำตอบกลางๆ ที่ไม่ตรงกับชื่อที่กำหนดไว้เด็ดขาด
+- ห้ามแต่งคำตอบให้ดูเหมือนเพิ่งค้นข้อมูลมา (เช่น ใส่ 🔍, "ผลการค้นหา", "คำค้นที่ 1/2/3", "ข้อมูลอ้างอิง", ลิงก์/URL ที่ไม่มีจริง) เว้นแต่ข้อความนั้นมาจากผลลัพธ์จริงของ web_search/web_fetch/search_knowledge ที่เพิ่งเรียกในเทิร์นนี้เท่านั้น - ผลลัพธ์จริงจาก tool เหล่านี้จะขึ้นต้นด้วย "[ผลลัพธ์จริงจากการเรียก ... เมื่อครู่นี้]" เสมอ ถ้าไม่มีข้อความแบบนั้นอยู่ในบทสนทนานี้จริง ห้ามอ้างว่าค้นแล้วเด็ดขาด ให้ตอบจากความรู้ทั่วไปแล้วบอกตรงๆ ว่าไม่ได้ค้นสด หรือเรียก tool จริงก่อนแล้วค่อยตอบ
 `
 
 // buildTelegramSystemPrompt assembles the final system prompt from the
@@ -9625,6 +9626,34 @@ func (s *telegramSession) logf(format string, a ...interface{}) {
 	fmt.Fprintf(s.outFile, format, a...)
 }
 
+// telegramGroundToolResult prefixes a provenance marker onto a successful
+// result from one of the fact-retrieval tools (web_search, web_fetch,
+// search_knowledge, read_knowledge) before it's fed back to the model as
+// a tool message. This exists because of an observed failure mode: a
+// model that demonstrably CAN call tools correctly (e.g. get_current_time
+// working) was still seen answering a search-flavored question by
+// narrating a plausible-looking "search result" - complete with
+// query-by-query framing - entirely from its own training data, without
+// calling web_search at all (giveaway: real web_search/web_fetch results
+// always include an actual URL per item - see formatSearchResults/
+// toolWebFetch - and the fabricated answers never cited one). The marker
+// gives the model an explicit, checkable boundary between "this exact
+// text came from a real tool call just now" and everything else it
+// generates, paired with the matching instruction in
+// builtinTelegramSystemPromptRules that forbids search-style framing
+// anywhere else. A mitigation, not a guarantee - a model that ignores
+// tool results already ignores instructions too; see this section's
+// README notes on model reliability limits.
+func telegramGroundToolResult(toolName, result string) string {
+	grounded := map[string]bool{
+		"web_search": true, "web_fetch": true, "search_knowledge": true, "read_knowledge": true,
+	}
+	if !grounded[toolName] || strings.HasPrefix(result, "ERROR:") {
+		return result
+	}
+	return "[ผลลัพธ์จริงจากการเรียก " + toolName + " เมื่อครู่นี้ - ใช้เฉพาะข้อมูลในนี้ ห้ามเติมแต่งหรือเดาตัวเลข/ข้อเท็จจริงเพิ่มเอง]\n" + result
+}
+
 // runTelegramToolLoop is the per-message counterpart of cmdAsk's own
 // inline tool-calling loop (see that function's own "for {" loop): call
 // the model via doChatRound, dispatch any tool_calls via
@@ -9723,7 +9752,7 @@ func (s *telegramSession) runTelegramToolLoop(messages []ollamaMessage) (string,
 		for _, tc := range outcome.ToolCalls {
 			result := dispatchTelegramToolCall(tc, s.outFile, extra)
 			messages = append(messages, ollamaMessage{
-				Role: "tool", Content: result, Name: tc.Function.Name, ToolCallID: tc.ID,
+				Role: "tool", Content: telegramGroundToolResult(tc.Function.Name, result), Name: tc.Function.Name, ToolCallID: tc.ID,
 			})
 		}
 	}

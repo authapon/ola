@@ -7257,3 +7257,88 @@ func TestBuildTelegramSystemPromptPersonaOrderingAndIdentityRule(t *testing.T) {
 		t.Fatal("expected no PERSONA section when no persona is configured")
 	}
 }
+
+// TestTelegramGroundToolResult is the regression test for the "answered a
+// search-flavored question with a fabricated-looking search transcript,
+// no real URL cited" bug report - see telegramGroundToolResult's own doc
+// comment for the full failure mode this addresses.
+func TestTelegramGroundToolResult(t *testing.T) {
+	cases := []struct {
+		name       string
+		toolName   string
+		result     string
+		wantMarked bool
+	}{
+		{"web_search success gets marked", "web_search", "1. Example\n   https://example.com\n   snippet", true},
+		{"web_fetch success gets marked", "web_fetch", "page title\n\ncontent", true},
+		{"search_knowledge success gets marked", "search_knowledge", "km/a.md", true},
+		{"read_knowledge success gets marked", "read_knowledge", "file content", true},
+		{"error result never marked", "web_search", "ERROR: web_search ไม่ได้ถูกตั้งค่า", false},
+		{"get_current_time never marked", "get_current_time", "2026-08-10 10:48", false},
+		{"delay never marked", "delay", "รอครบ 5s แล้ว", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := telegramGroundToolResult(tc.toolName, tc.result)
+			isMarked := strings.HasPrefix(got, "[ผลลัพธ์จริงจากการเรียก")
+			if isMarked != tc.wantMarked {
+				t.Fatalf("telegramGroundToolResult(%q, ...): marked=%v, want %v (got: %q)", tc.toolName, isMarked, tc.wantMarked, got)
+			}
+			if !strings.Contains(got, tc.result) {
+				t.Fatalf("expected the original result content to still be present, got: %q", got)
+			}
+		})
+	}
+}
+
+// TestHandleTelegramMessageGroundsWebSearchResultInFollowUpRequest is the
+// end-to-end version of TestTelegramGroundToolResult: it confirms the
+// marker actually reaches the model, in the actual follow-up request
+// telegrambot sends after a real web_search call - not just that the pure
+// helper function produces the right string in isolation.
+func TestHandleTelegramMessageGroundsWebSearchResultInFollowUpRequest(t *testing.T) {
+	telegramSrv, _ := newMockTelegramSendMessageServer(t)
+
+	var round int32
+	var secondRoundBody string
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&round, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		switch n {
+		case 1:
+			fmt.Fprint(w, streamLine("", "web_search", `{"queries":["ราคาทองคำวันนี้"]}`, true))
+		case 2:
+			body, _ := io.ReadAll(r.Body)
+			secondRoundBody = string(body)
+			fmt.Fprint(w, streamLine("ตามผลค้นหาล่าสุด...", "", "", true))
+		}
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	searxngMux := http.NewServeMux()
+	searxngMux.HandleFunc("/search", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"results":[{"title":"ราคาทอง","url":"https://example.com/gold","content":"67,700 บาท"}]}`)
+	})
+	searxngSrv := httptest.NewServer(searxngMux)
+	defer searxngSrv.Close()
+
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, t.TempDir(), map[int64]bool{111: true})
+	session.searchCfg = resolveSearchConfig(searxngSrv.URL, 0, 0, 0, 0, 0, false)
+	session.tools = append(session.tools, webSearchTool, webFetchTool)
+
+	msg := &tgMessage{From: tgUser{ID: 111}, Chat: tgChat{ID: 111, Type: "private"}, Text: "ราคาทองวันนี้เท่าไหร่"}
+	session.handleTelegramMessage(msg)
+
+	if atomic.LoadInt32(&round) != 2 {
+		t.Fatalf("expected 2 rounds (web_search call then answer), got %d", round)
+	}
+	if !strings.Contains(secondRoundBody, "ผลลัพธ์จริงจากการเรียก web_search") {
+		t.Fatalf("expected the grounding marker in the follow-up request sent to the model, body: %s", secondRoundBody)
+	}
+	if !strings.Contains(secondRoundBody, "example.com/gold") {
+		t.Fatalf("expected the real SearXNG result URL to reach the model, body: %s", secondRoundBody)
+	}
+}
