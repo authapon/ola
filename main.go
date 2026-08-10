@@ -9111,6 +9111,71 @@ func resolveKnowledgeConfig(flagVal string) (knowledgeConfig, []string) {
 	return cfg, warnings
 }
 
+// knowledgeGrepFallbackMaxFiles/knowledgeGrepFallbackMaxBytesPerFile bound
+// the auto-fallback in toolSearchKnowledge (see its own doc comment): when
+// a query matches the file pattern but no single LINE contains it, and
+// few enough files matched, the fallback shows the model those files' own
+// content instead of a dead-end "not found" - each file capped to this
+// many bytes.
+const knowledgeGrepFallbackMaxFiles = 5
+const knowledgeGrepFallbackMaxBytesPerFile = 3000
+
+// resolveKnowledgePath resolves a "<label>/<relative-path>" display path
+// - the exact shape toolSearchKnowledge's results are in, and what
+// read_knowledge/the grep fallback below both expect as input - to a
+// real, sandboxed absolute filesystem path. Shared by toolReadKnowledge
+// and toolSearchKnowledge's own grep-fallback so the sandboxedPathIn
+// security check has exactly one implementation, not two that could
+// drift apart.
+func resolveKnowledgePath(displayPath string, cfg knowledgeConfig) (string, error) {
+	p := strings.TrimPrefix(displayPath, "/")
+	parts := strings.SplitN(p, "/", 2)
+	if len(parts) < 2 {
+		example := ""
+		if len(cfg.Labels) > 0 {
+			example = cfg.Labels[0] + "/example.md"
+		}
+		return "", fmt.Errorf("path ต้องอยู่ในรูปแบบ \"<label>/<relative-path>\" ตามที่ search_knowledge คืนมา เช่น %q", example)
+	}
+	root, ok := cfg.Roots[parts[0]]
+	if !ok {
+		return "", fmt.Errorf("ไม่รู้จัก label %q - label ที่มีอยู่: %s", parts[0], strings.Join(cfg.Labels, ", "))
+	}
+	return sandboxedPathIn(root, parts[1])
+}
+
+// knowledgeGrepFallbackContent reads and concatenates (capped) the
+// content of each matched file, for toolSearchKnowledge's fallback when a
+// query-based search matched files by name/pattern but not by exact line
+// text. PDFs are skipped (read_knowledge doesn't support them either -
+// same limitation, noted the same way). Read errors are silently skipped
+// per-file rather than failing the whole fallback - a partial answer is
+// more useful than none, and the caller only calls this when there's
+// already at least one real matched file.
+func knowledgeGrepFallbackContent(matches []string, cfg knowledgeConfig) string {
+	var b strings.Builder
+	for _, m := range matches {
+		full, err := resolveKnowledgePath(m, cfg)
+		if err != nil {
+			continue
+		}
+		if strings.ToLower(filepath.Ext(full)) == ".pdf" {
+			fmt.Fprintf(&b, "=== %s ===\n(ไฟล์ PDF - read_knowledge ยังไม่รองรับ PDF ในตอนนี้ ข้าม)\n\n", m)
+			continue
+		}
+		data, err := os.ReadFile(full)
+		if err != nil {
+			continue
+		}
+		content := string(data)
+		if len(content) > knowledgeGrepFallbackMaxBytesPerFile {
+			content = content[:knowledgeGrepFallbackMaxBytesPerFile] + "\n...(ตัดเนื้อหา - เรียก read_knowledge เพื่ออ่านเต็ม)"
+		}
+		fmt.Fprintf(&b, "=== %s ===\n%s\n\n", m, content)
+	}
+	return b.String()
+}
+
 func toolSearchKnowledge(args map[string]interface{}, cfg knowledgeConfig) (string, error) {
 	if !cfg.enabled() {
 		return "", fmt.Errorf("search_knowledge ไม่ได้ถูกตั้งค่าสำหรับเซสชันนี้")
@@ -9187,7 +9252,26 @@ func toolSearchKnowledge(args map[string]interface{}, cfg knowledgeConfig) (stri
 	}
 	if query != "" {
 		if len(grepHits) == 0 {
-			return fmt.Sprintf("พบไฟล์ %d ไฟล์ตรงกับ pattern แต่ไม่มีบรรทัดใดตรงกับ query %q%s", len(matches), query, suffix), nil
+			// The pattern DID match file(s), but the query - the model's
+			// own choice of words - didn't appear verbatim in any single
+			// line. This is a common, expected mismatch (the model asks
+			// about "pets" while the document says "dog"/"cat", or a typo/
+			// spacing difference in the generated query) rather than
+			// evidence the knowledge base lacks the answer. Rather than
+			// dead-ending on "0 matches" here, fall back to showing the
+			// matched files' own content directly when there are few
+			// enough to make that cheap and sane - the model can then find
+			// the actual relevant text itself without a second guess-and-
+			// retry round trip.
+			if len(matches) <= knowledgeGrepFallbackMaxFiles {
+				if fallback := knowledgeGrepFallbackContent(matches, cfg); fallback != "" {
+					return fmt.Sprintf(
+						"ไม่มีบรรทัดใดตรงกับ query %q แบบตรงตัว (คำในเอกสารอาจเขียนต่างจากคำค้นนี้) แต่พบไฟล์ %d ไฟล์ที่ตรงกับ pattern - แนบเนื้อหาให้เลย อ่านหาคำตอบจากตรงนี้ก่อนสรุปว่าไม่มีข้อมูล:\n\n%s%s",
+						query, len(matches), fallback, suffix), nil
+				}
+			}
+			return fmt.Sprintf("พบไฟล์ %d ไฟล์ตรงกับ pattern (%s) แต่ไม่มีบรรทัดใดตรงกับ query %q แบบตรงตัว - ลองเรียก read_knowledge อ่านไฟล์เหล่านั้นโดยตรง หรือค้นด้วย query อื่น%s",
+				len(matches), strings.Join(matches, ", "), query, suffix), nil
 		}
 		return strings.Join(grepHits, "\n") + suffix, nil
 	}
@@ -9202,20 +9286,7 @@ func toolReadKnowledge(args map[string]interface{}, cfg knowledgeConfig) (string
 	if p == "" {
 		return "", fmt.Errorf("ต้องระบุ path")
 	}
-	p = strings.TrimPrefix(p, "/")
-	parts := strings.SplitN(p, "/", 2)
-	if len(parts) < 2 {
-		example := ""
-		if len(cfg.Labels) > 0 {
-			example = cfg.Labels[0] + "/example.md"
-		}
-		return "", fmt.Errorf("path ต้องอยู่ในรูปแบบ \"<label>/<relative-path>\" ตามที่ search_knowledge คืนมา เช่น %q", example)
-	}
-	root, ok := cfg.Roots[parts[0]]
-	if !ok {
-		return "", fmt.Errorf("ไม่รู้จัก label %q - label ที่มีอยู่: %s", parts[0], strings.Join(cfg.Labels, ", "))
-	}
-	full, err := sandboxedPathIn(root, parts[1])
+	full, err := resolveKnowledgePath(p, cfg)
 	if err != nil {
 		return "", err
 	}
@@ -9331,7 +9402,7 @@ const builtinTelegramSystemPromptRules = `กติกาพื้นฐาน�
 - ทุกคำตอบสุดท้ายต้องมีเนื้อความเสมอ ห้ามตอบข้อความว่างเปล่าเด็ดขาด ถ้าไม่แน่ใจว่าจะตอบอะไร ให้ถามกลับหรือบอกตรงๆ ว่าไม่มีข้อมูลพอ ดีกว่าปล่อยว่าง
 - คุณไม่มีเครื่องมือแก้ไฟล์ รันคำสั่ง หรือเข้าถึงระบบปฏิบัติการใดๆ ทั้งสิ้น เครื่องมือที่อาจมีให้ (ถ้าตั้งค่าไว้ - เช็คได้จาก tool list ที่แนบมากับ request นี้) มีแค่: search_knowledge/read_knowledge (ฐานความรู้ที่ผู้ดูแลกำหนดไว้ล่วงหน้า, read-only), web_search/web_fetch (ค้นอินเทอร์เน็ต, ถ้าเปิดใช้), get_current_time, delay
 - ห้ามอ้างว่าคุณทำสิ่งที่ไม่มีเครื่องมือให้ทำจริง (เช่น "แก้ไฟล์ให้แล้ว", "รันคำสั่งให้แล้ว", "บันทึกลงระบบแล้ว") และห้ามอ้างว่า "ค้นแล้วไม่เจอ" ถ้าไม่ได้เรียก tool จริงๆ
-- ถ้ามี search_knowledge อยู่ใน tool list: คำถามเกี่ยวกับชื่อคน สัตว์เลี้ยง สถานที่ เหตุการณ์ หรือรายละเอียดเฉพาะเจาะจงใดๆ ที่ไม่ใช่ความรู้ทั่วไป ให้เรียก search_knowledge ก่อนเสมอแล้วค่อยตอบ (ลอง pattern "*" ถ้าไม่แน่ใจว่าไฟล์ชื่ออะไร) ห้ามตอบว่า "ไม่รู้จัก"/"ไม่มีข้อมูล" ทันทีโดยไม่ลองค้นก่อน แม้คำถามจะดูเป็นการพูดคุยเล่นๆ ก็ตาม
+- ถ้ามี search_knowledge อยู่ใน tool list: คำถามเกี่ยวกับชื่อคน สัตว์เลี้ยง สถานที่ เหตุการณ์ หรือรายละเอียดเฉพาะเจาะจงใดๆ ที่ไม่ใช่ความรู้ทั่วไป ให้เรียก search_knowledge ก่อนเสมอแล้วค่อยตอบ (ลอง pattern "*" ถ้าไม่แน่ใจว่าไฟล์ชื่ออะไร) ห้ามตอบว่า "ไม่รู้จัก"/"ไม่มีข้อมูล" ทันทีโดยไม่ลองค้นก่อน แม้คำถามจะดูเป็นการพูดคุยเล่นๆ ก็ตาม - ถ้า query ที่ใช้ค้นไม่มีบรรทัดตรงกับคำนั้นเป๊ะๆ (คำในเอกสารมักเขียนต่างจากคำถามของผู้ใช้) แต่ระบบแนบเนื้อหาไฟล์ที่เกี่ยวข้องมาให้ ให้อ่านเนื้อหานั้นหาคำตอบเองก่อนเสมอ อย่าเพิ่งสรุปว่าไม่มีข้อมูลแค่เพราะบรรทัดไม่ตรงคำเป๊ะๆ - และให้ลอง search_knowledge ใหม่ทุกครั้งที่มีคำถามใหม่ที่อาจเกี่ยวข้อง แม้คำถามก่อนหน้าในแชทนี้จะค้นไม่เจอมาก่อนก็ตาม เพราะชื่อ/คำที่ถูกถามอาจเชื่อมโยงกับสิ่งที่ค้นเจอไปแล้วในบทสนทนานี้
 - ถ้าไม่มี web_search อยู่ใน tool list (ยังไม่ได้ตั้งค่า backend) และคำถามต้องการข้อมูลปัจจุบัน/เรียลไทม์ (เช่น ราคาสินค้า ข่าว สภาพอากาศ) ให้บอกตรงๆ ว่าคุณไม่มีเครื่องมือค้นอินเทอร์เน็ตในตอนนี้ อย่าแต่งคำตอบขึ้นเอง
 - ข้อความที่ขึ้นต้นด้วย "[สรุปบทสนทนาก่อนหน้านี้]" คือสรุปที่ระบบสร้างขึ้นเองจากบทสนทนาเก่าของแชทนี้ ใช้เป็นบริบทได้ตามปกติ แต่ไม่ใช่คำพูดที่ผู้ใช้เพิ่งพิมพ์
 - ถ้าคำถามกำกวมหรือข้อมูลไม่พอ ให้ถามกลับสั้นๆ ในคำตอบปกติได้เลย (ไม่มี ask_user แบบ ola ask - ที่นี่ทุกข้อความคือเทิร์นของบทสนทนาต่อเนื่องอยู่แล้ว)

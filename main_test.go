@@ -7371,3 +7371,63 @@ func TestBuildTelegramHTTPClientsTimeouts(t *testing.T) {
 		t.Fatalf("expected the poll client's timeout (%v) to be comfortably longer than --poll-timeout (%ds), or long polls would be killed client-side before Telegram can answer", poll.Timeout, pollTimeoutSec)
 	}
 }
+
+// TestToolSearchKnowledgeGrepFallbackWhenQueryWordsDiffer is the exact
+// regression test for a real bug report: a document literally reads
+// "นายอรรถพล คงหวาน มีหมาชื่อว่า เมกกะ และมีแมวชื่อ พิคโค่" (has a dog
+// named Mecca and a cat named Piccolo) - asked "what pets does he have",
+// the model generated the query "สัตว์เลี้ยง" (pets) which never appears
+// verbatim in the document (it says "หมา"/"แมว", dog/cat, never the word
+// "pet") - so the old exact-substring grep legitimately found zero
+// matching lines and told the model "not found", even though the file
+// plainly contains the answer for anyone who reads it. This pins down
+// the fix: when few files match the pattern, their content is returned
+// directly instead of a dead end.
+func TestToolSearchKnowledgeGrepFallbackWhenQueryWordsDiffer(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("นายอรรถพล คงหวาน มีหมาชื่อว่า เมกกะ และมีแมวชื่อ พิคโค่"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, warnings := resolveKnowledgeConfig(dir)
+	if len(warnings) != 0 {
+		t.Fatalf("unexpected warnings: %v", warnings)
+	}
+
+	result, err := toolSearchKnowledge(map[string]interface{}{"pattern": "*", "query": "สัตว์เลี้ยง"}, cfg)
+	if err != nil {
+		t.Fatalf("toolSearchKnowledge error: %v", err)
+	}
+	if !strings.Contains(result, "เมกกะ") || !strings.Contains(result, "พิคโค่") {
+		t.Fatalf("expected the fallback to include the file's actual content (the real answer), got: %s", result)
+	}
+	if !strings.Contains(result, "a.md") {
+		t.Fatalf("expected the matched file's path to be identifiable in the fallback, got: %s", result)
+	}
+}
+
+// TestToolSearchKnowledgeNoFallbackWhenTooManyFilesMatch confirms the
+// fallback is bounded: with more than knowledgeGrepFallbackMaxFiles
+// pattern matches, dumping every file's content would be expensive and
+// noisy, so the result should list file paths (so the model can pick one
+// for read_knowledge) rather than inline all their content.
+func TestToolSearchKnowledgeNoFallbackWhenTooManyFilesMatch(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < knowledgeGrepFallbackMaxFiles+2; i++ {
+		name := fmt.Sprintf("doc%d.md", i)
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("เนื้อหาไม่เกี่ยวข้อง"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, _ := resolveKnowledgeConfig(dir)
+
+	result, err := toolSearchKnowledge(map[string]interface{}{"pattern": "*.md", "query": "ไม่มีคำนี้แน่นอน"}, cfg)
+	if err != nil {
+		t.Fatalf("toolSearchKnowledge error: %v", err)
+	}
+	if strings.Contains(result, "เนื้อหาไม่เกี่ยวข้อง") {
+		t.Fatalf("expected no inline file content when too many files matched, got: %s", result)
+	}
+	if !strings.Contains(result, "doc0.md") {
+		t.Fatalf("expected matched file paths to still be listed so read_knowledge can target one, got: %s", result)
+	}
+}
