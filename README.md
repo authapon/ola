@@ -566,14 +566,14 @@ ola telegrambot \
 | `OLA_TELEGRAM_TOKEN` | *(env เท่านั้น)* | — | **จำเป็น** — bot token จาก [@BotFather](https://t.me/BotFather) ไม่มี flag รับตรงๆ เพื่อไม่ให้หลุดไปอยู่ใน shell history/`ps` |
 | `OLA_TELEGRAM_ALLOWED_USERS` | `--telegram-allowed-users` | — | comma-separated Telegram user ID (ตัวเลขเท่านั้น ไม่รับ `@username` เพราะเปลี่ยนได้) |
 | `OLA_TELEGRAM_ALLOWED_GROUPS` | `--telegram-allowed-groups` | — | comma-separated Telegram group/supergroup chat ID |
-| `OLA_TELEGRAM_PERSONA` | `--persona` | — | ข้อความ persona/คำสั่งเพิ่มเติม เติมต่อท้าย system prompt |
-| `OLA_TELEGRAM_PERSONA_FILE` | `--persona-file` | — | ไฟล์ persona (ชนะ `--persona`/`OLA_TELEGRAM_PERSONA` ถ้าตั้งทั้งคู่) |
-| `OLA_TELEGRAM_KNOWLEDGE_DIR` | `--knowledge-dir` | — | comma-separated directory สำหรับ `search_knowledge`/`read_knowledge` |
-| `OLA_TELEGRAM_EMBED_MODEL` | `--embed-model` | — | Ollama embedding model (เช่น `bge-m3`) เปิด semantic search fallback (`--provider ollama` เท่านั้น) |
+| `OLA_PERSONA` | `--persona` | — | ข้อความ persona/คำสั่งเพิ่มเติม เติมต่อท้าย system prompt (ใช้ร่วมกับ `ola discordbot`) |
+| `OLA_PERSONA_FILE` | `--persona-file` | — | ไฟล์ persona (ชนะ `--persona`/`OLA_PERSONA` ถ้าตั้งทั้งคู่ - ใช้ร่วมกับ `ola discordbot`) |
+| `OLA_KNOWLEDGE_DIR` | `--knowledge-dir` | — | comma-separated directory สำหรับ `search_knowledge`/`read_knowledge` (ใช้ร่วมกับ `ola discordbot`) |
+| `OLA_EMBED_MODEL` | `--embed-model` | — | Ollama embedding model (เช่น `bge-m3`) เปิด semantic search fallback (`--provider ollama` เท่านั้น, ใช้ร่วมกับ `ola discordbot`) |
 | — | `--embed-top-k` | `5` | จำนวน chunk สูงสุดจาก semantic search |
 | — | `--embed-min-score` | `0.35` | คะแนน cosine similarity ขั้นต่ำ (ค่าตั้งต้น ควรปรับตามโมเดิลจริง) |
 | — | `--embed-refresh-interval` | `300` วินาที | ความถี่ walk ไฟล์หาการเปลี่ยนแปลง (index ที่ `<context-dir>/knowledge-index.json`) |
-| `OLA_TELEGRAM_CONTEXT_DIR` | `--context-dir` | `telegram-context` | ที่เก็บไฟล์ context ราย user/group |
+| `OLA_CONTEXT_DIR` | `--context-dir` | `telegram-context` | ที่เก็บไฟล์ context ราย user/group (ตัวแปรเดียวกับ `ola discordbot` — ค่า default ต่างกันถ้าไม่ได้ตั้ง แต่ตั้ง `OLA_CONTEXT_DIR` แล้วทั้งสองบอทจะไปที่เดียวกัน ปลอดภัยเพราะ key ไม่ชนกัน) |
 | — | `--context-keep-recent` | `20` | จำนวน turn ล่าสุดที่เก็บแบบเต็มหลัง compact |
 | — | `--context-compact-after` | `40` | compact เมื่อจำนวน turn เกินนี้ (ต้องมากกว่า `--context-keep-recent`) |
 | `OLA_TELEGRAM_API_BASE` | `--telegram-api-base` | `https://api.telegram.org` | override สำหรับทดสอบกับ mock server |
@@ -643,12 +643,11 @@ Discord ซ้อนโครงสร้างลึกกว่า Telegram: S
 | `OLA_DISCORD_ALLOWED_USERS` | `--discord-allowed-users` | — | comma-separated user ID (DM) |
 | `OLA_DISCORD_ALLOWED_GUILDS` | `--discord-allowed-guilds` | — | comma-separated server ID |
 | `OLA_DISCORD_ALLOWED_CHANNELS` | `--discord-allowed-channels` | — | comma-separated channel ID (optional) |
-| `OLA_DISCORD_CONTEXT_DIR` | `--context-dir` | `discord-context` | ที่เก็บไฟล์ context ราย DM/channel |
 | `OLA_DISCORD_API_BASE` | `--discord-api-base` | `https://discord.com/api/v10` | override สำหรับทดสอบกับ mock server |
 | — | `--discord-max-concurrent` | `4` | จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส |
 | — | `-o, --output` | `discordbot.log` | log ไฟล์แบบเต็ม เปิดแบบ append เสมอ |
 
-ตัวแปรที่เหลือทั้งหมด (`--persona`/`--persona-file`, `--knowledge-dir`, `--embed-model`/`--embed-top-k`/`--embed-min-score`/`--embed-refresh-interval`, `--context-keep-recent`/`--context-compact-after`, การเชื่อมต่อโมเดล, web search/fetch ทั้งชุด) **ใช้ร่วมกับ `ola telegrambot` ทุก flag ทุกพฤติกรรมเป๊ะๆ** — ดู [`ola telegrambot`](#ola-telegrambot) และ [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด)
+ตัวแปรที่เหลือทั้งหมด (`--persona`/`--persona-file`/`OLA_PERSONA`/`OLA_PERSONA_FILE`, `--knowledge-dir`/`OLA_KNOWLEDGE_DIR`, `--embed-model`/`OLA_EMBED_MODEL`/`--embed-top-k`/`--embed-min-score`/`--embed-refresh-interval`, `--context-dir`/`OLA_CONTEXT_DIR` (default ต่างกัน: `discord-context` ที่นี่ vs `telegram-context` ฝั่ง telegrambot ถ้าไม่ได้ตั้ง แต่**ตัวแปร env ตัวเดียวกัน** — ตั้ง `OLA_CONTEXT_DIR` แล้วสองบอทจะไปที่เดียวกันได้ถ้าต้องการ)/`--context-keep-recent`/`--context-compact-after`, การเชื่อมต่อโมเดล, web search/fetch ทั้งชุด) **ใช้ร่วมกับ `ola telegrambot` ทุก flag ทุกพฤติกรรมเป๊ะๆ** — ดู [`ola telegrambot`](#ola-telegrambot) และ [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด)
 
 ---
 

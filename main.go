@@ -9044,9 +9044,9 @@ func stripBotMention(text, botUsername string) string {
 
 // ─────────────────────────────────────────────────────────────────
 // Knowledge base: read-only document search over operator-configured
-// folders (--knowledge-dir/OLA_TELEGRAM_KNOWLEDGE_DIR) - deliberately
+// folders (--knowledge-dir/OLA_KNOWLEDGE_DIR) - deliberately
 // separate from read_file/search_files (sandboxed to the bot process's
-// own current directory, which has nothing to do with what a Telegram
+// own current directory, which has nothing to do with what a chat bot
 // user should be able to read) and with no write_knowledge/edit_knowledge
 // counterpart at all: the knowledge base is meant to be curated from
 // outside the bot, never mutated through it.
@@ -9071,7 +9071,7 @@ func (c knowledgeConfig) enabled() bool { return len(c.Roots) > 0 }
 func resolveKnowledgeDirs(flagVal string) []string {
 	raw := flagVal
 	if raw == "" {
-		raw = os.Getenv("OLA_TELEGRAM_KNOWLEDGE_DIR")
+		raw = os.Getenv("OLA_KNOWLEDGE_DIR")
 	}
 	if raw == "" {
 		return nil
@@ -9427,7 +9427,7 @@ const (
 
 func resolveEmbedConfig(model string, topK int, minScore float64, refreshSec int) embedConfig {
 	if model == "" {
-		model = os.Getenv("OLA_TELEGRAM_EMBED_MODEL")
+		model = os.Getenv("OLA_EMBED_MODEL")
 	}
 	if topK <= 0 {
 		topK = defaultEmbedTopK
@@ -9830,17 +9830,16 @@ func semanticSearchKnowledge(client *http.Client, embedHost, embedModel string, 
 
 // ─────────────────────────────────────────────────────────────────
 // Persona: purely additive, same principle as skills' "AVAILABLE SKILLS"
-// section (see buildSkillsPromptSection) - telegrambot keeps the same
-
+// section (see buildSkillsPromptSection) - both chat bots keep the same
 // "system prompt is fixed/built-in" rule the rest of ola follows (see the
 // package doc comment at the top of this file). --persona/--persona-file
 // can only ever APPEND tone/personality/operator instructions after the
 // fixed safety+tool-usage contract below; it cannot replace or weaken it.
 // ─────────────────────────────────────────────────────────────────
 
-func resolveTelegramPersona(personaFlag, personaFile string) (string, error) {
+func resolveChatBotPersona(personaFlag, personaFile string) (string, error) {
 	if personaFile == "" {
-		personaFile = os.Getenv("OLA_TELEGRAM_PERSONA_FILE")
+		personaFile = os.Getenv("OLA_PERSONA_FILE")
 	}
 	if personaFile != "" {
 		data, err := os.ReadFile(personaFile)
@@ -9851,7 +9850,7 @@ func resolveTelegramPersona(personaFlag, personaFile string) (string, error) {
 	}
 	persona := personaFlag
 	if persona == "" {
-		persona = os.Getenv("OLA_TELEGRAM_PERSONA")
+		persona = os.Getenv("OLA_PERSONA")
 	}
 	return strings.TrimSpace(persona), nil
 }
@@ -10643,12 +10642,12 @@ func telegramUsage(fs *flag.FlagSet) func() {
 		fmt.Println("                                    ส่ง /whoami คุยกับบอทเพื่อดู ID ของตัวเอง (ใช้ได้แม้ยังไม่อยู่ใน allowlist)")
 		fmt.Println()
 		fmt.Println("Persona (เติมต่อท้าย system prompt ที่ตายตัว - ไม่ใช่การ override):")
-		fmt.Println("  --persona <text>          OLA_TELEGRAM_PERSONA")
-		fmt.Println("  --persona-file <path>     OLA_TELEGRAM_PERSONA_FILE (ชนะ --persona ถ้าตั้งทั้งคู่)")
+		fmt.Println("  --persona <text>          OLA_PERSONA")
+		fmt.Println("  --persona-file <path>     OLA_PERSONA_FILE (ชนะ --persona ถ้าตั้งทั้งคู่)")
 		fmt.Println()
 		fmt.Println("Knowledge base (read-only document search):")
-		fmt.Println("  --knowledge-dir <dirs>    OLA_TELEGRAM_KNOWLEDGE_DIR   comma-separated directory (เหมือน --skills-dir)")
-		fmt.Println("  --embed-model <name>      OLA_TELEGRAM_EMBED_MODEL   Ollama embedding model (เช่น bge-m3) - เปิด semantic search")
+		fmt.Println("  --knowledge-dir <dirs>    OLA_KNOWLEDGE_DIR   comma-separated directory (เหมือน --skills-dir)")
+		fmt.Println("  --embed-model <name>      OLA_EMBED_MODEL   Ollama embedding model (เช่น bge-m3) - เปิด semantic search")
 		fmt.Println("                            fallback เมื่อ grep แบบ exact-match ไม่เจอ (--provider ollama เท่านั้น ในตอนนี้)")
 		fmt.Println("  --embed-top-k <n>         จำนวน chunk สูงสุดที่คืนจาก semantic search (default 5)")
 		fmt.Println("  --embed-min-score <f>     คะแนน cosine similarity ขั้นต่ำ (default 0.35 - ค่าตั้งต้น ควรปรับตามโมเดิลที่ใช้จริง)")
@@ -10656,7 +10655,7 @@ func telegramUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  index เก็บที่ <context-dir>/knowledge-index.json - embed ทุกไฟล์ทันทีตอนเริ่มทำงาน แล้ว refresh เป็นระยะ (เฉพาะไฟล์ที่เปลี่ยน)")
 		fmt.Println()
 		fmt.Println("Per-chat persistent context:")
-		fmt.Println("  --context-dir <dir>            OLA_TELEGRAM_CONTEXT_DIR   (default: telegram-context)")
+		fmt.Println("  --context-dir <dir>            OLA_CONTEXT_DIR   (default: telegram-context)")
 		fmt.Println("  --context-keep-recent <n>      เก็บกี่ turn ล่าสุดแบบเต็มหลัง compact (default 20)")
 		fmt.Println("  --context-compact-after <n>    compact เมื่อจำนวน turn เกินนี้ (default 40, ใช้ LLM สรุปจริง ไม่ใช่ label)")
 		fmt.Println()
@@ -10828,7 +10827,7 @@ func cmdTelegramBot(args []string) int {
 	}
 
 	if contextDir == "" {
-		contextDir = os.Getenv("OLA_TELEGRAM_CONTEXT_DIR")
+		contextDir = os.Getenv("OLA_CONTEXT_DIR")
 	}
 	if contextDir == "" {
 		contextDir = defaultTelegramContextDir
@@ -10859,7 +10858,7 @@ func cmdTelegramBot(args []string) int {
 		return 1
 	}
 
-	persona, err = resolveTelegramPersona(persona, personaFile)
+	persona, err = resolveChatBotPersona(persona, personaFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
@@ -11931,7 +11930,7 @@ func cmdDiscordBot(args []string) int {
 	ctxSize, _ := strconv.Atoi(ctxStr)
 
 	if contextDir == "" {
-		contextDir = os.Getenv("OLA_DISCORD_CONTEXT_DIR")
+		contextDir = os.Getenv("OLA_CONTEXT_DIR")
 	}
 	if contextDir == "" {
 		contextDir = defaultDiscordContextDir
@@ -11959,7 +11958,7 @@ func cmdDiscordBot(args []string) int {
 		return 1
 	}
 
-	persona, err = resolveTelegramPersona(persona, personaFile)
+	persona, err = resolveChatBotPersona(persona, personaFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
