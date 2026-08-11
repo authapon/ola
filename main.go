@@ -6054,14 +6054,39 @@ func commandBaseName(segment string) string {
 
 // findDisallowedAbsolutePath returns the first absolute path referenced in
 // cmd that is neither inside cwd nor on the allowedAbsolutePaths list, or
-// "" if none is found.
+// "" if none is found. Compares against both cwd as given and its
+// symlink-resolved form (and, if the candidate path itself already exists
+// on disk, its own resolved form too) - the two can legitimately differ
+// when the working directory is reached through a symlink (some /tmp
+// setups, some container/CI mounts), which would otherwise make a
+// perfectly legitimate same-directory absolute path - e.g. a model
+// re-deriving the full path to a binary it just built - look like it
+// points somewhere else entirely.
 func findDisallowedAbsolutePath(cmd, cwd string) string {
+	resolvedCwd, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		resolvedCwd = cwd
+	}
+	withinCwd := func(p string) bool {
+		if p == cwd || strings.HasPrefix(p, cwd+"/") {
+			return true
+		}
+		if resolvedCwd != cwd && (p == resolvedCwd || strings.HasPrefix(p, resolvedCwd+"/")) {
+			return true
+		}
+		if resolvedP, err := filepath.EvalSymlinks(p); err == nil {
+			if resolvedP == resolvedCwd || strings.HasPrefix(resolvedP, resolvedCwd+"/") {
+				return true
+			}
+		}
+		return false
+	}
 	for _, m := range absolutePathPattern.FindAllStringSubmatch(cmd, -1) {
 		p := m[1]
 		if p == "" || allowedAbsolutePaths[p] {
 			continue
 		}
-		if p == cwd || strings.HasPrefix(p, cwd+"/") {
+		if withinCwd(p) {
 			continue
 		}
 		return p
@@ -6114,7 +6139,7 @@ func validateCommand(cmd string) error {
 	cwd, err := os.Getwd()
 	if err == nil {
 		if abs := findDisallowedAbsolutePath(cmd, cwd); abs != "" {
-			return fmt.Errorf("run_command ปฏิเสธคำสั่งนี้: path แบบ absolute %q อยู่นอก working directory (%s) - run_command ทำงานได้เฉพาะใน current directory และไดเรกทอรีย่อยของมันเท่านั้น", abs, cwd)
+			return fmt.Errorf("run_command ปฏิเสธคำสั่งนี้: path แบบ absolute %q อยู่นอก working directory (%s) - run_command ทำงานได้เฉพาะใน current directory และไดเรกทอรีย่อยของมันเท่านั้น ถ้าต้องการรันไฟล์/binary ที่อยู่ในไดเรกทอรีปัจจุบัน (เช่น binary ที่เพิ่ง build เสร็จ) ให้ใช้ path แบบ relative แทน เช่น \"./%s\"", abs, cwd, filepath.Base(abs))
 		}
 	}
 

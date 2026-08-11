@@ -199,6 +199,94 @@ func TestValidateCommandRejectsAbsolutePathOutsideWorkingDirectory(t *testing.T)
 	}
 }
 
+// TestValidateCommandAllowsRunningJustBuiltBinary is the direct
+// regression test for "coding mode compiles a binary, then tries to run
+// it to verify it actually works, and the run gets rejected" - both the
+// natural relative form (the model just typing "./binary") and a full
+// absolute path reconstructed from cwd (something a model sometimes does
+// out of an abundance of caution) must both be allowed for a binary that
+// genuinely lives in the current directory.
+func TestValidateCommandAllowsRunningJustBuiltBinary(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	binPath := filepath.Join(dir, "mathcalc")
+	if err := os.WriteFile(binPath, []byte("#!/bin/sh\necho ok\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []string{
+		"./mathcalc",
+		"./mathcalc arg1 arg2",
+		"go build -o mathcalc . && ./mathcalc",
+		binPath, // full absolute path to a binary that's genuinely inside cwd
+		"cd " + dir + " && ./mathcalc",
+	}
+	for _, c := range cases {
+		if err := validateCommand(c); err != nil {
+			t.Fatalf("expected %q (a binary inside the working directory) to be allowed, got error: %v", c, err)
+		}
+	}
+}
+
+// TestValidateCommandAbsolutePathErrorSuggestsRelativeForm confirms the
+// rejection message itself teaches the model the fix (use "./name")
+// rather than just saying no - so a model that hits this once can
+// self-correct on the next tool call without needing a human to explain
+// it, per the actual failure mode of coding-mode verification getting
+// stuck here.
+func TestValidateCommandAbsolutePathErrorSuggestsRelativeForm(t *testing.T) {
+	dir := t.TempDir()
+	origWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWD)
+
+	err := validateCommand("/some/other/place/mathcalc")
+	if err == nil {
+		t.Fatal("expected an absolute path genuinely outside the working directory to still be rejected")
+	}
+	if !strings.Contains(err.Error(), "./mathcalc") {
+		t.Fatalf("expected the error to suggest the relative-path fix (\"./mathcalc\"), got: %v", err)
+	}
+}
+
+// TestFindDisallowedAbsolutePathToleratesSymlinkedCwd is the regression
+// test for the "working directory reached through a symlink" case: some
+// /tmp setups, container mounts, and CI environments have the directory
+// ola is actually running in be a symlink to somewhere else. Without
+// symlink-aware comparison, a perfectly legitimate absolute path inside
+// the (symlinked) working directory could be misjudged as pointing
+// outside it purely because of which of the two equivalent path spellings
+// happened to be used.
+func TestFindDisallowedAbsolutePathToleratesSymlinkedCwd(t *testing.T) {
+	realDir := t.TempDir()
+	parent := filepath.Dir(realDir)
+	linkPath := filepath.Join(parent, "symlinked-workdir")
+	if err := os.Symlink(realDir, linkPath); err != nil {
+		t.Skipf("symlinks not supported in this environment: %v", err)
+	}
+	defer os.Remove(linkPath)
+
+	if err := os.WriteFile(filepath.Join(realDir, "mathcalc"), []byte("x"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// cwd given as the symlink path, candidate path given as the resolved
+	// (real) path - or vice versa - must both be recognized as "inside".
+	if got := findDisallowedAbsolutePath(filepath.Join(realDir, "mathcalc"), linkPath); got != "" {
+		t.Fatalf("expected the real path to be recognized as inside the symlinked cwd, got disallowed: %q", got)
+	}
+	if got := findDisallowedAbsolutePath(filepath.Join(linkPath, "mathcalc"), realDir); got != "" {
+		t.Fatalf("expected the symlink path to be recognized as inside the real cwd, got disallowed: %q", got)
+	}
+}
+
 func TestIsVerifiableEditGatesByToolchainExtension(t *testing.T) {
 	cases := []struct {
 		path, label string
