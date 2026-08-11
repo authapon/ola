@@ -7408,6 +7408,30 @@ func TestBuildChatBotSystemPromptDifferentPlatformNames(t *testing.T) {
 	}
 }
 
+// TestBuildChatBotSystemPromptSearchesKnowledgeForEveryQuestion is the
+// regression test for a direct request to broaden search_knowledge usage:
+// the earlier rule only pushed the model to search for questions that
+// looked like specific facts (names, pets, places); this pins down that
+// the rule now reads as "every question", with only genuine non-question
+// small talk exempted, and confirms it applies identically to both
+// platforms since they share builtinChatBotSystemPromptRules.
+func TestBuildChatBotSystemPromptSearchesKnowledgeForEveryQuestion(t *testing.T) {
+	for _, platform := range []string{"Telegram", "Discord"} {
+		prompt := buildChatBotSystemPrompt(platform, "")
+		if !strings.Contains(prompt, "ทุกคำถามที่ผู้ใช้ถาม") {
+			t.Fatalf("[%s] expected the rule to require searching for every question, not just specific-fact questions", platform)
+		}
+		if !strings.Contains(prompt, "ก่อนจะตอบจากความรู้ทั่วไปของตัวเอง") {
+			t.Fatalf("[%s] expected the rule to explicitly say search before answering from general knowledge", platform)
+		}
+		// small talk that isn't really a question should still be exempt,
+		// so the bot isn't forced to search_knowledge on a bare "hello"
+		if !strings.Contains(prompt, "ไม่ใช่คำถามจริงๆ") {
+			t.Fatalf("[%s] expected an exemption for non-question small talk to still be present", platform)
+		}
+	}
+}
+
 // TestTelegramGroundToolResult is the regression test for the "answered a
 // search-flavored question with a fabricated-looking search transcript,
 // no real URL cited" bug report - see groundToolResult's own doc
