@@ -67,6 +67,35 @@ func TestValidateCommandAllowsOrdinaryBuildTestCommands(t *testing.T) {
 	}
 }
 
+// TestValidateCommandAllowsSlashAsMathOperatorNotPath is the exact
+// regression test for a real bug report: a quoted arithmetic expression
+// like "10 / 0" has a standalone "/" surrounded by spaces (the division
+// operator), which absolutePathPattern's old "*" quantifier happily
+// captured as the single-character "path" "/" and then rejected as
+// pointing outside the working directory - even though the command never
+// references the filesystem at all. A calculator/math-tool program is
+// exactly the kind of thing coding-mode's own auto-verify step would
+// legitimately try to run and check the output of.
+func TestValidateCommandAllowsSlashAsMathOperatorNotPath(t *testing.T) {
+	cases := []string{
+		`./math-tool "10 / 0"`,
+		`./math-tool "10 / 3"`,
+		`./math-tool "100 / 4 / 5"`,
+		`echo "1 / 2"`,
+	}
+	for _, c := range cases {
+		if err := validateCommand(c); err != nil {
+			t.Fatalf("expected %q (division operator, not a path) to be allowed, got error: %v", c, err)
+		}
+	}
+	// A bare "/" must still not swallow a REAL absolute path immediately
+	// following more text on the same line - this only exempts a truly
+	// standalone "/" with nothing attached to it.
+	if err := validateCommand("cat /etc/passwd"); err == nil {
+		t.Fatal("expected a genuine absolute path to still be rejected after this fix")
+	}
+}
+
 func TestValidateCommandRejectsEmpty(t *testing.T) {
 	if err := validateCommand("   "); err == nil {
 		t.Fatal("expected empty command to be rejected")

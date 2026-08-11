@@ -6025,9 +6025,22 @@ var parentTraversalPattern = regexp.MustCompile(`(^|[\s"'/])\.\.($|[\s"'/])`)
 // "host:/remote/path" in scp syntax), not a local filesystem path, and
 // treating every URL in a command as an out-of-scope absolute path would
 // make run_command unusable for anything that fetches a dependency or
-// clones a repo. Used by findDisallowedAbsolutePath to check each
+// clones a repo. Requires at least one character AFTER the "/" (`+`, not
+// `*`) so a bare, standalone "/" never counts as a path by itself - this
+// matters in practice: a model testing a calculator program with
+// './math-tool "10 / 0"' has the division operator "/" sitting between
+// two spaces, which a `*` quantifier would happily capture as the single-
+// character "path" "/" and then reject as pointing outside the working
+// directory, even though nothing in the command references the
+// filesystem at all. A real absolute path always has more after the
+// leading slash than nothing ("/etc/passwd", "/tmp/out" - never bare "/"
+// as a meaningful command argument on its own), so requiring at least one
+// more character closes this false-positive class without weakening the
+// actual protection: "rm -rf /" and friends are already unconditionally
+// blocked by the denylist based on the command name itself, independent
+// of this path check. Used by findDisallowedAbsolutePath to check each
 // remaining candidate against the working-directory-only rule.
-var absolutePathPattern = regexp.MustCompile(`(?:^|[\s"'=(])(/[^\s"'()|&;]*)`)
+var absolutePathPattern = regexp.MustCompile(`(?:^|[\s"'=(])(/[^\s"'()|&;]+)`)
 
 // allowedAbsolutePaths are absolute paths permitted despite the
 // working-directory-only rule, because they're standard I/O/redirection
