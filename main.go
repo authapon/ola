@@ -9092,6 +9092,24 @@ func stripBotMention(text, botUsername string) string {
 
 const knowledgeSearchLimit = 200
 
+// isHiddenDirName reports whether a directory name is hidden by the
+// universal dotfile convention (".git", ".obsidian", ".trash", etc.).
+// Used to skip directories while walking a knowledge base - deliberately
+// NOT the same skipDirNames source-code denylist toolSearchFiles/
+// buildDirectoryTree use for ask/coding's cwd scanning (node_modules,
+// .venv, bin, dist, build, out, vendor, target, ...). That list makes
+// sense for a source tree; it's actively wrong for a curated document
+// folder, where "build", "vendor", or "target" are far more likely to be
+// someone's real, meaningful subfolder name (a course's "final-project-
+// vendor-docs" folder, a "target-audience" curriculum track, etc.) than a
+// compiler output directory - silently hiding an entire subfolder of
+// legitimate documents with no warning at all is a much worse failure
+// mode here than in a codebase, where those directories are reliably
+// build artifacts nobody wants indexed anyway.
+func isHiddenDirName(name string) bool {
+	return strings.HasPrefix(name, ".")
+}
+
 // knowledgeConfig resolves each configured directory to an absolute path
 // and a short, stable "label" (used as the first path segment the model
 // sees and must echo back to read_knowledge) instead of ever exposing the
@@ -9245,7 +9263,7 @@ func knowledgeGrepSearch(pattern, query string, cfg knowledgeConfig) (matches []
 				return nil
 			}
 			if info.IsDir() {
-				if p != root && skipDirNames[info.Name()] {
+				if p != root && isHiddenDirName(info.Name()) {
 					return filepath.SkipDir
 				}
 				return nil
@@ -9766,7 +9784,7 @@ func buildKnowledgeIndex(client *http.Client, embedHost, embedModel string, cfg 
 				return nil
 			}
 			if info.IsDir() {
-				if p != root && skipDirNames[info.Name()] {
+				if p != root && isHiddenDirName(info.Name()) {
 					return filepath.SkipDir
 				}
 				return nil

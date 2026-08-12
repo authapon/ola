@@ -6876,6 +6876,80 @@ func TestTelegramMessageAddressesBotAndStripBotMention(t *testing.T) {
 	}
 }
 
+// TestKnowledgeGrepSearchRecursesIntoSubfolders confirms a direct
+// question: search_knowledge does walk arbitrarily deep into a knowledge
+// base's subdirectories (organizing course materials by year/department/
+// topic in nested folders works exactly as expected), and that the
+// returned path always includes the full subdirectory route back to the
+// configured root, not just the filename.
+func TestKnowledgeGrepSearchRecursesIntoSubfolders(t *testing.T) {
+	dir := t.TempDir()
+	nested := filepath.Join(dir, "2566", "engineering")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "curriculum.md"), []byte("หลักสูตรปี 2566"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, warnings := resolveKnowledgeConfig(dir)
+	if len(warnings) != 0 {
+		t.Fatalf("unexpected warnings: %v", warnings)
+	}
+	matches, _, _ := knowledgeGrepSearch("*", "", cfg)
+	if len(matches) != 1 || !strings.Contains(matches[0], filepath.ToSlash(filepath.Join("2566", "engineering", "curriculum.md"))) {
+		t.Fatalf("expected the nested file's full relative path to be returned, got: %v", matches)
+	}
+	// read_knowledge must accept that same nested path back
+	content, err := toolReadKnowledge(map[string]interface{}{"path": matches[0]}, cfg)
+	if err != nil {
+		t.Fatalf("toolReadKnowledge on the nested path failed: %v", err)
+	}
+	if !strings.Contains(content, "2566") {
+		t.Fatalf("unexpected content: %s", content)
+	}
+}
+
+// TestKnowledgeWalkOnlySkipsHiddenDirsNotBuildToolNames is the regression
+// test for a real gap found by inspection: the knowledge base walk used
+// to reuse skipDirNames - the source-code denylist ask/coding use to skip
+// node_modules/.venv/bin/dist/build/out/vendor/target while scanning a
+// project's own cwd. Applied to a document folder, that silently hid any
+// subfolder whose name happened to collide with one of those (e.g. a
+// course materials folder literally named "build" or "vendor-docs"),
+// with no warning at all. A knowledge base should only skip genuinely
+// hidden (dot-prefixed) directories, the same universal convention every
+// file browser and `ls` already honor.
+func TestKnowledgeWalkOnlySkipsHiddenDirsNotBuildToolNames(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"build", "bin", "dist", "vendor", "target", "out", "node_modules"} {
+		sub := filepath.Join(dir, name)
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(sub, "doc.md"), []byte("เนื้อหาในโฟลเดอร์ "+name), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hidden := filepath.Join(dir, ".git")
+	if err := os.MkdirAll(hidden, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hidden, "doc.md"), []byte("ไม่ควรถูกพบ"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, _ := resolveKnowledgeConfig(dir)
+	matches, _, _ := knowledgeGrepSearch("*", "", cfg)
+	if len(matches) != 7 {
+		t.Fatalf("expected all 7 non-hidden subfolders' files to be found, got %d: %v", len(matches), matches)
+	}
+	for _, m := range matches {
+		if strings.Contains(m, ".git") {
+			t.Fatalf("expected the hidden .git directory to still be skipped, got it in results: %v", matches)
+		}
+	}
+}
+
 func TestKnowledgeConfigSearchAndRead(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "lecture1.md"), []byte("Network Security บทที่ 1\nfirewall คือ..."), 0644); err != nil {
