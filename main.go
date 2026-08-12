@@ -8803,8 +8803,8 @@ func marshalDryRunPayload(provider llmProvider, req ollamaRequest) ([]byte, erro
 const defaultTelegramAPIBase = "https://api.telegram.org"
 const defaultTelegramPollTimeoutSec = 30
 const defaultTelegramContextDir = "telegram-context"
-const defaultTelegramKeepRecentTurns = 20
-const defaultTelegramCompactAfterTurns = 40
+const defaultChatBotKeepRecentTurns = 100
+const defaultChatBotCompactAfterTurns = 300
 const defaultTelegramMaxConcurrent = 4
 
 // telegramMaxMessageRunes stays a little under Telegram's hard 4096-UTF-16-
@@ -9478,7 +9478,7 @@ func (c embedConfig) enabled() bool { return c.Model != "" }
 const (
 	defaultEmbedTopK            = 5
 	defaultEmbedMinScore        = 0.35 // a starting point, not a validated constant - see README's own note on tuning this per embedding model
-	defaultEmbedRefreshInterval = 5 * time.Minute
+	defaultEmbedRefreshInterval = 1 * time.Minute
 )
 
 func resolveEmbedConfig(model string, topK int, minScore float64, refreshSec int) embedConfig {
@@ -9994,9 +9994,24 @@ func buildDiscordSystemPrompt(persona string) string {
 // ─────────────────────────────────────────────────────────────────
 
 type chatTurn struct {
-	Role    string    `json:"role"` // "user" or "assistant"
+	Role    string    `json:"role"`              // "user" or "assistant"
+	Speaker string    `json:"speaker,omitempty"` // sender's display name - group/channel conversations with multiple participants only; empty for DMs (one human speaker, attribution adds nothing) and always empty for assistant turns
 	Content string    `json:"content"`
 	Time    time.Time `json:"time"`
+}
+
+// formatChatTurnContent is the one place that decides how a turn's
+// speaker attribution (if any) gets woven into the text the model
+// actually sees, so buildMessages (replaying history) and
+// chatBotCore.recordAndRespond (the newly-arriving turn) never drift out
+// of sync on the format. A DM turn (speaker == "") passes through
+// unchanged - there's only ever one human in a DM, so a name adds
+// nothing and would just be noise.
+func formatChatTurnContent(speaker, content string) string {
+	if speaker == "" {
+		return content
+	}
+	return "[" + speaker + "] " + content
 }
 
 type chatContext struct {
@@ -10013,6 +10028,22 @@ func telegramContextKey(chat tgChat) string {
 		kind = "group"
 	}
 	return fmt.Sprintf("%s_%d", kind, chat.ID)
+}
+
+// telegramDisplayName picks the name a group-chat turn gets attributed to
+// (see chatTurn.Speaker) - prefers FirstName (what Telegram shows by
+// default in a client's chat UI, and set for essentially every real
+// account) over Username (many users never set one) over a last-resort
+// numeric fallback that should only ever show up for an edge case the
+// other two didn't cover.
+func telegramDisplayName(u tgUser) string {
+	if u.FirstName != "" {
+		return u.FirstName
+	}
+	if u.Username != "" {
+		return u.Username
+	}
+	return fmt.Sprintf("user_%d", u.ID)
 }
 
 func chatContextPath(dir, key string) string {
@@ -10071,7 +10102,7 @@ func (c *chatContext) buildMessages(systemPrompt string) []ollamaMessage {
 		msgs = append(msgs, ollamaMessage{Role: "system", Content: "[สรุปบทสนทนาก่อนหน้านี้]\n" + c.Summary})
 	}
 	for _, t := range c.Turns {
-		msgs = append(msgs, ollamaMessage{Role: t.Role, Content: t.Content})
+		msgs = append(msgs, ollamaMessage{Role: t.Role, Content: formatChatTurnContent(t.Speaker, t.Content)})
 	}
 	return msgs
 }
@@ -10086,17 +10117,21 @@ func shouldCompactChatContext(c *chatContext, compactAfter int) bool {
 // (coding's in-flight compaction) uses: compactMessages summarizes with a
 // cheap static label ("these tool names were called") because the real
 // state it drops is always independently recoverable via read_file/
-// PROGRESS.md. A Telegram conversation has no such backing store - the
-// content of what a user said IS the value being preserved - so this needs
+// PROGRESS.md. A chat conversation has no such backing store - the
+// content of what someone said IS the value being preserved - so this needs
 // an actual model call to compress meaning, not just list actions taken.
+// For a group/channel conversation with several speakers, the summarizer
+// is explicitly told to keep attributing who said what (see its own
+// system prompt below) rather than blending everyone into one voice.
 //
 // Reuses doChatRound (the same request/response plumbing "ask"/"coding"
 // use) rather than a hand-rolled HTTP call, so it works unmodified against
 // either provider (Ollama native or OpenAI-compatible). Passing "" for all
-// four color arguments plus telegrambot having set quietMode=true for the
-// whole process (see cmdTelegramBot) means this produces no terminal
-// output of its own - only the -o log file records it (via doChatRound's
-// own unconditional outFile writes, plus the two log lines below).
+// four color arguments plus both chat bots having set quietMode=true for
+// the whole process (see cmdTelegramBot/cmdDiscordBot) means this produces
+// no terminal output of its own - only the -o log file records it (via
+// doChatRound's own unconditional outFile writes, plus the two log lines
+// below).
 func compactChatContext(client *http.Client, pcfg providerConfig, ctxSize int, c *chatContext, keepRecent int, outFile *os.File) {
 	older := c.Turns[:len(c.Turns)-keepRecent]
 	recent := c.Turns[len(c.Turns)-keepRecent:]
@@ -10107,7 +10142,11 @@ func compactChatContext(client *http.Client, pcfg providerConfig, ctxSize int, c
 	}
 	sb.WriteString("บทสนทนาที่จะสรุปเพิ่ม:\n")
 	for _, t := range older {
-		sb.WriteString(t.Role + ": " + t.Content + "\n")
+		label := t.Role
+		if t.Speaker != "" {
+			label = t.Speaker
+		}
+		sb.WriteString(label + ": " + t.Content + "\n")
 	}
 
 	req := ollamaRequest{
@@ -10115,7 +10154,7 @@ func compactChatContext(client *http.Client, pcfg providerConfig, ctxSize int, c
 		Options: ollamaOptions{NumCtx: ctxSize},
 		Stream:  true,
 		Messages: []ollamaMessage{
-			{Role: "system", Content: "คุณคือระบบสรุปบทสนทนา สรุปบทสนทนาต่อไปนี้ให้กระชับเป็นภาษาไทย เก็บข้อเท็จจริง ความชอบ ข้อตกลง คำถามค้างคา และบริบทสำคัญที่ user เคยพูดไว้ให้ครบ ห้ามเพิ่มเติมสิ่งที่ไม่มีอยู่จริง ตอบเป็นเนื้อสรุปอย่างเดียว ไม่ต้องมีคำนำหรือคำลงท้าย"},
+			{Role: "system", Content: "คุณคือระบบสรุปบทสนทนา สรุปบทสนทนาต่อไปนี้ให้กระชับเป็นภาษาไทย เก็บข้อเท็จจริง ความชอบ ข้อตกลง คำถามค้างคา และบริบทสำคัญที่ user เคยพูดไว้ให้ครบ ห้ามเพิ่มเติมสิ่งที่ไม่มีอยู่จริง - ถ้าบทสนทนามีหลายคนพูด (มีชื่อคนกำกับแต่ละบรรทัดแทนคำว่า user) ให้ระบุไว้ในสรุปด้วยเสมอว่าใครพูดอะไร ห้ามรวมเป็นเสียงเดียวจนแยกไม่ออกว่าเป็นความเห็น/ข้อมูลของใคร ตอบเป็นเนื้อสรุปอย่างเดียว ไม่ต้องมีคำนำหรือคำลงท้าย"},
 			{Role: "user", Content: sb.String()},
 		},
 	}
@@ -10124,13 +10163,13 @@ func compactChatContext(client *http.Client, pcfg providerConfig, ctxSize int, c
 		// ล้มเหลว: ไม่ตัดบทสนทนาเก่าทิ้งโดยไม่มีสรุปทดแทน - ปล่อยให้ context
 		// โตต่อไปก่อน แล้วจะลองใหม่อีกครั้งในข้อความถัดไป (shouldCompactChatContext
 		// ยังเป็นจริงอยู่จนกว่าจะสำเร็จสักครั้ง)
-		fmt.Fprintf(outFile, "[telegram_compact] ล้มเหลว (status=%d, err=%v) - ข้าม compaction รอบนี้ ลองใหม่ข้อความถัดไป\n", statusCode, err)
+		fmt.Fprintf(outFile, "[chatbot_compact] ล้มเหลว (status=%d, err=%v) - ข้าม compaction รอบนี้ ลองใหม่ข้อความถัดไป\n", statusCode, err)
 		return
 	}
 	c.Summary = strings.TrimSpace(outcome.Content)
 	c.Turns = recent
 	c.Compactions++
-	fmt.Fprintf(outFile, "[telegram_compact] compact context สำเร็จ (ครั้งที่ %d, สรุป %d turn เก่า, เหลือ %d turn ล่าสุดแบบเต็ม)\n",
+	fmt.Fprintf(outFile, "[chatbot_compact] compact context สำเร็จ (ครั้งที่ %d, สรุป %d turn เก่า, เหลือ %d turn ล่าสุดแบบเต็ม)\n",
 		c.Compactions, len(older), len(recent))
 }
 
@@ -10255,10 +10294,91 @@ type chatBotCore struct {
 	compactAfter     int
 	ntfyTopic        string
 	outFile          *os.File
+
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
 }
 
 func (c *chatBotCore) logf(format string, a ...interface{}) {
 	fmt.Fprintf(c.outFile, format, a...)
+}
+
+// contextMutex returns the lock for a given context key (see
+// telegramContextKey/discordContextKey), creating it on first use.
+// Shared by telegramSession and discordSession so two rapid-fire messages
+// landing on the very same chat/channel/DM can never race on that
+// context file, regardless of which platform they arrived from - keyed
+// by the same string chatContext itself is keyed by, so the lock and the
+// file it protects can never drift out of sync.
+func (c *chatBotCore) contextMutex(key string) *sync.Mutex {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m, ok := c.locks[key]
+	if !ok {
+		m = &sync.Mutex{}
+		c.locks[key] = m
+	}
+	return m
+}
+
+// recordAndRespond is the shared heart of handling one incoming message
+// in a group/channel-capable chat bot, used by both telegramSession and
+// discordSession. It always loads the chat's persistent context and
+// records the incoming message as a new turn (attributed to speaker when
+// non-empty, i.e. a group/channel conversation with more than one human
+// participant) - this happens whether or not the bot was actually
+// addressed, so that when it IS mentioned later, it already has the
+// group's own back-and-forth as context, not just the messages that
+// happened to be directed at it. It only actually runs the tool-calling
+// loop and returns an answer when addressed is true; otherwise it saves
+// the recorded turn and returns immediately with no error and no answer.
+//
+// Callers own everything platform-specific: deriving speaker (a display
+// name, or "" for DMs), deciding addressed (mention/reply/prefix
+// detection), and actually sending the returned answer back out - this
+// function never touches the network for the reply itself, only for the
+// model call inside runChatToolLoop.
+func (c *chatBotCore) recordAndRespond(key, speaker, text string, addressed bool) (answer string, err error) {
+	cctx, err := loadChatContext(c.contextDir, key)
+	if err != nil {
+		return "", fmt.Errorf("โหลด context ไม่ได้: %v", err)
+	}
+
+	if shouldCompactChatContext(cctx, c.compactAfter) {
+		compactChatContext(c.client, c.pcfg, c.ctxSize, cctx, c.keepRecent, c.outFile)
+	}
+
+	userTurn := chatTurn{Role: "user", Speaker: speaker, Content: text, Time: time.Now()}
+
+	if !addressed {
+		cctx.Turns = append(cctx.Turns, userTurn)
+		cctx.LastActive = time.Now()
+		if err := cctx.save(c.contextDir); err != nil {
+			return "", fmt.Errorf("บันทึก context ไม่ได้: %v", err)
+		}
+		return "", nil
+	}
+
+	messages := cctx.buildMessages(c.systemPrompt)
+	messages = append(messages, ollamaMessage{Role: "user", Content: formatChatTurnContent(speaker, text)})
+
+	answer, err = c.runChatToolLoop(messages)
+	if err != nil {
+		return "", err
+	}
+
+	cctx.Turns = append(cctx.Turns,
+		userTurn,
+		chatTurn{Role: "assistant", Content: answer, Time: time.Now()},
+	)
+	cctx.LastActive = time.Now()
+	if err := cctx.save(c.contextDir); err != nil {
+		// Saving failed but the answer itself is still good - log it and
+		// let the caller send the reply anyway rather than throwing away a
+		// successful answer because of an unrelated disk-write problem.
+		c.logf("[chatbot_error] บันทึก context ไม่ได้: %v\n", err)
+	}
+	return answer, nil
 }
 
 type telegramSession struct {
@@ -10269,20 +10389,6 @@ type telegramSession struct {
 	botUsername    string
 	access         telegramAccessConfig
 	sem            chan struct{}
-
-	mu        sync.Mutex
-	chatLocks map[int64]*sync.Mutex
-}
-
-func (s *telegramSession) chatMutex(chatID int64) *sync.Mutex {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	m, ok := s.chatLocks[chatID]
-	if !ok {
-		m = &sync.Mutex{}
-		s.chatLocks[chatID] = m
-	}
-	return m
 }
 
 // groundToolResult prefixes a provenance marker onto a successful
@@ -10569,35 +10675,53 @@ func (c *chatBotCore) toolsStatusText() string {
 // serializes any two messages that land on the very same chat (so two
 // rapid-fire messages from one user can never race on that chat's context
 // file).
+// handleTelegramMessage processes exactly one incoming message end to
+// end. In a group, EVERY message from an allowed group gets recorded into
+// that group's persistent context (see chatBotCore.recordAndRespond) so
+// the bot already has the group's own back-and-forth as context whenever
+// it's later mentioned - but the tool-calling loop only actually runs,
+// and a reply only actually gets sent, when the message addresses the
+// bot (mention, reply, or /ola|/ask prefix - see
+// telegramMessageAddressesBot). A DM is always "addressed": there's no
+// other participant it could be talking to.
 func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 	s.sem <- struct{}{}
 	defer func() { <-s.sem }()
 
 	chat := msg.Chat
 	from := msg.From
-	text := strings.TrimSpace(msg.Text)
-	if text == "" {
-		return // no tool here can act on photos/stickers/etc. - nothing to do
+	rawText := strings.TrimSpace(msg.Text)
+	if rawText == "" {
+		return // no tool here can act on photos/stickers/etc. - nothing to record or act on
 	}
 
-	if chat.Type != "private" {
-		if !telegramMessageAddressesBot(msg, s.botUsername) {
-			return // group chat: only answer when clearly addressed at the bot
-		}
-		text = stripBotMention(text, s.botUsername)
-		if text == "" {
-			return
+	isGroup := chat.Type != "private"
+	addressed := true
+	text := rawText
+	if isGroup {
+		addressed = telegramMessageAddressesBot(msg, s.botUsername)
+		if addressed {
+			text = stripBotMention(rawText, s.botUsername)
+			if text == "" {
+				return // e.g. a message that's *just* the mention with nothing else - nothing to say or record
+			}
 		}
 	}
 
-	// /whoami and /start work regardless of allowlist status - the whole
-	// point is letting a not-yet-allowed person (or the operator, testing)
-	// discover the numeric ID to put in --telegram-allowed-users/-groups.
-	// This reveals nothing the person couldn't already get from Telegram
-	// itself (e.g. any of the many public @userinfobot-style bots).
-	if text == "/whoami" || text == "/start" {
+	// /whoami, /start, /tools only make sense as commands when the bot is
+	// actually being addressed - an ambient, unaddressed group message
+	// that happens to contain that exact text for some unrelated reason
+	// should just be recorded like any other message, not treated as a
+	// command aimed at the bot.
+	if addressed && (text == "/whoami" || text == "/start") {
+		// /whoami and /start work regardless of allowlist status - the
+		// whole point is letting a not-yet-allowed person (or the
+		// operator, testing) discover the numeric ID to put in
+		// --telegram-allowed-users/-groups. This reveals nothing the
+		// person couldn't already get from Telegram itself (e.g. any of
+		// the many public @userinfobot-style bots).
 		reply := fmt.Sprintf("User ID ของคุณ: %d", from.ID)
-		if chat.Type != "private" {
+		if isGroup {
 			reply += fmt.Sprintf("\nGroup Chat ID: %d", chat.ID)
 		}
 		_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID, reply)
@@ -10605,67 +10729,62 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 	}
 
 	if !s.access.allowed(chat, from) {
-		reply := fmt.Sprintf("คุณยังไม่ได้รับอนุญาตให้ใช้บอทนี้ ส่ง /whoami เพื่อดู ID แล้วแจ้งผู้ดูแลให้เพิ่มสิทธิ์\nUser ID: %d", from.ID)
-		if chat.Type != "private" {
-			reply += fmt.Sprintf("\nGroup Chat ID: %d", chat.ID)
+		if addressed {
+			reply := fmt.Sprintf("คุณยังไม่ได้รับอนุญาตให้ใช้บอทนี้ ส่ง /whoami เพื่อดู ID แล้วแจ้งผู้ดูแลให้เพิ่มสิทธิ์\nUser ID: %d", from.ID)
+			if isGroup {
+				reply += fmt.Sprintf("\nGroup Chat ID: %d", chat.ID)
+			}
+			_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID, reply)
+			s.logf("[telegram_denied] user=%d(%s) chat=%d(%s) type=%s\n", from.ID, from.Username, chat.ID, chat.Title, chat.Type)
 		}
-		_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID, reply)
-		s.logf("[telegram_denied] user=%d(%s) chat=%d(%s) type=%s\n", from.ID, from.Username, chat.ID, chat.Title, chat.Type)
-		return
+		return // not allowed: never record either way - the bot has no business remembering a group/user it isn't authorized for
 	}
 
-	// /tools is a live diagnostic, only for already-allowed chats (unlike
-	// /whoami, this reveals real server-side configuration - knowledge-base
-	// directory labels, which web backend is active). It exists because
-	// telegrambot runs unattended as a background daemon: when "the bot
-	// can't find X in the knowledge base" or "can't search the web" is
-	// reported, the fastest way to tell "not configured" apart from "was
-	// configured but the model just didn't call the tool" is checking this
-	// from inside the chat itself, without needing shell/log access to the
-	// host it's running on.
-	if text == "/tools" {
+	// /tools is a live diagnostic, only for already-allowed AND addressed
+	// chats (unlike /whoami, this reveals real server-side configuration -
+	// knowledge-base directory labels, which web backend is active). It
+	// exists because telegrambot runs unattended as a background daemon:
+	// when "the bot can't find X in the knowledge base" or "can't search
+	// the web" is reported, the fastest way to tell "not configured" apart
+	// from "was configured but the model just didn't call the tool" is
+	// checking this from inside the chat itself, without needing
+	// shell/log access to the host it's running on.
+	if addressed && text == "/tools" {
 		_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID, s.toolsStatusText())
 		return
 	}
 
-	lock := s.chatMutex(chat.ID)
+	key := telegramContextKey(chat)
+	lock := s.contextMutex(key)
 	lock.Lock()
 	defer lock.Unlock()
 
-	cctx, err := loadChatContext(s.contextDir, telegramContextKey(chat))
-	if err != nil {
-		s.logf("[telegram_error] โหลด context ไม่ได้: %v\n", err)
-		_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID, "ขออภัย เกิดข้อผิดพลาดในการโหลดบทสนทนา ลองใหม่อีกครั้ง")
-		return
+	speaker := ""
+	if isGroup {
+		speaker = telegramDisplayName(from)
 	}
 
-	if shouldCompactChatContext(cctx, s.compactAfter) {
-		compactChatContext(s.client, s.pcfg, s.ctxSize, cctx, s.keepRecent, s.outFile)
+	if addressed {
+		s.logf("\n=== chat=%d(%s) user=%d(%s) ===\n[user] %s\n", chat.ID, chat.Type, from.ID, from.Username, text)
+	} else {
+		s.logf("[telegram_record] chat=%d(%s) user=%d(%s): %s\n", chat.ID, chat.Type, from.ID, from.Username, text)
 	}
 
-	messages := cctx.buildMessages(s.systemPrompt)
-	messages = append(messages, ollamaMessage{Role: "user", Content: text})
-
-	s.logf("\n=== chat=%d(%s) user=%d(%s) ===\n[user] %s\n", chat.ID, chat.Type, from.ID, from.Username, text)
-	answer, err := s.runChatToolLoop(messages)
+	answer, err := s.recordAndRespond(key, speaker, text, addressed)
 	if err != nil {
 		s.logf("[telegram_error] chat=%d: %v\n", chat.ID, err)
-		if s.ntfyTopic != "" {
-			sendNotification(s.ntfyTopic, truncateWords(fmt.Sprintf("[telegrambot error] chat=%d: %v", chat.ID, err), maxNotificationWords))
+		if addressed {
+			if s.ntfyTopic != "" {
+				sendNotification(s.ntfyTopic, truncateWords(fmt.Sprintf("[telegrambot error] chat=%d: %v", chat.ID, err), maxNotificationWords))
+			}
+			_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID, "ขออภัย เกิดข้อผิดพลาดระหว่างประมวลผล ลองใหม่อีกครั้ง")
 		}
-		_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID, "ขออภัย เกิดข้อผิดพลาดระหว่างประมวลผล ลองใหม่อีกครั้ง")
 		return
 	}
-	s.logf("[assistant] %s\n", answer)
-
-	cctx.Turns = append(cctx.Turns,
-		chatTurn{Role: "user", Content: text, Time: time.Now()},
-		chatTurn{Role: "assistant", Content: answer, Time: time.Now()},
-	)
-	cctx.LastActive = time.Now()
-	if err := cctx.save(s.contextDir); err != nil {
-		s.logf("[telegram_error] บันทึก context ไม่ได้: %v\n", err)
+	if !addressed {
+		return // recorded silently for future context - nothing to send back
 	}
+	s.logf("[assistant] %s\n", answer)
 
 	if err := tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID, answer); err != nil {
 		s.logf("[telegram_error] ส่งข้อความกลับไม่ได้: %v\n", err)
@@ -10707,13 +10826,13 @@ func telegramUsage(fs *flag.FlagSet) func() {
 		fmt.Println("                            fallback เมื่อ grep แบบ exact-match ไม่เจอ (--provider ollama เท่านั้น ในตอนนี้)")
 		fmt.Println("  --embed-top-k <n>         จำนวน chunk สูงสุดที่คืนจาก semantic search (default 5)")
 		fmt.Println("  --embed-min-score <f>     คะแนน cosine similarity ขั้นต่ำ (default 0.35 - ค่าตั้งต้น ควรปรับตามโมเดิลที่ใช้จริง)")
-		fmt.Println("  --embed-refresh-interval <sec>  ความถี่ในการ walk ไฟล์หาการเปลี่ยนแปลง (default 300 = 5 นาที)")
+		fmt.Println("  --embed-refresh-interval <sec>  ความถี่ในการ walk ไฟล์หาการเปลี่ยนแปลง (default 60 = 1 นาที)")
 		fmt.Println("  index เก็บที่ <context-dir>/knowledge-index.json - embed ทุกไฟล์ทันทีตอนเริ่มทำงาน แล้ว refresh เป็นระยะ (เฉพาะไฟล์ที่เปลี่ยน)")
 		fmt.Println()
 		fmt.Println("Per-chat persistent context:")
 		fmt.Println("  --context-dir <dir>            OLA_CONTEXT_DIR   (default: telegram-context)")
-		fmt.Println("  --context-keep-recent <n>      เก็บกี่ turn ล่าสุดแบบเต็มหลัง compact (default 20)")
-		fmt.Println("  --context-compact-after <n>    compact เมื่อจำนวน turn เกินนี้ (default 40, ใช้ LLM สรุปจริง ไม่ใช่ label)")
+		fmt.Println("  --context-keep-recent <n>      เก็บกี่ turn ล่าสุดแบบเต็มหลัง compact (default 100)")
+		fmt.Println("  --context-compact-after <n>    compact เมื่อจำนวน turn เกินนี้ (default 300, ใช้ LLM สรุปจริง ไม่ใช่ label)")
 		fmt.Println()
 		fmt.Println("Web search/fetch (เหมือน 'ola ask -h' ทุกประการ - ดูรายละเอียดที่นั่น):")
 		fmt.Println("  --searxng-url, --ollama-search-key, --no-web-search,")
@@ -10889,10 +11008,10 @@ func cmdTelegramBot(args []string) int {
 		contextDir = defaultTelegramContextDir
 	}
 	if keepRecent <= 0 {
-		keepRecent = defaultTelegramKeepRecentTurns
+		keepRecent = defaultChatBotKeepRecentTurns
 	}
 	if compactAfter <= 0 {
-		compactAfter = defaultTelegramCompactAfterTurns
+		compactAfter = defaultChatBotCompactAfterTurns
 	}
 	if compactAfter <= keepRecent {
 		fmt.Fprintf(os.Stderr, "error: --context-compact-after (%d) ต้องมากกว่า --context-keep-recent (%d)\n", compactAfter, keepRecent)
@@ -11006,6 +11125,7 @@ func cmdTelegramBot(args []string) int {
 			compactAfter:     compactAfter,
 			ntfyTopic:        ntfyTopic,
 			outFile:          outFile,
+			locks:            map[string]*sync.Mutex{},
 		},
 		telegramClient: telegramClient,
 		apiBase:        telegramAPIBase,
@@ -11013,7 +11133,6 @@ func cmdTelegramBot(args []string) int {
 		botUsername:    me.Username,
 		access:         access,
 		sem:            make(chan struct{}, maxConcurrent),
-		chatLocks:      map[int64]*sync.Mutex{},
 	}
 
 	if embedCfg.enabled() {
@@ -11678,6 +11797,19 @@ func discordContextKey(msg *discordMessage) string {
 	return "discord_channel_" + msg.ChannelID
 }
 
+// discordDisplayName picks the name a channel turn gets attributed to
+// (see chatTurn.Speaker). Discord's per-server nickname isn't in the
+// discordUser struct this bot parses (would need an extra guild-member
+// lookup per message to fetch it), so this uses the account's global
+// Username - not as polished as a nickname, but stable and always
+// present for a real account.
+func discordDisplayName(u discordUser) string {
+	if u.Username != "" {
+		return u.Username
+	}
+	return "user_" + u.ID
+}
+
 // discordMessageAddressesBot mirrors telegramMessageAddressesBot's own
 // reasoning: a guild channel is a shared space other humans are also
 // talking in, not a 1:1 session the way a DM is - only answer when
@@ -11720,25 +11852,20 @@ type discordSession struct {
 	botUsername string
 	access      discordAccessConfig
 	sem         chan struct{}
-
-	mu        sync.Mutex
-	chanLocks map[string]*sync.Mutex
-}
-
-func (s *discordSession) chanMutex(key string) *sync.Mutex {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	m, ok := s.chanLocks[key]
-	if !ok {
-		m = &sync.Mutex{}
-		s.chanLocks[key] = m
-	}
-	return m
 }
 
 // toolsStatusText is inherited from chatBotCore - reused verbatim, see
 // that method's own doc comment.
 
+// handleDiscordMessage processes exactly one incoming message end to
+// end. In a guild channel, EVERY message from an allowed guild gets
+// recorded into that channel's persistent context (see
+// chatBotCore.recordAndRespond) so the bot already has the channel's own
+// back-and-forth as context whenever it's later mentioned - but the
+// tool-calling loop only actually runs, and a reply only actually gets
+// sent, when the message addresses the bot (mention, or !ola|!ask prefix
+// - see discordMessageAddressesBot). A DM is always "addressed": there's
+// no other participant it could be talking to.
 func (s *discordSession) handleDiscordMessage(msg *discordMessage) {
 	s.sem <- struct{}{}
 	defer func() { <-s.sem }()
@@ -11746,24 +11873,32 @@ func (s *discordSession) handleDiscordMessage(msg *discordMessage) {
 	if msg.Author.Bot || msg.Author.ID == s.botUserID {
 		return // never respond to bots (including itself) - avoids echo loops with other bots in the same server
 	}
-	text := strings.TrimSpace(msg.Content)
-	if text == "" {
+	rawText := strings.TrimSpace(msg.Content)
+	if rawText == "" {
 		return
 	}
 
-	if !msg.isDM() {
-		if !discordMessageAddressesBot(msg, s.botUserID) {
-			return // guild channel: only answer when clearly addressed
-		}
-		text = stripDiscordMention(text, s.botUserID)
-		if text == "" {
-			return
+	isGuild := !msg.isDM()
+	addressed := true
+	text := rawText
+	if isGuild {
+		addressed = discordMessageAddressesBot(msg, s.botUserID)
+		if addressed {
+			text = stripDiscordMention(rawText, s.botUserID)
+			if text == "" {
+				return // e.g. a message that's *just* the mention with nothing else - nothing to say or record
+			}
 		}
 	}
 
-	if text == "!whoami" || text == "!start" {
+	// !whoami, !start, !tools only make sense as commands when the bot is
+	// actually being addressed - an ambient, unaddressed channel message
+	// that happens to contain that exact text for some unrelated reason
+	// should just be recorded like any other message, not treated as a
+	// command aimed at the bot.
+	if addressed && (text == "!whoami" || text == "!start") {
 		reply := fmt.Sprintf("User ID ของคุณ: %s", msg.Author.ID)
-		if !msg.isDM() {
+		if isGuild {
 			reply += fmt.Sprintf("\nGuild ID: %s\nChannel ID: %s", msg.GuildID, msg.ChannelID)
 		}
 		_ = discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID, reply)
@@ -11771,59 +11906,53 @@ func (s *discordSession) handleDiscordMessage(msg *discordMessage) {
 	}
 
 	if !s.access.allowed(msg) {
-		reply := fmt.Sprintf("คุณยังไม่ได้รับอนุญาตให้ใช้บอทนี้ ส่ง !whoami เพื่อดู ID แล้วแจ้งผู้ดูแลให้เพิ่มสิทธิ์\nUser ID: %s", msg.Author.ID)
-		if !msg.isDM() {
-			reply += fmt.Sprintf("\nGuild ID: %s\nChannel ID: %s", msg.GuildID, msg.ChannelID)
+		if addressed {
+			reply := fmt.Sprintf("คุณยังไม่ได้รับอนุญาตให้ใช้บอทนี้ ส่ง !whoami เพื่อดู ID แล้วแจ้งผู้ดูแลให้เพิ่มสิทธิ์\nUser ID: %s", msg.Author.ID)
+			if isGuild {
+				reply += fmt.Sprintf("\nGuild ID: %s\nChannel ID: %s", msg.GuildID, msg.ChannelID)
+			}
+			_ = discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID, reply)
+			s.logf("[discord_denied] user=%s(%s) guild=%s channel=%s\n", msg.Author.ID, msg.Author.Username, msg.GuildID, msg.ChannelID)
 		}
-		_ = discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID, reply)
-		s.logf("[discord_denied] user=%s(%s) guild=%s channel=%s\n", msg.Author.ID, msg.Author.Username, msg.GuildID, msg.ChannelID)
-		return
+		return // not allowed: never record either way - the bot has no business remembering a guild/user it isn't authorized for
 	}
 
-	if text == "!tools" {
+	if addressed && text == "!tools" {
 		_ = discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID, s.toolsStatusText())
 		return
 	}
 
 	key := discordContextKey(msg)
-	lock := s.chanMutex(key)
+	lock := s.contextMutex(key)
 	lock.Lock()
 	defer lock.Unlock()
 
-	cctx, err := loadChatContext(s.contextDir, key)
-	if err != nil {
-		s.logf("[discord_error] โหลด context ไม่ได้: %v\n", err)
-		_ = discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID, "ขออภัย เกิดข้อผิดพลาดในการโหลดบทสนทนา ลองใหม่อีกครั้ง")
-		return
+	speaker := ""
+	if isGuild {
+		speaker = discordDisplayName(msg.Author)
 	}
 
-	if shouldCompactChatContext(cctx, s.compactAfter) {
-		compactChatContext(s.client, s.pcfg, s.ctxSize, cctx, s.keepRecent, s.outFile)
+	if addressed {
+		s.logf("\n=== discord key=%s user=%s(%s) ===\n[user] %s\n", key, msg.Author.ID, msg.Author.Username, text)
+	} else {
+		s.logf("[discord_record] key=%s user=%s(%s): %s\n", key, msg.Author.ID, msg.Author.Username, text)
 	}
 
-	messages := cctx.buildMessages(s.systemPrompt)
-	messages = append(messages, ollamaMessage{Role: "user", Content: text})
-
-	s.logf("\n=== discord key=%s user=%s(%s) ===\n[user] %s\n", key, msg.Author.ID, msg.Author.Username, text)
-	answer, err := s.runChatToolLoop(messages)
+	answer, err := s.recordAndRespond(key, speaker, text, addressed)
 	if err != nil {
 		s.logf("[discord_error] key=%s: %v\n", key, err)
-		if s.ntfyTopic != "" {
-			sendNotification(s.ntfyTopic, truncateWords(fmt.Sprintf("[discordbot error] key=%s: %v", key, err), maxNotificationWords))
+		if addressed {
+			if s.ntfyTopic != "" {
+				sendNotification(s.ntfyTopic, truncateWords(fmt.Sprintf("[discordbot error] key=%s: %v", key, err), maxNotificationWords))
+			}
+			_ = discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID, "ขออภัย เกิดข้อผิดพลาดระหว่างประมวลผล ลองใหม่อีกครั้ง")
 		}
-		_ = discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID, "ขออภัย เกิดข้อผิดพลาดระหว่างประมวลผล ลองใหม่อีกครั้ง")
 		return
 	}
-	s.logf("[assistant] %s\n", answer)
-
-	cctx.Turns = append(cctx.Turns,
-		chatTurn{Role: "user", Content: text, Time: time.Now()},
-		chatTurn{Role: "assistant", Content: answer, Time: time.Now()},
-	)
-	cctx.LastActive = time.Now()
-	if err := cctx.save(s.contextDir); err != nil {
-		s.logf("[discord_error] บันทึก context ไม่ได้: %v\n", err)
+	if !addressed {
+		return // recorded silently for future context - nothing to send back
 	}
+	s.logf("[assistant] %s\n", answer)
 
 	if err := discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID, answer); err != nil {
 		s.logf("[discord_error] ส่งข้อความกลับไม่ได้: %v\n", err)
@@ -11992,10 +12121,10 @@ func cmdDiscordBot(args []string) int {
 		contextDir = defaultDiscordContextDir
 	}
 	if keepRecent <= 0 {
-		keepRecent = defaultTelegramKeepRecentTurns
+		keepRecent = defaultChatBotKeepRecentTurns
 	}
 	if compactAfter <= 0 {
-		compactAfter = defaultTelegramCompactAfterTurns
+		compactAfter = defaultChatBotCompactAfterTurns
 	}
 	if compactAfter <= keepRecent {
 		fmt.Fprintf(os.Stderr, "error: --context-compact-after (%d) ต้องมากกว่า --context-keep-recent (%d)\n", compactAfter, keepRecent)
@@ -12106,6 +12235,7 @@ func cmdDiscordBot(args []string) int {
 			compactAfter:     compactAfter,
 			ntfyTopic:        ntfyTopic,
 			outFile:          outFile,
+			locks:            map[string]*sync.Mutex{},
 		},
 		restClient:  restClient,
 		apiBase:     discordAPIBaseResolved,
@@ -12114,7 +12244,6 @@ func cmdDiscordBot(args []string) int {
 		botUsername: me.Username,
 		access:      access,
 		sem:         make(chan struct{}, maxConcurrent),
-		chanLocks:   map[string]*sync.Mutex{},
 	}
 
 	if embedCfg.enabled() {

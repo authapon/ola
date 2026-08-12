@@ -7109,9 +7109,10 @@ func newTestTelegramSession(t *testing.T, telegramSrv, ollamaSrv *httptest.Serve
 			ctxSize:      4096,
 			contextDir:   contextDir,
 			knowledgeIdx: &knowledgeIndexStore{},
-			keepRecent:   defaultTelegramKeepRecentTurns,
-			compactAfter: defaultTelegramCompactAfterTurns,
+			keepRecent:   defaultChatBotKeepRecentTurns,
+			compactAfter: defaultChatBotCompactAfterTurns,
 			outFile:      logFile,
+			locks:        map[string]*sync.Mutex{},
 		},
 		telegramClient: telegramSrv.Client(),
 		apiBase:        telegramSrv.URL,
@@ -7119,7 +7120,6 @@ func newTestTelegramSession(t *testing.T, telegramSrv, ollamaSrv *httptest.Serve
 		botUsername:    "olabot",
 		access:         telegramAccessConfig{Users: users, Groups: map[int64]bool{}},
 		sem:            make(chan struct{}, 4),
-		chatLocks:      map[int64]*sync.Mutex{},
 	}
 }
 
@@ -8603,9 +8603,10 @@ func newTestDiscordSession(t *testing.T, discordSrv, ollamaSrv *httptest.Server,
 			ctxSize:      4096,
 			contextDir:   contextDir,
 			knowledgeIdx: &knowledgeIndexStore{},
-			keepRecent:   defaultTelegramKeepRecentTurns,
-			compactAfter: defaultTelegramCompactAfterTurns,
+			keepRecent:   defaultChatBotKeepRecentTurns,
+			compactAfter: defaultChatBotCompactAfterTurns,
 			outFile:      logFile,
+			locks:        map[string]*sync.Mutex{},
 		},
 		restClient:  discordSrv.Client(),
 		apiBase:     discordSrv.URL + "/api/v10",
@@ -8614,7 +8615,6 @@ func newTestDiscordSession(t *testing.T, discordSrv, ollamaSrv *httptest.Server,
 		botUsername: "olabot",
 		access:      discordAccessConfig{Users: users, Guilds: map[string]bool{}},
 		sem:         make(chan struct{}, 4),
-		chanLocks:   map[string]*sync.Mutex{},
 	}
 }
 
@@ -8775,5 +8775,218 @@ func TestHandleDiscordMessageToolsAndWhoamiCommands(t *testing.T) {
 	}
 	if !strings.Contains((*sent)[1].Content, "search_knowledge") {
 		t.Fatalf("expected !tools to show the shared status text, got: %s", (*sent)[1].Content)
+	}
+}
+
+// TestHandleTelegramMessageRecordsUnaddressedGroupMessageWithoutReplying
+// is the direct regression test for a specific request: group chat
+// members' conversation should be recorded into persistent context - with
+// speaker attribution - even for messages that never mention the bot, so
+// the bot already has that context whenever it IS later addressed. The
+// bot must still never call the model or reply for these.
+func TestHandleTelegramMessageRecordsUnaddressedGroupMessageWithoutReplying(t *testing.T) {
+	telegramSrv, sent := newMockTelegramSendMessageServer(t)
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&ollamaCalls, 1)
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	contextDir := t.TempDir()
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, contextDir, map[int64]bool{})
+	session.access.Groups = map[int64]bool{-999: true}
+
+	msg := &tgMessage{
+		From: tgUser{ID: 111, FirstName: "สมชาย", Username: "somchai"},
+		Chat: tgChat{ID: -999, Type: "group", Title: "ห้องเรียน"},
+		Text: "วันนี้อากาศดีจัง",
+	}
+	session.handleTelegramMessage(msg)
+
+	if atomic.LoadInt32(&ollamaCalls) != 0 {
+		t.Fatal("expected an unaddressed group message to never reach the model")
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("expected no reply to an unaddressed group message, got: %#v", *sent)
+	}
+
+	cctx, err := loadChatContext(contextDir, telegramContextKey(msg.Chat))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	if len(cctx.Turns) != 1 {
+		t.Fatalf("expected the unaddressed message to still be recorded as a turn, got %d turns", len(cctx.Turns))
+	}
+	if cctx.Turns[0].Speaker != "สมชาย" {
+		t.Fatalf("expected the turn to be attributed to the sender's display name, got speaker=%q", cctx.Turns[0].Speaker)
+	}
+	if cctx.Turns[0].Content != "วันนี้อากาศดีจัง" {
+		t.Fatalf("unexpected recorded content: %q", cctx.Turns[0].Content)
+	}
+	if cctx.Turns[0].Role != "user" {
+		t.Fatalf("expected role=user, got %q", cctx.Turns[0].Role)
+	}
+}
+
+// TestHandleTelegramMessageMentionedSeesPriorUnaddressedGroupHistory is the
+// end-to-end version: several group members chat without mentioning the
+// bot, then one of them @mentions it - the bot's actual request to the
+// model must include the earlier speakers' names and what they said, not
+// just the addressed message on its own.
+func TestHandleTelegramMessageMentionedSeesPriorUnaddressedGroupHistory(t *testing.T) {
+	telegramSrv, sent := newMockTelegramSendMessageServer(t)
+	var lastRequestBody string
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		lastRequestBody = string(body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("เข้าใจแล้วครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	contextDir := t.TempDir()
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, contextDir, map[int64]bool{})
+	session.access.Groups = map[int64]bool{-999: true}
+	session.botUsername = "olabot"
+	chat := tgChat{ID: -999, Type: "group", Title: "ห้องเรียน"}
+
+	session.handleTelegramMessage(&tgMessage{
+		From: tgUser{ID: 111, FirstName: "สมชาย"},
+		Chat: chat,
+		Text: "พรุ่งนี้มีสอบวิชาอะไรนะ",
+	})
+	session.handleTelegramMessage(&tgMessage{
+		From: tgUser{ID: 222, FirstName: "สมหญิง"},
+		Chat: chat,
+		Text: "วิชา Network Security ครับ",
+	})
+	session.handleTelegramMessage(&tgMessage{
+		From: tgUser{ID: 333, FirstName: "มานะ"},
+		Chat: chat,
+		Text: "@olabot ช่วยสรุปให้หน่อย",
+	})
+
+	if len(*sent) != 1 {
+		t.Fatalf("expected exactly 1 reply (only the mentioned message), got %d: %#v", len(*sent), *sent)
+	}
+	if !strings.Contains(lastRequestBody, "สมชาย") || !strings.Contains(lastRequestBody, "สมหญิง") {
+		t.Fatalf("expected the model request to include the earlier speakers' names, got: %s", lastRequestBody)
+	}
+	if !strings.Contains(lastRequestBody, "พรุ่งนี้มีสอบ") || !strings.Contains(lastRequestBody, "Network Security") {
+		t.Fatalf("expected the model request to include the earlier unaddressed messages' content, got: %s", lastRequestBody)
+	}
+
+	cctx, err := loadChatContext(contextDir, telegramContextKey(chat))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	// 2 unaddressed user turns + 1 addressed user turn + that turn's own assistant reply
+	if len(cctx.Turns) != 4 {
+		t.Fatalf("expected 4 turns recorded, got %d: %#v", len(cctx.Turns), cctx.Turns)
+	}
+	if cctx.Turns[0].Speaker != "สมชาย" || cctx.Turns[1].Speaker != "สมหญิง" {
+		t.Fatalf("expected the first two turns attributed to the unaddressed speakers in order, got: %#v", cctx.Turns[:2])
+	}
+	if cctx.Turns[3].Role != "assistant" || cctx.Turns[3].Speaker != "" {
+		t.Fatalf("expected the final turn to be the bot's own reply with no speaker, got: %#v", cctx.Turns[3])
+	}
+}
+
+// TestHandleDiscordMessageRecordsUnaddressedGuildMessageWithoutReplying is
+// the Discord counterpart of the Telegram test above - same behavior via
+// the shared chatBotCore.recordAndRespond.
+func TestHandleDiscordMessageRecordsUnaddressedGuildMessageWithoutReplying(t *testing.T) {
+	discordSrv, sent, _ := newMockDiscordRESTServer(t)
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&ollamaCalls, 1)
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	contextDir := t.TempDir()
+	session := newTestDiscordSession(t, discordSrv, ollamaSrv, contextDir, map[string]bool{})
+	session.access.Guilds = map[string]bool{"guild-1": true}
+
+	msg := &discordMessage{ID: "1", GuildID: "guild-1", ChannelID: "channel-1", Author: discordUser{ID: "111", Username: "somchai"}, Content: "สวัสดีทุกคน"}
+	session.handleDiscordMessage(msg)
+
+	if atomic.LoadInt32(&ollamaCalls) != 0 {
+		t.Fatal("expected an unaddressed guild message to never reach the model")
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("expected no reply, got: %#v", *sent)
+	}
+
+	cctx, err := loadChatContext(contextDir, discordContextKey(msg))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	if len(cctx.Turns) != 1 || cctx.Turns[0].Speaker != "somchai" || cctx.Turns[0].Content != "สวัสดีทุกคน" {
+		t.Fatalf("expected the unaddressed message recorded with speaker attribution, got: %#v", cctx.Turns)
+	}
+}
+
+// TestFormatChatTurnContentDMHasNoSpeakerPrefix confirms a DM turn
+// (speaker == "") is never prefixed - only group/channel turns with more
+// than one possible human speaker need attribution.
+func TestFormatChatTurnContentDMHasNoSpeakerPrefix(t *testing.T) {
+	if got := formatChatTurnContent("", "สวัสดี"); got != "สวัสดี" {
+		t.Fatalf("expected no prefix for an empty speaker, got: %q", got)
+	}
+	if got := formatChatTurnContent("สมชาย", "สวัสดี"); got != "[สมชาย] สวัสดี" {
+		t.Fatalf("expected speaker prefix, got: %q", got)
+	}
+}
+
+// TestCompactChatContextPreservesSpeakerAttribution confirms compaction's
+// own summarization input keeps who-said-what instead of collapsing
+// every group member into a generic "user:" label.
+func TestCompactChatContextPreservesSpeakerAttribution(t *testing.T) {
+	var lastRequestBody string
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		lastRequestBody = string(body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("สรุป: สมชายถามเรื่องสอบ สมหญิงตอบว่าเป็นวิชา Network Security", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	cctx := &chatContext{Key: "group_-999"}
+	for i := 0; i < 25; i++ {
+		cctx.Turns = append(cctx.Turns, chatTurn{Role: "user", Speaker: "สมชาย", Content: "ข้อความที่ " + fmt.Sprint(i)})
+	}
+	logFile, _ := os.CreateTemp(t.TempDir(), "log")
+	defer logFile.Close()
+
+	compactChatContext(ollamaSrv.Client(), providerConfig{Provider: providerOllama, Host: ollamaSrv.URL, Model: "mock"}, 4096, cctx, 5, logFile)
+
+	if !strings.Contains(lastRequestBody, "สมชาย:") {
+		t.Fatalf("expected the summarization request to attribute turns by speaker name, got: %s", lastRequestBody)
+	}
+	if len(cctx.Turns) != 5 {
+		t.Fatalf("expected 5 recent turns kept verbatim after compaction, got %d", len(cctx.Turns))
+	}
+}
+
+// TestChatBotDefaultsMatchRequestedValues pins down the three default
+// values explicitly requested: --context-compact-after=300,
+// --context-keep-recent=100, --embed-refresh-interval=1 minute.
+func TestChatBotDefaultsMatchRequestedValues(t *testing.T) {
+	if defaultChatBotCompactAfterTurns != 300 {
+		t.Fatalf("expected default compact-after to be 300, got %d", defaultChatBotCompactAfterTurns)
+	}
+	if defaultChatBotKeepRecentTurns != 100 {
+		t.Fatalf("expected default keep-recent to be 100, got %d", defaultChatBotKeepRecentTurns)
+	}
+	if defaultEmbedRefreshInterval != time.Minute {
+		t.Fatalf("expected default embed-refresh-interval to be 1 minute, got %v", defaultEmbedRefreshInterval)
 	}
 }

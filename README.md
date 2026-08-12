@@ -503,6 +503,10 @@ ola telegrambot \
 - ข้อความเป็นการ reply ต่อข้อความของบอทเอง
 - ข้อความขึ้นต้นด้วย `/ola` หรือ `/ask`
 
+**แต่บอทจะบันทึกทุกข้อความในกลุ่มลง context เสมอ แม้ข้อความนั้นจะไม่ได้ mention ถึงบอทก็ตาม** — เพื่อให้พอถูก mention เมื่อไหร่ บอทจะเข้าใจบริบทของบทสนทนาก่อนหน้าในกลุ่มด้วย (ไม่ใช่เห็นแค่ข้อความที่ mention มันตรงๆ) แต่ละข้อความที่บันทึกจะระบุชื่อผู้พูดกำกับไว้ด้วยเสมอ (ใช้ first name ของ Telegram หรือ username ของ Discord) เพื่อให้บอทแยกออกว่าใครพูดอะไรไว้บ้างเมื่อมีหลายคนคุยกัน — ข้อความที่บันทึกแต่ไม่ตอบจะขึ้น log เป็น `[telegram_record]`/`[discord_record]` (แยกจาก `[assistant]` ที่เป็นรอบที่ตอบจริง) ให้ตรวจสอบได้ว่าอะไรถูกบันทึกไปบ้าง
+
+ข้อควรรู้: กลุ่มที่ไม่อยู่ใน allowlist จะไม่ถูกบันทึกอะไรเลย (ไม่ว่าจะ mention บอทหรือไม่) — บอทไม่มีเหตุผลต้องจดจำบทสนทนาของกลุ่มที่ไม่ได้รับอนุญาตให้ใช้งานตั้งแต่แรก และ private chat (DM) ไม่มีการระบุชื่อผู้พูดกำกับ (มีคนเดียวคุยด้วยอยู่แล้ว การระบุชื่อไม่ได้เพิ่มข้อมูลอะไร)
+
 ### Persona — เติมต่อท้ายเท่านั้น ไม่ใช่ override
 
 หลักการ "system prompt คงที่ ไม่มี `-s/--system`" (ดู [ภาพรวมและปรัชญาการออกแบบ](#ภาพรวมและปรัชญาการออกแบบ)) ยังใช้กับ `telegrambot` เช่นกัน — `--persona`/`--persona-file` ถูกแทรกเข้าไป**ระหว่าง**ประโยคเปิดกับกติกาพื้นฐานของ system prompt ที่ตายตัว (ไม่ใช่ต่อท้ายทั้งหมด) เพื่อให้ชื่อ/บุคลิกที่กำหนดไว้มีน้ำหนักสูงสุดในสายตาโมเดิล — พบจากการทดสอบจริงว่าถ้า persona ถูกแปะไว้ท้ายสุด (หลังกติกายาวๆ) โมเดิลบางตัวมีแนวโน้มตอบชื่อแบบทั่วไป เช่น "ฉันชื่อบอท" แทนชื่อที่ตั้งไว้ กติกาความปลอดภัย/ขอบเขต tool ที่มีให้ ไม่สามารถถูกเปลี่ยนผ่าน persona ได้ไม่ว่าจะวางตำแหน่งไหน
@@ -513,7 +517,7 @@ ola telegrambot \
 
 แต่ละ private chat / group แยกไฟล์ context ของตัวเองไว้ที่ `--context-dir` (default: `telegram-context/`) เป็น JSON หนึ่งไฟล์ต่อหนึ่งแชท (`user_<id>.json` / `group_<id>.json`) เขียนแบบ atomic (`.tmp` แล้ว rename) ป้องกันไฟล์เสียหายถ้า process โดน kill กลางคัน
 
-เมื่อจำนวน turn ในแชทหนึ่งเกิน `--context-compact-after` (default 40) ola จะเรียกโมเดิลสรุปบทสนทนาที่เก่ากว่า `--context-keep-recent` (default 20) turn ล่าสุด เก็บเป็น "สรุปบทสนทนาก่อนหน้า" แทนที่ turn ดิบทั้งหมด — **นี่คือการสรุปเนื้อหาจริงด้วยโมเดล ไม่ใช่แค่ label เหมือนที่ `ola coding` ทำกับ context ของตัวเอง**เพราะบทสนทนาไม่มี state อื่นให้ recover เนื้อหาคืนได้แบบ `PROGRESS.md`/`read_file` ของ `ola coding`
+เมื่อจำนวน turn ในแชทหนึ่งเกิน `--context-compact-after` (default 300) ola จะเรียกโมเดิลสรุปบทสนทนาที่เก่ากว่า `--context-keep-recent` (default 100) turn ล่าสุด เก็บเป็น "สรุปบทสนทนาก่อนหน้า" แทนที่ turn ดิบทั้งหมด — **นี่คือการสรุปเนื้อหาจริงด้วยโมเดล ไม่ใช่แค่ label เหมือนที่ `ola coding` ทำกับ context ของตัวเอง**เพราะบทสนทนาไม่มี state อื่นให้ recover เนื้อหาคืนได้แบบ `PROGRESS.md`/`read_file` ของ `ola coding`
 
 ### สิ่งที่ยังไม่รองรับ (รู้ไว้ก่อน)
 
@@ -542,7 +546,7 @@ ola telegrambot \
 **สถาปัตยกรรมโดยย่อ:** ไม่มี vector database ภายนอก — ใช้ brute-force cosine similarity ในหน่วยความจำ (เร็วพอสำหรับฐานความรู้ขนาดหลักร้อยไฟล์) เรียก Ollama's native `/api/embed` โดยตรงผ่าน `net/http` (ไม่มี Go dependency ใหม่) แบ่งแต่ละไฟล์เป็น chunk ก่อน embed (ตัดตาม paragraph, chunk ที่ยาวเกินไปตัดซ้ำแบบ sliding window พร้อม overlap — ตัดแบบ rune-safe ไม่มีทางตัดกลางตัวอักษรไทยหลาย byte) ระบบจะ:
 
 1. **ตอนเริ่มทำงาน**: โหลด index เดิมจาก `<context-dir>/knowledge-index.json` (ถ้ามี) แล้ว **embed ทุกไฟล์ใหม่/ที่เปลี่ยนแปลงทันที** ก่อนเข้า loop รับข้อความ (ครั้งแรกที่ไม่มี index เดิม = embed ทั้งฐานความรู้ทันที)
-2. **ระหว่างรัน**: walk ไฟล์ใหม่เป็นระยะ (`--embed-refresh-interval`, default ทุก 5 นาที) เปรียบเทียบ hash เนื้อหาไฟล์กับที่ index ไว้ — ไฟล์ที่ไม่เปลี่ยนใช้ embedding เดิมจาก cache ไฟล์ใหม่/เปลี่ยนแปลงค่อย embed ใหม่เฉพาะไฟล์นั้น ไฟล์ที่ถูกลบจะหายไปจาก index ในรอบถัดไปด้วย
+2. **ระหว่างรัน**: walk ไฟล์ใหม่เป็นระยะ (`--embed-refresh-interval`, default ทุก 1 นาที) เปรียบเทียบ hash เนื้อหาไฟล์กับที่ index ไว้ — ไฟล์ที่ไม่เปลี่ยนใช้ embedding เดิมจาก cache ไฟล์ใหม่/เปลี่ยนแปลงค่อย embed ใหม่เฉพาะไฟล์นั้น ไฟล์ที่ถูกลบจะหายไปจาก index ในรอบถัดไปด้วย
 3. **ตอนค้น**: ถ้า grep ไม่เจอเลย embed query (1 ครั้ง) แล้วเทียบ cosine similarity กับทุก chunk ที่อยู่ในไฟล์ที่ `pattern` match (จำกัดเฉพาะไฟล์ที่ pattern เลือกไว้ เพื่อให้ pattern ยังมีความหมาย) คืน top-`--embed-top-k` ที่คะแนนเกิน `--embed-min-score`
 
 **ข้อจำกัดสำคัญ:**
@@ -576,10 +580,10 @@ ola telegrambot \
 | `OLA_EMBED_MODEL` | `--embed-model` | — | Ollama embedding model (เช่น `bge-m3`) เปิด semantic search fallback (`--provider ollama` เท่านั้น, ใช้ร่วมกับ `ola discordbot`) |
 | — | `--embed-top-k` | `5` | จำนวน chunk สูงสุดจาก semantic search |
 | — | `--embed-min-score` | `0.35` | คะแนน cosine similarity ขั้นต่ำ (ค่าตั้งต้น ควรปรับตามโมเดิลจริง) |
-| — | `--embed-refresh-interval` | `300` วินาที | ความถี่ walk ไฟล์หาการเปลี่ยนแปลง (index ที่ `<context-dir>/knowledge-index.json`) |
+| — | `--embed-refresh-interval` | `60` วินาที | ความถี่ walk ไฟล์หาการเปลี่ยนแปลง (index ที่ `<context-dir>/knowledge-index.json`) |
 | `OLA_CONTEXT_DIR` | `--context-dir` | `telegram-context` | ที่เก็บไฟล์ context ราย user/group (ตัวแปรเดียวกับ `ola discordbot` — ค่า default ต่างกันถ้าไม่ได้ตั้ง แต่ตั้ง `OLA_CONTEXT_DIR` แล้วทั้งสองบอทจะไปที่เดียวกัน ปลอดภัยเพราะ key ไม่ชนกัน) |
-| — | `--context-keep-recent` | `20` | จำนวน turn ล่าสุดที่เก็บแบบเต็มหลัง compact |
-| — | `--context-compact-after` | `40` | compact เมื่อจำนวน turn เกินนี้ (ต้องมากกว่า `--context-keep-recent`) |
+| — | `--context-keep-recent` | `100` | จำนวน turn ล่าสุดที่เก็บแบบเต็มหลัง compact |
+| — | `--context-compact-after` | `300` | compact เมื่อจำนวน turn เกินนี้ (ต้องมากกว่า `--context-keep-recent`) |
 | `OLA_TELEGRAM_API_BASE` | `--telegram-api-base` | `https://api.telegram.org` | override สำหรับทดสอบกับ mock server |
 | — | `--poll-timeout` | `30` | long-poll timeout วินาทีต่อ `getUpdates` |
 | — | `--telegram-max-concurrent` | `4` | จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส |
