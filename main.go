@@ -8801,7 +8801,7 @@ func marshalDryRunPayload(provider llmProvider, req ollamaRequest) ([]byte, erro
 // ─────────────────────────────────────────────────────────────────
 
 const defaultTelegramAPIBase = "https://api.telegram.org"
-const defaultTelegramPollTimeoutSec = 30
+const defaultTelegramPollTimeoutSec = 600
 const defaultTelegramContextDir = "telegram-context"
 const defaultChatBotKeepRecentTurns = 100
 const defaultChatBotCompactAfterTurns = 300
@@ -10842,7 +10842,7 @@ func telegramUsage(fs *flag.FlagSet) func() {
 		fmt.Println()
 		fmt.Println("Runtime:")
 		fmt.Println("  --telegram-api-base <url>   OLA_TELEGRAM_API_BASE (default: https://api.telegram.org - override สำหรับเทสต์)")
-		fmt.Println("  --poll-timeout <sec>        long-poll timeout ต่อ getUpdates (default 30)")
+		fmt.Println("  --poll-timeout <sec>        long-poll timeout ต่อ getUpdates (default 600 = 10 นาที)")
 		fmt.Println("  --telegram-max-concurrent <n>  จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส (default 4)")
 		fmt.Println("  -c/--ctx, -P/--provider, --api-base, -k/--key   เหมือน 'ola ask'")
 		fmt.Println("  -x/--topic     ntfy.sh topic (แจ้งเตือนเมื่อเกิด error ระหว่างประมวลผลข้อความ)")

@@ -525,6 +525,10 @@ ola telegrambot \
 - ไม่มี `ask_user` แบบ `ola ask` — ถ้าโมเดิลพยายามถามกลับ จะได้ error กลับไปเหมือนรันแบบ non-interactive (โมเดิลต้องตัดสินใจเองหรือถามในคำตอบปกติแทน เพราะทุกข้อความในแชทคือเทิร์นของบทสนทนาต่อเนื่องอยู่แล้ว)
 - ไม่มี per-user rate limit ละเอียด — มีแค่ mutex ต่อแชท (กันสองข้อความจากแชทเดียวกันแข่งกันเขียน context) และ `--telegram-max-concurrent` (จำกัดจำนวนข้อความที่ประมวลผลพร้อมกันทั้งโปรเซส)
 
+### เรื่อง `--poll-timeout` ค่าสูงๆ (default 600 วินาที)
+
+`getUpdates` ของ Telegram ไม่มีเอกสารระบุค่าสูงสุดของ `timeout` อย่างเป็นทางการ (แค่บอกว่า "ควรเป็นค่าบวก") ในทางปฏิบัติมีรายงานผลไม่ตรงกัน — บางคนใช้ 300 วินาทีได้ปกติ บางคนเจอ connection ถูกตัดกลับมาเร็วกว่าที่ตั้งไว้มาก (เช่น ที่ ~50 วินาที) ซึ่งน่าจะมาจากตัวกลาง (proxy/load balancer) ระหว่างทางมากกว่าตัว Telegram API เอง ไม่ใช่ข้อจำกัดที่ตายตัว — ผลข้างเคียงถ้า connection ถูกตัดกลางคันไม่ใช่ปัญหาร้ายแรงอะไร (`buildTelegramHTTPClients` ตั้ง client-side timeout ไว้ที่ `--poll-timeout + 15` วินาทีเสมอ พอ read ล้มเหลวหรือ timeout ก็แค่วนลอง `getUpdates` ใหม่รอบถัดไปตามปกติ) แต่ถ้าสังเกตว่าบอทตอบช้ากว่าที่ควรหรือ log มี error จาก `getUpdates` บ่อยผิดปกติ ลองลดค่านี้ลงมาที่ 60-300 วินาทีดูก่อน
+
 ### ถ้าเจอ "context deadline exceeded" ตลอด
 
 ถ้า log ขึ้น `Post "http://127.0.0.1:11434/api/chat": context deadline exceeded (Client.Timeout exceeded while awaiting headers)` ทุกข้อความแม้แต่ทักทายธรรมดา — เวอร์ชันก่อนหน้ามีบั๊กที่ client เรียก Ollama/OpenAI ใช้ timeout สั้นแบบเดียวกับที่เรียก Telegram API (30 วินาที) ทำให้โมเดิลขนาดใหญ่ (เช่น 35B) ที่ตอบช้ากว่า 30 วินาทีบนเครื่องที่ไม่แรงพอ **ล้มเหลวทุกครั้ง** ไม่ว่าจะตั้ง `--poll-timeout` เท่าไหร่ก็ตาม (`--poll-timeout` มีผลแค่กับ `getUpdates` เท่านั้น ไม่เกี่ยวกับการเรียกโมเดิล) — แก้แล้วในเวอร์ชันนี้ด้วยการแยก HTTP client ของการเรียกโมเดิลออกจาก Telegram API โดยเด็ดขาด (ไม่มี timeout เลย เหมือนที่ `ask`/`coding` ใช้ ตรงกับที่โมเดิลใหญ่อาจต้องใช้เวลานานในการตอบจริง)
@@ -585,7 +589,7 @@ ola telegrambot \
 | — | `--context-keep-recent` | `100` | จำนวน turn ล่าสุดที่เก็บแบบเต็มหลัง compact |
 | — | `--context-compact-after` | `300` | compact เมื่อจำนวน turn เกินนี้ (ต้องมากกว่า `--context-keep-recent`) |
 | `OLA_TELEGRAM_API_BASE` | `--telegram-api-base` | `https://api.telegram.org` | override สำหรับทดสอบกับ mock server |
-| — | `--poll-timeout` | `30` | long-poll timeout วินาทีต่อ `getUpdates` |
+| — | `--poll-timeout` | `600` | long-poll timeout วินาทีต่อ `getUpdates` (10 นาที — ดูหมายเหตุด้านล่างเรื่องขีดจำกัดฝั่ง Telegram) |
 | — | `--telegram-max-concurrent` | `4` | จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส |
 | — | `-o, --output` | `telegrambot.log` | log ไฟล์แบบเต็ม เปิดแบบ **append เสมอ** (ต่างจาก `ask`/`coding` ที่ overwrite เป็น default — `telegrambot` เป็น process เดียวรันยาวข้าม restart) |
 

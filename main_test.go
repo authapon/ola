@@ -8989,4 +8989,7 @@ func TestChatBotDefaultsMatchRequestedValues(t *testing.T) {
 	if defaultEmbedRefreshInterval != time.Minute {
 		t.Fatalf("expected default embed-refresh-interval to be 1 minute, got %v", defaultEmbedRefreshInterval)
 	}
+	if defaultTelegramPollTimeoutSec != 600 {
+		t.Fatalf("expected default poll-timeout to be 600, got %d", defaultTelegramPollTimeoutSec)
+	}
 }
