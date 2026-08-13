@@ -198,6 +198,7 @@ import (
 	"flag"
 	"fmt"
 	"html"
+	"html/template"
 	"io"
 	"io/fs"
 	"math"
@@ -13381,30 +13382,40 @@ func cmdLineBot(args []string) int {
 //     explicitly told to), and an optional shared --webbot-token gates
 //     every request behind a simple bearer-style check (constant-time
 //     compared - see requireToken).
-//  2. NO PERSISTENT CONTEXT, BY DESIGN (explicitly requested this way,
-//     not a limitation). Each browser session gets a chatContext that
-//     lives ONLY in memory for the lifetime of that session - .save() is
-//     never called anywhere in this section. Closing the tab or
-//     restarting the process both simply lose that conversation, which is
-//     the intended behavior here (contrast with telegrambot/discordbot/
-//     linebot, where losing history on restart would be a bug). Idle
-//     sessions are still swept periodically (see cleanupIdleSessions) so
-//     memory doesn't grow unbounded if tabs are left open indefinitely.
+//  2. NO PERSISTENT CHAT CONTEXT, BY DESIGN (explicitly requested this
+//     way, not a limitation). Each browser session gets a chatContext
+//     that lives ONLY in memory for the lifetime of that session -
+//     .save() is never called on it anywhere in this section. Closing
+//     the tab or restarting the process both simply lose that
+//     conversation, which is the intended behavior here (contrast with
+//     telegrambot/discordbot/linebot, where losing history on restart
+//     would be a bug). Idle sessions are still swept periodically (see
+//     cleanupIdleSessions) so memory doesn't grow unbounded if tabs are
+//     left open indefinitely. The one thing that DOES get a durable
+//     --context-dir cache, same as the other three bots, is the
+//     knowledge embedding index (see cmdWebBot's own embedCfg.enabled()
+//     block) - rebuilding that from scratch on every restart would be
+//     real, avoidable cost for a knowledge base of any size, unlike a
+//     lost chat session which costs nothing to just start over.
 //
-// The frontend is a single embedded HTML/CSS/JS page (see
-// webBotChatHTML) - no build step, no external JS framework, matching
-// the rest of this project's "one binary, nothing to install" philosophy
-// on the frontend side too. Kept as a Go string constant (not a
-// go:embed'd separate file) specifically so it stays inside main.go
-// rather than becoming an unavoidable exception to the project's
-// single-file convention the way platform_linux.go/platform_other.go are
-// (those two are split for a real technical reason - a build-tag file
-// must contain ONLY the tagged code; nothing forces the HTML out of
-// main.go the same way).
+// The frontend is a single embedded HTML/CSS/JS page, pre-rendered once
+// at startup from webBotChatHTMLTemplate with the operator's chosen
+// title/avatar (--webbot-title/--webbot-avatar) baked in via
+// html/template (see webBotPageData) - no build step, no external JS
+// framework, matching the rest of this project's "one binary, nothing to
+// install" philosophy on the frontend side too. Kept as a Go string
+// constant (not a go:embed'd separate file) specifically so it stays
+// inside main.go rather than becoming an unavoidable exception to the
+// project's single-file convention the way platform_linux.go/
+// platform_other.go are (those two are split for a real technical reason
+// - a build-tag file must contain ONLY the tagged code; nothing forces
+// the HTML out of main.go the same way).
 // ─────────────────────────────────────────────────────────────────
 
 const defaultWebBotListenAddr = "127.0.0.1:8090"
 const defaultWebBotSessionTTL = 2 * time.Hour
+const defaultWebBotContextDir = "webbot-context"
+const defaultWebBotTitle = "ola webbot"
 
 // webBotGreetingPrompt is never shown to the user - it's the synthetic
 // first "turn" that makes the bot introduce itself before any real
@@ -13430,7 +13441,8 @@ const webBotFallbackGreeting = "สวัสดีครับ มีอะไ�
 
 type webBotSession struct {
 	chatBotCore
-	token string
+	token        string
+	renderedHTML []byte // the chat page, pre-rendered once at startup with title/avatar baked in - see cmdWebBot's template execution
 
 	sessMu   sync.Mutex
 	sessions map[string]*chatContext
@@ -13448,6 +13460,40 @@ func newWebBotSessionID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// resolveWebBotAvatar turns --webbot-avatar/OLA_WEBBOT_AVATAR into
+// something usable directly as an <img src="..."> value:
+//
+//   - "" (not set) -> "", "" (no avatar - the header/message avatar
+//     markup simply doesn't render at all, see webBotChatHTMLTemplate)
+//   - an http(s):// or data: URL -> used exactly as given (the operator
+//     is already pointing at an image somewhere; ola doesn't need to
+//     touch it)
+//   - anything else -> treated as a local file path, read once at
+//     startup and baked into the page as a data: URI (base64-encoded)
+//     rather than served through a separate endpoint. This keeps the
+//     page fully self-contained (matches the "no build step, nothing
+//     else to deploy" frontend philosophy the rest of webbot follows)
+//     at the cost of needing a restart to pick up a changed avatar file
+//   - the same tradeoff --webbot-title already has, so it's
+//     consistent rather than a new kind of limitation.
+func resolveWebBotAvatar(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") || strings.HasPrefix(raw, "data:") {
+		return raw, nil
+	}
+	data, err := os.ReadFile(raw)
+	if err != nil {
+		return "", fmt.Errorf("อ่านไฟล์ avatar %s ไม่ได้: %v", raw, err)
+	}
+	contentType := http.DetectContentType(data)
+	if !strings.HasPrefix(contentType, "image/") {
+		return "", fmt.Errorf("ไฟล์ avatar %s ดูไม่เหมือนไฟล์รูปภาพ (ตรวจพบชนิดไฟล์: %s) - ต้องเป็นไฟล์รูปภาพ (PNG/JPEG/GIF/WebP) หรือ URL ที่ขึ้นต้นด้วย http(s):// ", raw, contentType)
+	}
+	return "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(data), nil
 }
 
 // createSession makes a brand-new, empty, in-memory-only chatContext -
@@ -13562,7 +13608,7 @@ func (s *webBotSession) requireToken(next http.HandlerFunc) http.HandlerFunc {
 
 func (s *webBotSession) indexHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write([]byte(webBotChatHTML))
+	_, _ = w.Write(s.renderedHTML)
 }
 
 type webBotSessionResponse struct {
@@ -13700,12 +13746,40 @@ func (s *webBotSession) chatHandler(w http.ResponseWriter, r *http.Request) {
 // early.
 // ─────────────────────────────────────────────────────────────────
 
-const webBotChatHTML = `<!DOCTYPE html>
+// webBotPageData is executed against webBotChatHTMLTemplate once at
+// startup (see cmdWebBot) - title/avatar are operator-configured (CLI
+// flag/env), never end-user input, but this still goes through
+// html/template's normal contextual auto-escaping rather than raw string
+// substitution, both as good hygiene and because it's genuinely needed
+// here: the exact same value is used in two different contexts in one
+// template (an HTML attribute AND a JS string literal - see OLA_AVATAR
+// below), and those two contexts escape unsafe characters differently.
+type webBotPageData struct {
+	Title string
+	// Avatar is template.URL, not a plain string, deliberately -
+	// html/template's default URL-context escaper only allows a small
+	// scheme allowlist (http/https/mailto/...) through and replaces
+	// anything else, INCLUDING a data: URI, with an inert "#ZgotmplZ"
+	// placeholder - confirmed by hitting exactly that placeholder in
+	// testing before this type was added. template.URL tells the escaper
+	// "this value was already produced safely by our own code (see
+	// resolveWebBotAvatar - either operator-supplied http(s) URL or bytes
+	// we base64-encoded ourselves), trust the scheme" while it still
+	// applies per-context character escaping on top (confirmed empirically
+	// too: an adversarial value with an embedded '"' still gets that quote
+	// escaped rather than breaking out of the src="..." attribute or the
+	// JS string literal it's also used in - see OLA_AVATAR in the
+	// template). "" (no avatar configured) still controls truthiness in
+	// {{if .Avatar}} the same way it would as a plain string.
+	Avatar template.URL
+}
+
+const webBotChatHTMLTemplate = `<!DOCTYPE html>
 <html lang="th">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ola webbot</title>
+<title>{{.Title}}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Playpen+Sans+Thai:wght@100..800&display=swap" rel="stylesheet">
@@ -13829,11 +13903,24 @@ const webBotChatHTML = `<!DOCTYPE html>
   #chat::-webkit-scrollbar { width: 10px; }
   #chat::-webkit-scrollbar-track { background: var(--bg0); }
   #chat::-webkit-scrollbar-thumb { background: var(--bg2); border-radius: 6px; }
+  .header-avatar {
+    width: 28px; height: 28px; border-radius: 50%;
+    vertical-align: middle; margin-right: 8px;
+    object-fit: cover; border: 1px solid var(--bg3);
+  }
+  .msg.assistant.has-avatar {
+    display: flex; align-items: flex-start; gap: 8px;
+  }
+  .msg-avatar {
+    width: 26px; height: 26px; border-radius: 50%; flex-shrink: 0;
+    object-fit: cover; border: 1px solid var(--bg3); margin-top: 2px;
+  }
+  .msg-text { white-space: pre-wrap; word-wrap: break-word; }
 </style>
 </head>
 <body>
   <header>
-    <h1>ola webbot</h1>
+    <h1>{{if .Avatar}}<img class="header-avatar" src="{{.Avatar}}" alt="">{{end}}{{.Title}}</h1>
     <span class="status" id="status">กำลังเชื่อมต่อ...</span>
   </header>
   <div id="chat"></div>
@@ -13842,6 +13929,9 @@ const webBotChatHTML = `<!DOCTYPE html>
     <button id="send" disabled>ส่ง</button>
   </div>
 
+<script>
+var OLA_AVATAR = "{{.Avatar}}";
+</script>
 <script>
 (function() {
   var chatEl = document.getElementById('chat');
@@ -13853,7 +13943,20 @@ const webBotChatHTML = `<!DOCTYPE html>
   function addMessage(role, text) {
     var div = document.createElement('div');
     div.className = 'msg ' + role;
-    div.textContent = text;
+    if (role === 'assistant' && OLA_AVATAR) {
+      div.className += ' has-avatar';
+      var img = document.createElement('img');
+      img.className = 'msg-avatar';
+      img.src = OLA_AVATAR;
+      img.alt = '';
+      div.appendChild(img);
+      var span = document.createElement('span');
+      span.className = 'msg-text';
+      span.textContent = text;
+      div.appendChild(span);
+    } else {
+      div.textContent = text;
+    }
     chatEl.appendChild(div);
     chatEl.scrollTop = chatEl.scrollHeight;
     return div;
@@ -13951,7 +14054,8 @@ func webBotUsage(fs *flag.FlagSet) func() {
 		fmt.Println("    แนะนำให้ตั้ง OLA_WEBBOT_TOKEN ไว้เสมอถ้าจะเปิดให้เข้าถึงได้กว้างกว่านั้น")
 		fmt.Println()
 		fmt.Println("⚠️  ไม่เก็บบทสนทนาลงดิสก์เลย (ตั้งใจออกแบบแบบนี้) - แต่ละ browser session อยู่ในหน่วยความจำ")
-		fmt.Println("    เท่านั้น ปิดแท็บ/รีสตาร์ท process แล้วบทสนทนานั้นหายไปเลย")
+		fmt.Println("    เท่านั้น ปิดแท็บ/รีสตาร์ท process แล้วบทสนทนานั้นหายไปเลย (แต่ knowledge embedding index")
+		fmt.Println("    ถ้าเปิด --embed-model ไว้ จะ cache ลง --context-dir เหมือน telegrambot/discordbot/linebot)")
 		fmt.Println()
 		fmt.Println("Required:")
 		fmt.Println("  -m/--model หรือ OLA_OLLAMA_MODEL")
@@ -13960,10 +14064,17 @@ func webBotUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  OLA_WEBBOT_TOKEN            (env เท่านั้น) - ถ้าตั้งไว้ ต้องเข้าผ่าน URL ที่มี ?token=...")
 		fmt.Println("                               ครั้งแรก (ตั้ง cookie ให้เองหลังจากนั้น) ไม่ตั้งไว้ = ไม่มีการตรวจสอบใดๆ")
 		fmt.Println()
+		fmt.Println("หน้าตา:")
+		fmt.Println("  --webbot-title <text>    OLA_WEBBOT_TITLE    ชื่อที่แสดงใน <title> และหัวหน้าเว็บ (default: ola webbot)")
+		fmt.Println("  --webbot-avatar <src>    OLA_WEBBOT_AVATAR   URL (http(s)://... หรือ data:...) หรือ path ไฟล์รูปภาพในเครื่อง")
+		fmt.Println("                           (ถ้าเป็น path ไฟล์ ola จะอ่านแล้วฝังเป็น data: URI ไว้ในหน้าเว็บให้เอง ไม่ต้อง")
+		fmt.Println("                           เสิร์ฟแยก - เปลี่ยนไฟล์แล้วต้อง restart ถึงจะเห็นรูปใหม่)")
+		fmt.Println()
 		fmt.Println("Persona/Knowledge base/Web search: เหมือน 'ola telegrambot' ทุก flag ทุกพฤติกรรม - ดู 'ola telegrambot -h'")
 		fmt.Println("  --persona, --persona-file, --knowledge-dir, --embed-model, --embed-top-k, --embed-min-score,")
-		fmt.Println("  --embed-refresh-interval, --context-keep-recent, --context-compact-after (compact ในหน่วยความจำ")
-		fmt.Println("  เท่านั้น ไม่มี --context-dir เพราะไม่มีอะไรให้เขียนลงดิสก์), --searxng-url, --ollama-search-key,")
+		fmt.Println("  --embed-refresh-interval, --context-dir/OLA_CONTEXT_DIR (default: webbot-context - ใช้เก็บ")
+		fmt.Println("  knowledge-index.json เท่านั้น ไม่มีบทสนทนาถูกเขียนไว้ที่นี่เลย), --context-keep-recent,")
+		fmt.Println("  --context-compact-after (compact ในหน่วยความจำเท่านั้น), --searxng-url, --ollama-search-key,")
 		fmt.Println("  --no-web-search, --search-*")
 		fmt.Println()
 		fmt.Println("Runtime:")
@@ -13988,6 +14099,8 @@ func cmdWebBot(args []string) int {
 	var flagKey bool
 	var listenAddr string
 	var sessionTTLSec int
+	var contextDir string
+	var title, avatar string
 	var persona, personaFile string
 	var knowledgeDir string
 	var embedModel string
@@ -14010,6 +14123,9 @@ func cmdWebBot(args []string) int {
 	fs.StringVar(&apiBaseFlag, "api-base", "", "")
 	fs.StringVar(&listenAddr, "webbot-listen-addr", "", "")
 	fs.IntVar(&sessionTTLSec, "webbot-session-ttl", 0, "")
+	fs.StringVar(&contextDir, "context-dir", "", "")
+	fs.StringVar(&title, "webbot-title", "", "")
+	fs.StringVar(&avatar, "webbot-avatar", "", "")
 	fs.StringVar(&persona, "persona", "", "")
 	fs.StringVar(&personaFile, "persona-file", "", "")
 	fs.StringVar(&knowledgeDir, "knowledge-dir", "", "")
@@ -14077,6 +14193,28 @@ func cmdWebBot(args []string) int {
 	sessionTTL := defaultWebBotSessionTTL
 	if sessionTTLSec > 0 {
 		sessionTTL = time.Duration(sessionTTLSec) * time.Second
+	}
+
+	if contextDir == "" {
+		contextDir = os.Getenv("OLA_CONTEXT_DIR")
+	}
+	if contextDir == "" {
+		contextDir = defaultWebBotContextDir
+	}
+
+	if title == "" {
+		title = os.Getenv("OLA_WEBBOT_TITLE")
+	}
+	if title == "" {
+		title = defaultWebBotTitle
+	}
+	if avatar == "" {
+		avatar = os.Getenv("OLA_WEBBOT_AVATAR")
+	}
+	avatarSrc, err := resolveWebBotAvatar(avatar)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
 	}
 
 	if keepRecent <= 0 {
@@ -14153,41 +14291,72 @@ func cmdWebBot(args []string) int {
 
 	session := &webBotSession{
 		chatBotCore: chatBotCore{
-			client:       modelClient,
-			systemPrompt: systemPrompt,
-			tools:        tools,
-			knowledgeCfg: knowledgeCfg,
-			embedCfg:     embedCfg,
-			knowledgeIdx: &knowledgeIndexStore{},
-			searchCfg:    searchCfg,
-			pcfg:         pcfg,
-			ctxSize:      ctxSize,
-			keepRecent:   keepRecent,
-			compactAfter: compactAfter,
-			ntfyTopic:    ntfyTopic,
-			outFile:      outFile,
-			locks:        map[string]*sync.Mutex{},
+			client:           modelClient,
+			systemPrompt:     systemPrompt,
+			tools:            tools,
+			knowledgeCfg:     knowledgeCfg,
+			embedCfg:         embedCfg,
+			knowledgeIdx:     &knowledgeIndexStore{},
+			knowledgeIdxPath: knowledgeIndexPath(contextDir),
+			searchCfg:        searchCfg,
+			pcfg:             pcfg,
+			ctxSize:          ctxSize,
+			contextDir:       contextDir,
+			keepRecent:       keepRecent,
+			compactAfter:     compactAfter,
+			ntfyTopic:        ntfyTopic,
+			outFile:          outFile,
+			locks:            map[string]*sync.Mutex{},
 		},
 		token:    token,
 		sessions: map[string]*chatContext{},
 	}
 
+	pageTmpl, err := template.New("webbot").Parse(webBotChatHTMLTemplate)
+	if err != nil {
+		// Only possible if webBotChatHTMLTemplate itself is malformed,
+		// which would be a real bug in this codebase, not a user
+		// misconfiguration - fail loudly rather than silently serving a
+		// broken page.
+		fmt.Fprintf(os.Stderr, "error: parse webbot HTML template ไม่ได้ (บั๊กในตัวโปรแกรมเอง): %v\n", err)
+		return 1
+	}
+	var pageBuf bytes.Buffer
+	if err := pageTmpl.Execute(&pageBuf, webBotPageData{Title: title, Avatar: template.URL(avatarSrc)}); err != nil {
+		fmt.Fprintf(os.Stderr, "error: render webbot HTML ไม่ได้: %v\n", err)
+		return 1
+	}
+	session.renderedHTML = pageBuf.Bytes()
+
 	if embedCfg.enabled() {
-		// webbot has no --context-dir (nothing on disk at all - see this
-		// section's header comment), so the knowledge embedding index -
-		// unlike the other three bots - has nowhere durable to cache to
-		// either. It's rebuilt in memory only, from scratch, every time
-		// this process starts, and re-walked periodically same as always.
-		session.knowledgeIdxPath = ""
+		// Same pattern as telegrambot/discordbot/linebot: load whatever
+		// index survived a previous run (if any) from <context-dir>/
+		// knowledge-index.json so a restart doesn't force re-embedding a
+		// knowledge base that hasn't changed - buildKnowledgeIndex only
+		// (re-)embeds files whose content hash differs from what's
+		// already cached. Note this is specifically about the KNOWLEDGE
+		// index, not chat sessions - webbot still never persists a
+		// conversation itself (see this section's own header comment);
+		// only the (potentially expensive to rebuild) embedding index
+		// gets a durable cache.
+		if prevIdx, err := loadKnowledgeIndex(session.knowledgeIdxPath); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: โหลด knowledge index เดิม (%s) ไม่ได้ (%v) - จะสร้างใหม่ทั้งหมด\n", session.knowledgeIdxPath, err)
+		} else {
+			session.knowledgeIdx.set(prevIdx)
+		}
 		fmt.Println("กำลัง embed ฐานความรู้ (embed-model: " + embedCfg.Model + ")...")
 		session.refreshKnowledgeIndex()
-		fmt.Printf("  embed เสร็จแล้ว: %d chunk(s) ใน index (เก็บในหน่วยความจำเท่านั้น ไม่มีการ cache ลงดิสก์)\n", len(session.knowledgeIdx.get().Chunks))
+		fmt.Printf("  embed เสร็จแล้ว: %d chunk(s) ใน index (%s)\n", len(session.knowledgeIdx.get().Chunks), session.knowledgeIdxPath)
 		session.startKnowledgeIndexRefresher(embedCfg.RefreshInterval)
 	}
 
 	session.startSessionCleanup(sessionTTL)
 
 	fmt.Printf("ola webbot: พร้อมทำงาน (model: %s, provider: %s)\n", pcfg.Model, pcfg.Provider)
+	fmt.Printf("  title: %s\n", title)
+	if avatarSrc != "" {
+		fmt.Println("  avatar: ตั้งไว้")
+	}
 	fmt.Println("  " + strings.ReplaceAll(session.toolsStatusText(), "\n", "\n  "))
 	if token != "" {
 		fmt.Printf("  token: เปิดใช้ - เข้าครั้งแรกผ่าน http://%s/?token=%s\n", listenAddr, token)
@@ -14195,6 +14364,9 @@ func cmdWebBot(args []string) int {
 		fmt.Println("  token: ปิด (ไม่มีการตรวจสอบสิทธิ์เข้าถึง - ตั้ง OLA_WEBBOT_TOKEN ถ้าจะเปิดให้เข้าถึงได้กว้างกว่า localhost)")
 	}
 	fmt.Printf("  session: เก็บในหน่วยความจำเท่านั้น (ไม่ persist ลงดิสก์), หมดอายุถ้าไม่ใช้งานเกิน %s\n", sessionTTL)
+	if embedCfg.enabled() {
+		fmt.Printf("  context: %s (เก็บเฉพาะ knowledge index - ไม่มีการบันทึกบทสนทนาลงดิสก์)\n", contextDir)
+	}
 	fmt.Printf("  log: %s (append)\n", outputFile)
 	fmt.Printf("  ฟังที่: http://%s\n", listenAddr)
 	fmt.Println("กด Ctrl-C เพื่อหยุด")

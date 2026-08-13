@@ -765,7 +765,7 @@ Telegram/Discord/LINE ต่างมี "แพลตฟอร์ม" ที่
 
 แต่ละ browser session ได้ `chatContext` ของตัวเองที่อยู่ใน**หน่วยความจำล้วนๆ** ตลอดอายุ session — ไม่มีการเรียก `.save()` ที่ไหนในโค้ดส่วนนี้เลยสักที่ ปิดแท็บหรือรีสตาร์ท process แล้วบทสนทนานั้นหายไปทันที (ตรงข้ามกับ telegrambot/discordbot/linebot ที่การหายไปแบบนี้ถือเป็นบั๊ก — ที่นี่คือพฤติกรรมที่ตั้งใจ) session ที่ไม่มีการใช้งานเกิน `--webbot-session-ttl` (default 2 ชั่วโมง) จะถูกเก็บกวาดทิ้งอัตโนมัติเป็นระยะ กัน memory โตไม่มีที่สิ้นสุดถ้ามีคนเปิดแท็บทิ้งไว้นานๆ หลายแท็บ
 
-ถ้าเปิด `--embed-model` ด้วย ตัว knowledge index ก็อยู่ในหน่วยความจำเช่นกัน (ไม่มี `--context-dir` ให้ cache ลงดิสก์ข้ามการรีสตาร์ท) — รีสตาร์ท `ola webbot` แล้วต้อง embed ฐานความรู้ใหม่ทั้งหมดทุกครั้ง (ต่างจากสามบอทก่อนที่ embed เฉพาะไฟล์ที่เปลี่ยนหลัง restart)
+ถ้าเปิด `--embed-model` ด้วย ตัว knowledge index จะถูก cache ลง `--context-dir`/`OLA_CONTEXT_DIR` (default `webbot-context`) **เหมือนกับ telegrambot/discordbot/linebot ทุกประการ** — restart แล้วโหลด index เดิมกลับมา และ embed ใหม่เฉพาะไฟล์ที่เปลี่ยนแปลงเท่านั้น ไม่ต้อง embed ทั้งฐานความรู้ใหม่ทุกครั้งที่รีสตาร์ท **ข้อควรรู้:** `--context-dir` ของ webbot ใช้เก็บ**เฉพาะ** `knowledge-index.json` เท่านั้น ไม่มีบทสนทนาของผู้ใช้ถูกเขียนไว้ที่นี่เลย (บทสนทนายังคงอยู่ในหน่วยความจำล้วนๆ ตามเดิม)
 
 ### บอทแนะนำตัวเองก่อนเสมอ ก่อนผู้ใช้จะเริ่มพิมพ์ได้
 
@@ -774,6 +774,19 @@ Telegram/Discord/LINE ต่างมี "แพลตฟอร์ม" ที่
 ### Theme และฟอนต์
 
 **Gruvbox** (dark) และ **Playpen Sans Thai** (Google Font) ตามที่ระบุไว้ — โหลดฟอนต์ผ่าน `<link>` ไปยัง Google Fonts ตรงๆ (ต้องมีอินเทอร์เน็ตตอนเปิดหน้าเว็บถึงจะได้ฟอนต์ตามที่ตั้งใจ ไม่มีอินเทอร์เน็ตจะ fallback เป็น `sans-serif` ของเบราว์เซอร์แทนแต่หน้าเว็บยังใช้งานได้ปกติ)
+
+### ปรับแต่งหน้าตา: `--webbot-title` และ `--webbot-avatar`
+
+- **`--webbot-title`/`OLA_WEBBOT_TITLE`** — เปลี่ยนข้อความใน `<title>` และหัวหน้าเว็บ (default: `ola webbot`) ผ่าน `html/template` เสมอ (ไม่ใช่แทรก string ตรงๆ) ดังนั้นแม้ตั้ง title ที่มีอักขระ HTML พิเศษก็ปลอดภัย ไม่หลุดออกมาเป็น HTML/JS จริง
+- **`--webbot-avatar`/`OLA_WEBBOT_AVATAR`** — ใส่รูปโปรไฟล์ของบอท แสดงทั้งข้างชื่อในหัวหน้าเว็บและข้างข้อความตอบของบอททุกข้อความ รับค่าได้ 2 แบบ:
+  - **URL** — ขึ้นต้นด้วย `http://`, `https://`, หรือ `data:` จะใช้ตรงๆ ตามที่ให้มา
+  - **path ไฟล์ในเครื่อง** — ถ้าไม่ใช่ URL ข้างบน จะถือว่าเป็น path ไฟล์รูปภาพ (PNG/JPEG/GIF/WebP) ในเครื่อง `ola` จะ**อ่านแล้วฝังเป็น `data:` URI ไว้ในหน้าเว็บให้เองตอนเริ่มทำงาน** ไม่ต้องเสิร์ฟไฟล์แยก ทำให้หน้าเว็บยังคง self-contained เหมือนเดิม — ข้อแลกเปลี่ยนคือเปลี่ยนไฟล์รูปแล้วต้อง restart `ola webbot` ใหม่ถึงจะเห็นรูปที่อัปเดต (เหมือนกับ `--webbot-title` ที่ก็ไม่ hot-reload เช่นกัน)
+
+```bash
+ola webbot \
+  --webbot-title 'น้องโอลา ผู้ช่วยวิชา Network Security' \
+  --webbot-avatar /home/user/ola-avatar.png
+```
 
 ### เริ่มต้นใช้งาน
 
@@ -790,6 +803,8 @@ ola webbot \
   --knowledge-dir /srv/course-docs \
   --embed-model bge-m3 \
   --searxng-url http://127.0.0.1:3001 \
+  --webbot-title 'ผู้ช่วยวิชา Network Security' \
+  --webbot-avatar /srv/course-docs/avatar.png \
   --webbot-listen-addr 127.0.0.1:8090
 ```
 
@@ -802,9 +817,11 @@ ola webbot \
 | `OLA_WEBBOT_TOKEN` | *(env เท่านั้น)* | — | shared token gate — ไม่ตั้ง = ไม่มีการตรวจสอบสิทธิ์เข้าถึงเลย |
 | `OLA_WEBBOT_LISTEN_ADDR` | `--webbot-listen-addr` | `127.0.0.1:8090` | ที่อยู่ที่ HTTP server ฟัง |
 | — | `--webbot-session-ttl` | `7200` วินาที (2 ชม.) | อายุ session สูงสุดก่อนถูกเก็บกวาดทิ้งถ้าไม่มีการใช้งาน |
+| `OLA_WEBBOT_TITLE` | `--webbot-title` | `ola webbot` | ข้อความใน `<title>` และหัวหน้าเว็บ |
+| `OLA_WEBBOT_AVATAR` | `--webbot-avatar` | — | URL (`http(s)://`/`data:`) หรือ path ไฟล์รูปภาพในเครื่อง (ฝังเป็น `data:` URI ให้อัตโนมัติ) |
 | — | `-o, --output` | `webbot.log` | log ไฟล์แบบเต็ม เปิดแบบ append เสมอ |
 
-ตัวแปรที่เหลือทั้งหมด (`--persona`/`--persona-file`, `--knowledge-dir`, `--embed-model`/`--embed-top-k`/`--embed-min-score`/`--embed-refresh-interval`, `--context-keep-recent`/`--context-compact-after` (compact ในหน่วยความจำเท่านั้น — **ไม่มี** `--context-dir` เพราะไม่มีอะไรให้เขียนลงดิสก์), การเชื่อมต่อโมเดล, web search/fetch ทั้งชุด) **ใช้ร่วมกับ `ola telegrambot` ทุก flag ทุกพฤติกรรมเป๊ะๆ** — ดู [`ola telegrambot`](#ola-telegrambot) และ [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด) **ไม่มี** flag allowlist แบบ `--*-allowed-users`/`--*-allowed-groups` เหมือนสามบอทก่อน เพราะไม่มีแนวคิด "ผู้ใช้แต่ละคน" ให้ allowlist — การควบคุมการเข้าถึงทำผ่าน network binding + token เท่านั้น
+ตัวแปรที่เหลือทั้งหมด (`--persona`/`--persona-file`, `--knowledge-dir`, `--embed-model`/`--embed-top-k`/`--embed-min-score`/`--embed-refresh-interval`, `--context-dir`/`OLA_CONTEXT_DIR` (default `webbot-context` — เก็บเฉพาะ knowledge index เท่านั้น ไม่มีบทสนทนา), `--context-keep-recent`/`--context-compact-after` (compact บทสนทนาในหน่วยความจำเท่านั้น), การเชื่อมต่อโมเดล, web search/fetch ทั้งชุด) **ใช้ร่วมกับ `ola telegrambot` ทุก flag ทุกพฤติกรรมเป๊ะๆ** — ดู [`ola telegrambot`](#ola-telegrambot) และ [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด) **ไม่มี** flag allowlist แบบ `--*-allowed-users`/`--*-allowed-groups` เหมือนสามบอทก่อน เพราะไม่มีแนวคิด "ผู้ใช้แต่ละคน" ให้ allowlist — การควบคุมการเข้าถึงทำผ่าน network binding + token เท่านั้น
 
 ---
 

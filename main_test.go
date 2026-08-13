@@ -22,6 +22,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"io"
 	"math"
 	"net/http"
@@ -9614,6 +9615,23 @@ func TestLineWebhookRedeliveryIsIgnored(t *testing.T) {
 // newTestWebBotSession builds a webBotSession wired to a mock Ollama
 // server, for driving the HTTP handlers directly - mirrors
 // newTestTelegramSession/newTestDiscordSession/newTestLineSession.
+// renderWebBotPageForTest mirrors cmdWebBot's own template execution -
+// tests that exercise indexHandler need session.renderedHTML populated
+// the same way a real run would, since indexHandler just serves that
+// field verbatim rather than rendering on every request.
+func renderWebBotPageForTest(t *testing.T, title, avatar string) []byte {
+	t.Helper()
+	tmpl, err := template.New("webbot").Parse(webBotChatHTMLTemplate)
+	if err != nil {
+		t.Fatalf("parse webbot template: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, webBotPageData{Title: title, Avatar: template.URL(avatar)}); err != nil {
+		t.Fatalf("execute webbot template: %v", err)
+	}
+	return buf.Bytes()
+}
+
 func newTestWebBotSession(t *testing.T, ollamaSrv *httptest.Server, token string) *webBotSession {
 	t.Helper()
 	logFile, err := os.CreateTemp(t.TempDir(), "webbot-test-log")
@@ -9633,8 +9651,9 @@ func newTestWebBotSession(t *testing.T, ollamaSrv *httptest.Server, token string
 			outFile:      logFile,
 			locks:        map[string]*sync.Mutex{},
 		},
-		token:    token,
-		sessions: map[string]*chatContext{},
+		token:        token,
+		renderedHTML: renderWebBotPageForTest(t, defaultWebBotTitle, ""),
+		sessions:     map[string]*chatContext{},
 	}
 }
 
@@ -9951,5 +9970,251 @@ func TestWebBotChatHandlerEndToEndAndNeverPersists(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("expected webbot to never write anything to disk for a session, found: %v", entries)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// webbot: knowledge index persistence, --webbot-title, --webbot-avatar
+// ─────────────────────────────────────────────────────────────────
+
+func TestResolveWebBotAvatarEmptyReturnsEmpty(t *testing.T) {
+	got, err := resolveWebBotAvatar("")
+	if err != nil || got != "" {
+		t.Fatalf("expected (\"\", nil) for no avatar configured, got (%q, %v)", got, err)
+	}
+}
+
+func TestResolveWebBotAvatarURLPassthrough(t *testing.T) {
+	cases := []string{
+		"https://example.com/avatar.png",
+		"http://example.com/avatar.png",
+		"data:image/png;base64,iVBORw0KGgo=",
+	}
+	for _, c := range cases {
+		got, err := resolveWebBotAvatar(c)
+		if err != nil {
+			t.Fatalf("resolveWebBotAvatar(%q) error: %v", c, err)
+		}
+		if got != c {
+			t.Fatalf("expected a URL/data-URI to pass through unchanged, got %q for input %q", got, c)
+		}
+	}
+}
+
+// minimalPNG is a well-known, valid, complete 1x1 transparent PNG (the
+// smallest valid PNG file byte-for-byte) - real enough for
+// http.DetectContentType to correctly identify as image/png.
+var minimalPNG = []byte{
+	0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+	0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+	0x08, 0x04, 0x00, 0x00, 0x00, 0xb5, 0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00,
+	0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x64, 0x60, 0x00, 0x00,
+	0x00, 0x05, 0x00, 0x01, 0x5a, 0x39, 0x0e, 0x74, 0x00, 0x00, 0x00, 0x00,
+	0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+}
+
+func TestResolveWebBotAvatarLocalFileBecomesDataURI(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "avatar.png")
+	if err := os.WriteFile(path, minimalPNG, 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveWebBotAvatar(path)
+	if err != nil {
+		t.Fatalf("resolveWebBotAvatar error: %v", err)
+	}
+	if !strings.HasPrefix(got, "data:image/png;base64,") {
+		t.Fatalf("expected a data:image/png;base64,... URI, got: %s", got[:min(40, len(got))])
+	}
+	wantB64 := base64.StdEncoding.EncodeToString(minimalPNG)
+	if !strings.HasSuffix(got, wantB64) {
+		t.Fatal("expected the data URI to contain the exact base64-encoded file bytes")
+	}
+}
+
+func TestResolveWebBotAvatarRejectsNonImageFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "not-an-image.txt")
+	if err := os.WriteFile(path, []byte("this is definitely not an image"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveWebBotAvatar(path); err == nil {
+		t.Fatal("expected an error for a local file that isn't an image")
+	}
+}
+
+func TestResolveWebBotAvatarMissingFileErrors(t *testing.T) {
+	if _, err := resolveWebBotAvatar("/does/not/exist/avatar.png"); err == nil {
+		t.Fatal("expected an error for a nonexistent local path")
+	}
+}
+
+func TestWebBotPageTemplateAppliesCustomTitleAndAvatar(t *testing.T) {
+	html := string(renderWebBotPageForTest(t, "ผู้ช่วยวิชา Network Security", "https://example.com/bot.png"))
+	if !strings.Contains(html, "<title>ผู้ช่วยวิชา Network Security</title>") {
+		t.Fatalf("expected the custom title in <title>, got: %s", html[:min(400, len(html))])
+	}
+	if !strings.Contains(html, "ผู้ช่วยวิชา Network Security</h1>") {
+		t.Fatal("expected the custom title in the page header <h1>")
+	}
+	if !strings.Contains(html, `src="https://example.com/bot.png"`) {
+		t.Fatal("expected the avatar URL as the header <img> src")
+	}
+	// html/template escapes "/" as "\/" inside a JS string literal
+	// (defensive against a value containing "</script>") - functionally
+	// identical JavaScript, just not byte-identical to the unescaped URL.
+	if !strings.Contains(html, `var OLA_AVATAR = "https:\/\/example.com\/bot.png";`) {
+		t.Fatal("expected the avatar URL exposed to JS as OLA_AVATAR for use in chat bubbles")
+	}
+}
+
+func TestWebBotPageTemplateOmitsAvatarMarkupWhenNotConfigured(t *testing.T) {
+	html := string(renderWebBotPageForTest(t, defaultWebBotTitle, ""))
+	if strings.Contains(html, `class="header-avatar"`) {
+		t.Fatal("expected no header avatar <img> element at all when no avatar is configured")
+	}
+	if !strings.Contains(html, `var OLA_AVATAR = "";`) {
+		t.Fatal("expected OLA_AVATAR to be an empty string when no avatar is configured")
+	}
+}
+
+// TestWebBotPageTemplateAllowsDataURIAvatar is the direct regression test
+// for a real bug caught by live testing (not by the unit tests above,
+// which only ever exercised an https:// avatar): html/template's default
+// URL-context escaper only allows a small scheme allowlist through
+// (http/https/mailto/...) and silently replaces anything else - INCLUDING
+// a data: URI, exactly what a local --webbot-avatar file resolves to -
+// with an inert "#ZgotmplZ" placeholder instead of ever rendering it.
+// Fixed by typing webBotPageData.Avatar as template.URL so the escaper
+// trusts a scheme our own code already produced safely (see
+// resolveWebBotAvatar) rather than filtering it.
+func TestWebBotPageTemplateAllowsDataURIAvatar(t *testing.T) {
+	dataURI := "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+	html := string(renderWebBotPageForTest(t, defaultWebBotTitle, dataURI))
+	if strings.Contains(html, "ZgotmplZ") {
+		t.Fatal("expected the data: URI avatar to render as-is, not get replaced with html/template's inert placeholder")
+	}
+	// html/template HTML-entity-escapes some characters within an
+	// attribute value even when it trusts the URL scheme (here "+"
+	// becomes "&#43;") - a browser decodes that back to the literal
+	// character before using it as the actual attribute value, so this is
+	// functionally identical to the raw URI, not a sign anything broke.
+	// Compare against the entity-escaped form rather than requiring
+	// byte-for-byte equality with the input.
+	wantSrc := `src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk&#43;A8AAQUBAScY42YAAAAASUVORK5CYII="`
+	if !strings.Contains(html, wantSrc) {
+		t.Fatalf("expected the data URI (HTML-entity-escaped, which is safe/equivalent) as the header <img> src, got: %s", html[:min(600, len(html))])
+	}
+}
+
+// TestWebBotPageTemplateEscapesAdversarialAvatarValue proves the
+// template.URL fix above doesn't reopen an injection hole: a value
+// containing a literal '"' must still be neutralized rather than
+// breaking out of either the src="..." attribute or the JS string
+// literal OLA_AVATAR also sits in, even though template.URL tells the
+// escaper to trust the URL *scheme*.
+func TestWebBotPageTemplateEscapesAdversarialAvatarValue(t *testing.T) {
+	evil := `data:image/png;base64,AAAA"onerror="alert(1)`
+	html := string(renderWebBotPageForTest(t, defaultWebBotTitle, evil))
+	if strings.Contains(html, `"onerror="alert(1)"`) {
+		t.Fatal("expected an embedded quote in the avatar value to be escaped, not break out of the src attribute")
+	}
+	if strings.Contains(html, `var OLA_AVATAR = "data:image/png;base64,AAAA"onerror`) {
+		t.Fatal("expected an embedded quote in the avatar value to be escaped, not break out of the JS string literal")
+	}
+}
+
+// TestWebBotPageTemplateEscapesTitleSafely proves html/template's
+// contextual auto-escaping actually protects this page even though
+// --webbot-title is operator-configured, not end-user input - good
+// hygiene regardless of who sets it.
+func TestWebBotPageTemplateEscapesTitleSafely(t *testing.T) {
+	html := string(renderWebBotPageForTest(t, `</title><script>alert(1)</script>`, ""))
+	if strings.Contains(html, "<script>alert(1)</script>") {
+		t.Fatal("expected a title containing HTML/script markup to be escaped, not injected verbatim")
+	}
+}
+
+// TestWebBotEmbeddingIndexPersistsToContextDir is the direct regression
+// test for the request that webbot's knowledge index behave like
+// telegrambot/discordbot/linebot's own: cached to disk under
+// --context-dir, and incrementally updated (not fully rebuilt) on
+// subsequent refreshes.
+func TestWebBotEmbeddingIndexPersistsToContextDir(t *testing.T) {
+	knowledgeDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(knowledgeDir, "a.md"), []byte("เนื้อหาความรู้ทดสอบ"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	knowledgeCfg, _ := resolveKnowledgeConfig(knowledgeDir)
+
+	var embedCalls int32
+	embedSrv, _ := newMockEmbedServer(t, func(text string) []float32 {
+		atomic.AddInt32(&embedCalls, 1)
+		return []float32{1, 0}
+	})
+
+	contextDir := t.TempDir()
+	idxPath := knowledgeIndexPath(contextDir)
+	logFile, _ := os.CreateTemp(t.TempDir(), "log")
+	defer logFile.Close()
+
+	session := &webBotSession{
+		chatBotCore: chatBotCore{
+			client:           embedSrv.Client(),
+			knowledgeCfg:     knowledgeCfg,
+			embedCfg:         embedConfig{Model: "mock-embed", TopK: 5, MinScore: 0.1},
+			knowledgeIdx:     &knowledgeIndexStore{},
+			knowledgeIdxPath: idxPath,
+			pcfg:             providerConfig{Provider: providerOllama, Host: embedSrv.URL, Model: "mock-embed"},
+			contextDir:       contextDir,
+			outFile:          logFile,
+			locks:            map[string]*sync.Mutex{},
+		},
+		sessions: map[string]*chatContext{},
+	}
+
+	session.refreshKnowledgeIndex()
+
+	if _, err := os.Stat(idxPath); err != nil {
+		t.Fatalf("expected knowledge-index.json to be written under --context-dir, got: %v", err)
+	}
+	if len(session.knowledgeIdx.get().Chunks) == 0 {
+		t.Fatal("expected the freshly built index to have at least one chunk")
+	}
+	firstCallCount := atomic.LoadInt32(&embedCalls)
+	if firstCallCount == 0 {
+		t.Fatal("expected at least one embed call for the initial build")
+	}
+
+	// A second session pointed at the SAME context-dir should load the
+	// cached index from disk and, since the file hasn't changed,
+	// re-embed nothing at all.
+	session2 := &webBotSession{
+		chatBotCore: chatBotCore{
+			client:           embedSrv.Client(),
+			knowledgeCfg:     knowledgeCfg,
+			embedCfg:         embedConfig{Model: "mock-embed", TopK: 5, MinScore: 0.1},
+			knowledgeIdx:     &knowledgeIndexStore{},
+			knowledgeIdxPath: idxPath,
+			pcfg:             providerConfig{Provider: providerOllama, Host: embedSrv.URL, Model: "mock-embed"},
+			contextDir:       contextDir,
+			outFile:          logFile,
+			locks:            map[string]*sync.Mutex{},
+		},
+		sessions: map[string]*chatContext{},
+	}
+	prevIdx, err := loadKnowledgeIndex(idxPath)
+	if err != nil {
+		t.Fatalf("loadKnowledgeIndex: %v", err)
+	}
+	session2.knowledgeIdx.set(prevIdx)
+
+	atomic.StoreInt32(&embedCalls, 0)
+	session2.refreshKnowledgeIndex()
+	if atomic.LoadInt32(&embedCalls) != 0 {
+		t.Fatalf("expected zero embed calls when reloading an unchanged knowledge base from a persisted index, got %d", embedCalls)
+	}
+	if len(session2.knowledgeIdx.get().Chunks) != len(session.knowledgeIdx.get().Chunks) {
+		t.Fatal("expected the reloaded index to have the same chunks as the original")
 	}
 }
