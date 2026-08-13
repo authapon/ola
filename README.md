@@ -511,7 +511,22 @@ ola telegrambot \
 
 ข้อควรรู้: กลุ่มที่ไม่อยู่ใน allowlist จะไม่ถูกบันทึกอะไรเลย (ไม่ว่าจะ mention บอทหรือไม่) — บอทไม่มีเหตุผลต้องจดจำบทสนทนาของกลุ่มที่ไม่ได้รับอนุญาตให้ใช้งานตั้งแต่แรก และ private chat (DM) ไม่มีการระบุชื่อผู้พูดกำกับ (มีคนเดียวคุยด้วยอยู่แล้ว การระบุชื่อไม่ได้เพิ่มข้อมูลอะไร)
 
-### Persona — เติมต่อท้ายเท่านั้น ไม่ใช่ override
+### รองรับรูปภาพ — `--max-image-size`/`OLA_MAX_IMAGE_SIZE`
+
+ทั้งสี่บอทแชท (`telegrambot`/`discordbot`/`linebot`/`webbot`) รับรูปภาพจากผู้ใช้ได้ ผ่าน `chatBotCore` ตัวเดียวกัน — หลักการเดียวกันหมดทุกบอท:
+
+- **ต้องใช้โมเดิลที่รองรับ vision จริง** (เช่น `llava`, `qwen2-vl`, `gemma3`/`gemma4` บางเวอร์ชัน หรือ GPT-4V-style ผ่าน OpenAI-compatible) โมเดิลข้อความล้วนจะเห็นแค่ข้อความ ไม่เห็นรูป — system prompt สั่งให้โมเดิลบอกตรงๆ ว่าดูรูปไม่ได้แทนที่จะแต่งคำอธิบายขึ้นเอง แต่ก็ยังขึ้นกับว่าโมเดิลจะทำตามจริงแค่ไหน
+- **`--max-image-size <size>`/`OLA_MAX_IMAGE_SIZE`** — ขนาดรูปภาพสูงสุดที่รับได้ เช่น `10K`, `12M`, `1G` (ไม่ใส่หน่วย = bytes) หน่วยเป็นแบบ binary (K=1024 ไม่ใช่ 1000) default **10M** — รูปเกินขนาดจะถูกปฏิเสธก่อนส่งให้โมเดิลเสมอ (Telegram/Discord ปฏิเสธได้ตั้งแต่ก่อนดาวน์โหลดด้วยซ้ำถ้าแพลตฟอร์มรายงานขนาดไฟล์มาให้ล่วงหน้า)
+- **รูปภาพไม่ถูกบันทึกลง context ถาวรเลย** (ทั้งที่เก็บลงดิสก์อย่าง telegrambot/discordbot/linebot และที่เก็บในหน่วยความจำอย่าง webbot) — โมเดิลเห็นรูปแค่ในเทิร์นที่ส่งมาเท่านั้น เทิร์นที่บันทึกไว้จะมีแค่ข้อความ + tag สั้นๆ เช่น `[แนบรูปภาพ 1 รูป]` แทน กันไม่ให้ context โตเร็วเกินไปจากไฟล์ base64
+- **ในกลุ่ม/channel: ดาวน์โหลดรูปเฉพาะข้อความที่ถูก mention เท่านั้น** (เหมือนหลักการ record-แต่ไม่ตอบ ของข้อความทั่วไป — ดูหัวข้อ [พฤติกรรมใน group chat](#พฤติกรรมใน-group-chat) ด้านล่าง) ข้อความที่มีรูปแต่ไม่ถูก mention จะถูกบันทึกเป็น `[ส่งรูปภาพ]` เฉยๆ ไม่ดาวน์โหลดจริง ประหยัด bandwidth
+
+**ความต่างเฉพาะแพลตฟอร์ม:**
+- **Telegram** — ดึงรูปจาก `photo` field (`getFile` แล้วดาวน์โหลดแยกอีกที) ข้อความประกอบรูปอยู่ใน `caption` ไม่ใช่ `text`
+- **Discord** — attachment URL มาพร้อมข้อความอยู่แล้ว ดาวน์โหลดตรงได้เลยไม่ต้องมี lookup แยก
+- **LINE** — ดาวน์โหลดผ่าน endpoint คนละ host กับ REST API ปกติ (`api-data.line.me`) และ**ข้อความรูปภาพของ LINE ไม่มี mention object เลย** จึงไม่มีทางที่รูปในกลุ่มจะ "ถูก mention" ได้ตามกลไกเดียวกับข้อความตัวอักษร — รูปที่ส่งในกลุ่ม LINE จะถูกบันทึกเป็น `[ส่งรูปภาพ]` เสมอ ไม่ถูกวิเคราะห์เลย (ส่งรูปใน DM ยังทำงานปกติ เพราะ DM ถือว่า addressed เสมออยู่แล้ว)
+- **webbot** — มีปุ่มแนบรูป (📎) ข้าง input box พร้อม preview รูปก่อนส่งและปุ่มเอาออก
+
+
 
 หลักการ "system prompt คงที่ ไม่มี `-s/--system`" (ดู [ภาพรวมและปรัชญาการออกแบบ](#ภาพรวมและปรัชญาการออกแบบ)) ยังใช้กับ `telegrambot` เช่นกัน — `--persona`/`--persona-file` ถูกแทรกเข้าไป**ระหว่าง**ประโยคเปิดกับกติกาพื้นฐานของ system prompt ที่ตายตัว (ไม่ใช่ต่อท้ายทั้งหมด) เพื่อให้ชื่อ/บุคลิกที่กำหนดไว้มีน้ำหนักสูงสุดในสายตาโมเดิล — พบจากการทดสอบจริงว่าถ้า persona ถูกแปะไว้ท้ายสุด (หลังกติกายาวๆ) โมเดิลบางตัวมีแนวโน้มตอบชื่อแบบทั่วไป เช่น "ฉันชื่อบอท" แทนชื่อที่ตั้งไว้ กติกาความปลอดภัย/ขอบเขต tool ที่มีให้ ไม่สามารถถูกเปลี่ยนผ่าน persona ได้ไม่ว่าจะวางตำแหน่งไหน
 
@@ -595,6 +610,7 @@ ola telegrambot \
 | `OLA_TELEGRAM_API_BASE` | `--telegram-api-base` | `https://api.telegram.org` | override สำหรับทดสอบกับ mock server |
 | — | `--poll-timeout` | `600` | long-poll timeout วินาทีต่อ `getUpdates` (10 นาที — ดูหมายเหตุด้านล่างเรื่องขีดจำกัดฝั่ง Telegram) |
 | — | `--telegram-max-concurrent` | `4` | จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส |
+| `OLA_MAX_IMAGE_SIZE` | `--max-image-size` | `10M` | ขนาดรูปภาพสูงสุด เช่น `10K`/`12M`/`1G` — ดูหัวข้อ "รองรับรูปภาพ" ด้านล่าง |
 | — | `-o, --output` | `telegrambot.log` | log ไฟล์แบบเต็ม เปิดแบบ **append เสมอ** (ต่างจาก `ask`/`coding` ที่ overwrite เป็น default — `telegrambot` เป็น process เดียวรันยาวข้าม restart) |
 
 ตัวแปรที่เหลือ (การเชื่อมต่อโมเดล `-m/-c/-P/--api-base/-k`, `-x/--topic`, และ web search/fetch ทั้งชุด `--searxng-url`/`--ollama-search-key`/`--no-web-search`/ฯลฯ) ใช้ร่วมกับ `ola ask` ทุกประการ — ดู [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด) และ [Web search / web fetch](#web-search--web-fetch) `web_search` เปิดอัตโนมัติเมื่อมีการตั้ง backend ไว้ (SearXNG หรือ Ollama search key) ส่วน `web_fetch` เปิดอัตโนมัติเสมอเหมือน `ask` จนกว่าจะสั่ง `--no-web-search`
@@ -661,6 +677,7 @@ Discord ซ้อนโครงสร้างลึกกว่า Telegram: S
 | `OLA_DISCORD_ALLOWED_CHANNELS` | `--discord-allowed-channels` | — | comma-separated channel ID (optional) |
 | `OLA_DISCORD_API_BASE` | `--discord-api-base` | `https://discord.com/api/v10` | override สำหรับทดสอบกับ mock server |
 | — | `--discord-max-concurrent` | `4` | จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส |
+| `OLA_MAX_IMAGE_SIZE` | `--max-image-size` | `10M` | ขนาดรูปภาพสูงสุด — เหมือน `ola telegrambot` ทุกประการ |
 | — | `-o, --output` | `discordbot.log` | log ไฟล์แบบเต็ม เปิดแบบ append เสมอ |
 
 ตัวแปรที่เหลือทั้งหมด (`--persona`/`--persona-file`/`OLA_PERSONA`/`OLA_PERSONA_FILE`, `--knowledge-dir`/`OLA_KNOWLEDGE_DIR`, `--embed-model`/`OLA_EMBED_MODEL`/`--embed-top-k`/`--embed-min-score`/`--embed-refresh-interval`, `--context-dir`/`OLA_CONTEXT_DIR` (default ต่างกัน: `discord-context` ที่นี่ vs `telegram-context` ฝั่ง telegrambot ถ้าไม่ได้ตั้ง แต่**ตัวแปร env ตัวเดียวกัน** — ตั้ง `OLA_CONTEXT_DIR` แล้วสองบอทจะไปที่เดียวกันได้ถ้าต้องการ)/`--context-keep-recent`/`--context-compact-after`, การเชื่อมต่อโมเดล, web search/fetch ทั้งชุด) **ใช้ร่วมกับ `ola telegrambot` ทุก flag ทุกพฤติกรรมเป๊ะๆ** — ดู [`ola telegrambot`](#ola-telegrambot) และ [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด)
@@ -744,6 +761,7 @@ LINE อาจส่ง webhook event ซ้ำได้เอง (เช่น 
 | `OLA_LINE_LISTEN_ADDR` | `--line-listen-addr` | `:8080` | ที่อยู่ที่ HTTP server ฟัง — แนะนำผูกแค่ `127.0.0.1:8080` แล้ววาง reverse proxy ไว้ข้างหน้า |
 | `OLA_LINE_WEBHOOK_PATH` | `--line-webhook-path` | `/line/webhook` | path ของ webhook (ต้องตรงกับที่ตั้งใน LINE Developers Console) |
 | — | `--line-max-concurrent` | `4` | จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส |
+| `OLA_MAX_IMAGE_SIZE` | `--max-image-size` | `10M` | ขนาดรูปภาพสูงสุด — เหมือน `ola telegrambot` ทุกประการ |
 | — | `-o, --output` | `linebot.log` | log ไฟล์แบบเต็ม เปิดแบบ append เสมอ |
 
 ตัวแปรที่เหลือทั้งหมด (`--persona`/`--persona-file`, `--knowledge-dir`, `--embed-model`/`--embed-top-k`/`--embed-min-score`/`--embed-refresh-interval`, `--context-dir`/`OLA_CONTEXT_DIR` (default `line-context` ถ้าไม่ได้ตั้ง — ตัวแปรเดียวกับอีกสองบอท), `--context-keep-recent`/`--context-compact-after`, การเชื่อมต่อโมเดล, web search/fetch ทั้งชุด) **ใช้ร่วมกับ `ola telegrambot` ทุก flag ทุกพฤติกรรมเป๊ะๆ** — ดู [`ola telegrambot`](#ola-telegrambot) และ [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด)
@@ -819,6 +837,7 @@ ola webbot \
 | — | `--webbot-session-ttl` | `7200` วินาที (2 ชม.) | อายุ session สูงสุดก่อนถูกเก็บกวาดทิ้งถ้าไม่มีการใช้งาน |
 | `OLA_WEBBOT_TITLE` | `--webbot-title` | `ola webbot` | ข้อความใน `<title>` และหัวหน้าเว็บ |
 | `OLA_WEBBOT_AVATAR` | `--webbot-avatar` | — | URL (`http(s)://`/`data:`) หรือ path ไฟล์รูปภาพในเครื่อง (ฝังเป็น `data:` URI ให้อัตโนมัติ) |
+| `OLA_MAX_IMAGE_SIZE` | `--max-image-size` | `10M` | ขนาดรูปภาพสูงสุด — เหมือน `ola telegrambot` ทุกประการ |
 | — | `-o, --output` | `webbot.log` | log ไฟล์แบบเต็ม เปิดแบบ append เสมอ |
 
 ตัวแปรที่เหลือทั้งหมด (`--persona`/`--persona-file`, `--knowledge-dir`, `--embed-model`/`--embed-top-k`/`--embed-min-score`/`--embed-refresh-interval`, `--context-dir`/`OLA_CONTEXT_DIR` (default `webbot-context` — เก็บเฉพาะ knowledge index เท่านั้น ไม่มีบทสนทนา), `--context-keep-recent`/`--context-compact-after` (compact บทสนทนาในหน่วยความจำเท่านั้น), การเชื่อมต่อโมเดล, web search/fetch ทั้งชุด) **ใช้ร่วมกับ `ola telegrambot` ทุก flag ทุกพฤติกรรมเป๊ะๆ** — ดู [`ola telegrambot`](#ola-telegrambot) และ [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด) **ไม่มี** flag allowlist แบบ `--*-allowed-users`/`--*-allowed-groups` เหมือนสามบอทก่อน เพราะไม่มีแนวคิด "ผู้ใช้แต่ละคน" ให้ allowlist — การควบคุมการเข้าถึงทำผ่าน network binding + token เท่านั้น

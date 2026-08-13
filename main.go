@@ -8852,13 +8852,32 @@ type tgChat struct {
 	Username string `json:"username,omitempty"`
 }
 
+type tgPhotoSize struct {
+	FileID   string `json:"file_id"`
+	Width    int    `json:"width"`
+	Height   int    `json:"height"`
+	FileSize int64  `json:"file_size,omitempty"`
+}
+
 type tgMessage struct {
-	MessageID      int64      `json:"message_id"`
-	From           tgUser     `json:"from"`
-	Chat           tgChat     `json:"chat"`
-	Text           string     `json:"text"`
-	Date           int64      `json:"date"`
-	ReplyToMessage *tgMessage `json:"reply_to_message,omitempty"`
+	MessageID      int64         `json:"message_id"`
+	From           tgUser        `json:"from"`
+	Chat           tgChat        `json:"chat"`
+	Text           string        `json:"text"`
+	Caption        string        `json:"caption,omitempty"` // Telegram puts a photo message's accompanying text here, not in Text
+	Photo          []tgPhotoSize `json:"photo,omitempty"`   // multiple resolutions of the same photo, smallest to largest - see largestPhoto
+	Date           int64         `json:"date"`
+	ReplyToMessage *tgMessage    `json:"reply_to_message,omitempty"`
+}
+
+// largestPhoto returns the highest-resolution size Telegram sent for a
+// photo message (the last element - Telegram documents this array as
+// smallest to largest), or ok=false if the message has no photo at all.
+func largestPhoto(sizes []tgPhotoSize) (tgPhotoSize, bool) {
+	if len(sizes) == 0 {
+		return tgPhotoSize{}, false
+	}
+	return sizes[len(sizes)-1], true
 }
 
 type tgUpdate struct {
@@ -8904,6 +8923,71 @@ func tgGetMe(client *http.Client, apiBase, token string) (tgUser, error) {
 		return tgUser{}, fmt.Errorf("getMe ล้มเหลว: %s", out.Description)
 	}
 	return out.Result, nil
+}
+
+// tgFileURL builds the download URL for a resolved file_path - Telegram
+// uses a genuinely different URL shape for file downloads
+// (".../file/bot<token>/<path>") than every other Bot API call
+// (".../bot<token>/<method>", see tgAPIURL) - easy to get wrong if typed
+// from memory instead of kept as its own small helper.
+func tgFileURL(apiBase, token, filePath string) string {
+	return strings.TrimRight(apiBase, "/") + "/file/bot" + token + "/" + filePath
+}
+
+type tgGetFileResponse struct {
+	OK          bool   `json:"ok"`
+	Description string `json:"description,omitempty"`
+	Result      struct {
+		FilePath string `json:"file_path"`
+	} `json:"result"`
+}
+
+// tgGetFile resolves a file_id (as sent in a photo message's largest
+// tgPhotoSize) to the file_path needed to actually download it - a
+// required extra round trip Telegram's API imposes that Discord's own
+// attachment URLs (already fully resolved) don't need.
+func tgGetFile(client *http.Client, apiBase, token, fileID string) (string, error) {
+	resp, err := client.Get(tgAPIURL(apiBase, token, "getFile") + "?file_id=" + url.QueryEscape(fileID))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var out tgGetFileResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("decode getFile response: %v", err)
+	}
+	if !out.OK {
+		return "", fmt.Errorf("getFile ล้มเหลว: %s", out.Description)
+	}
+	return out.Result.FilePath, nil
+}
+
+// tgDownloadImage resolves fileID to a download URL then downloads it,
+// enforcing maxSize via io.LimitReader - reads at most maxSize+1 bytes so
+// a misreported or maliciously large file can't make this buffer an
+// unbounded amount of memory; hitting that extra byte is treated as "too
+// big" without ever having read the whole thing into memory first.
+func tgDownloadImage(client *http.Client, apiBase, token, fileID string, maxSize int64) ([]byte, error) {
+	filePath, err := tgGetFile(client, apiBase, token, fileID)
+	if err != nil {
+		return nil, fmt.Errorf("หา path ไฟล์ไม่ได้: %v", err)
+	}
+	resp, err := client.Get(tgFileURL(apiBase, token, filePath))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("ดาวน์โหลดรูปภาพสถานะ %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("ดาวน์โหลดรูปภาพไม่สำเร็จ: %v", err)
+	}
+	if int64(len(data)) > maxSize {
+		return nil, fmt.Errorf("รูปภาพมีขนาดเกิน %s", formatByteSize(maxSize))
+	}
+	return data, nil
 }
 
 // tgGetUpdates long-polls for new messages. The HTTP client passed in must
@@ -9953,6 +10037,7 @@ const builtinChatBotSystemPromptRules = `กติกาพื้นฐานท
 - ทุกคำตอบสุดท้ายต้องมีเนื้อความเสมอ ห้ามตอบข้อความว่างเปล่าเด็ดขาด ถ้าไม่แน่ใจว่าจะตอบอะไร ให้ถามกลับหรือบอกตรงๆ ว่าไม่มีข้อมูลพอ ดีกว่าปล่อยว่าง
 - คุณไม่มีเครื่องมือแก้ไฟล์ รันคำสั่ง หรือเข้าถึงระบบปฏิบัติการใดๆ ทั้งสิ้น เครื่องมือที่อาจมีให้ (ถ้าตั้งค่าไว้ - เช็คได้จาก tool list ที่แนบมากับ request นี้) มีแค่: search_knowledge/read_knowledge (ฐานความรู้ที่ผู้ดูแลกำหนดไว้ล่วงหน้า, read-only), web_search/web_fetch (ค้นอินเทอร์เน็ต, ถ้าเปิดใช้), get_current_time, delay
 - ห้ามอ้างว่าคุณทำสิ่งที่ไม่มีเครื่องมือให้ทำจริง (เช่น "แก้ไฟล์ให้แล้ว", "รันคำสั่งให้แล้ว", "บันทึกลงระบบแล้ว") และห้ามอ้างว่า "ค้นแล้วไม่เจอ" ถ้าไม่ได้เรียก tool จริงๆ
+- บางครั้งผู้ใช้อาจส่งรูปภาพมาพร้อมข้อความ (หรือส่งแค่รูปภาพเฉยๆ) - ถ้าโมเดิลที่กำลังใช้งานอยู่รองรับการดูรูปภาพจริง (vision-capable) ให้ดูรูปนั้นแล้วตอบคำถาม/อธิบายตามที่เห็นจริงในรูปตามปกติ **แต่ถ้าไม่แน่ใจหรือดูรูปไม่ได้จริง (โมเดิลไม่รองรับ vision) ห้ามแต่งคำอธิบายรูปภาพขึ้นเองเด็ดขาด** ให้บอกตรงๆ ว่าไม่สามารถดูรูปภาพนี้ได้ ดีกว่าเดาหรือสมมติว่ารูปนั้นมีอะไรอยู่
 - ถ้ามี search_knowledge อยู่ใน tool list: **ทุกคำถามที่ผู้ใช้ถาม** (ไม่ใช่แค่คำถามเกี่ยวกับชื่อคน/สถานที่/เหตุการณ์เฉพาะเจาะจงเหมือนก่อนหน้านี้) ให้เรียก search_knowledge ก่อนเสมอเพื่อดูว่าฐานความรู้มีคำตอบ/ข้อมูลที่เกี่ยวข้องอยู่หรือไม่ ก่อนจะตอบจากความรู้ทั่วไปของตัวเอง แม้จะเป็นคำถามที่ดูเหมือนความรู้ทั่วไปที่ตอบได้อยู่แล้วก็ตาม (ฐานความรู้อาจมีคำนิยาม/คำตอบเฉพาะที่ผู้ดูแลตั้งใจให้ใช้แทนความรู้ทั่วไป) ยกเว้นเฉพาะข้อความที่ไม่ใช่คำถามจริงๆ เช่น คำทักทาย/พูดคุยเล่นๆ ล้วนๆ ("สวัสดี", "ขอบคุณ", "555") ที่ไม่ต้องค้นก็ได้ (ลอง pattern "*" ถ้าไม่แน่ใจว่าไฟล์ชื่ออะไร) ห้ามตอบว่า "ไม่รู้จัก"/"ไม่มีข้อมูล" ทันทีโดยไม่ลองค้นก่อน - ถ้า query ที่ใช้ค้นไม่มีบรรทัดตรงกับคำนั้นเป๊ะๆ (คำในเอกสารมักเขียนต่างจากคำถามของผู้ใช้) แต่ระบบแนบเนื้อหาไฟล์ที่เกี่ยวข้องมาให้ ให้อ่านเนื้อหานั้นหาคำตอบเองก่อนเสมอ อย่าเพิ่งสรุปว่าไม่มีข้อมูลแค่เพราะบรรทัดไม่ตรงคำเป๊ะๆ - และให้ลอง search_knowledge ใหม่ทุกครั้งที่มีคำถามใหม่ แม้คำถามก่อนหน้าในแชทนี้จะค้นไม่เจอมาก่อนก็ตาม เพราะแต่ละคำถามอาจเชื่อมโยงกับข้อมูลคนละส่วนของฐานความรู้
 - ถ้าไม่มี web_search อยู่ใน tool list (ยังไม่ได้ตั้งค่า backend) และคำถามต้องการข้อมูลปัจจุบัน/เรียลไทม์ (เช่น ราคาสินค้า ข่าว สภาพอากาศ) ให้บอกตรงๆ ว่าคุณไม่มีเครื่องมือค้นอินเทอร์เน็ตในตอนนี้ อย่าแต่งคำตอบขึ้นเอง
 - ข้อความที่ขึ้นต้นด้วย "[สรุปบทสนทนาก่อนหน้านี้]" คือสรุปที่ระบบสร้างขึ้นเองจากบทสนทนาเก่าของแชทนี้ ใช้เป็นบริบทได้ตามปกติ แต่ไม่ใช่คำพูดที่ผู้ใช้เพิ่งพิมพ์
@@ -10297,6 +10382,96 @@ func filterTools(all []ollamaTool, names ...string) []ollamaTool {
 // to know or care that these are "actually" on a different struct.
 // ─────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────
+// Image size limiting: --max-image-size/OLA_MAX_IMAGE_SIZE, shared by
+// all four chat bots (telegrambot/discordbot/linebot/webbot - the only
+// places a human can hand ola an image over a network connection, as
+// opposed to ask/coding's own --image flag where the operator is
+// pointing at their own local file and implicitly trusts its size).
+// ─────────────────────────────────────────────────────────────────
+
+const defaultMaxImageSize = 10 * 1024 * 1024 // 10 MiB
+
+var byteSizeSuffixes = map[string]int64{
+	"":   1,
+	"B":  1,
+	"K":  1024,
+	"KB": 1024,
+	"M":  1024 * 1024,
+	"MB": 1024 * 1024,
+	"G":  1024 * 1024 * 1024,
+	"GB": 1024 * 1024 * 1024,
+}
+
+// parseByteSize parses a human-friendly size like "10K", "12M", "500",
+// "1.5G" into a byte count. Suffixes are binary (K=1024, not 1000) -
+// matches how file-size limits are conventionally expressed in most CLI
+// tools (systemd units, docker --memory, etc.), as opposed to network
+// transfer rates or marketing figures which are usually decimal.
+// Case-insensitive; a bare number with no suffix is taken as bytes.
+func parseByteSize(raw string) (int64, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return 0, fmt.Errorf("ค่าว่างเปล่า")
+	}
+	upper := strings.ToUpper(trimmed)
+	i := 0
+	for i < len(upper) && ((upper[i] >= '0' && upper[i] <= '9') || upper[i] == '.') {
+		i++
+	}
+	if i == 0 {
+		return 0, fmt.Errorf("ต้องขึ้นต้นด้วยตัวเลข เช่น \"10K\", \"12M\", \"500\" (got: %q)", raw)
+	}
+	numPart := upper[:i]
+	suffix := strings.TrimSpace(upper[i:])
+	mult, ok := byteSizeSuffixes[suffix]
+	if !ok {
+		return 0, fmt.Errorf("หน่วยไม่รู้จัก %q ใน %q (รองรับ: B, K/KB, M/MB, G/GB)", trimmed[i:], raw)
+	}
+	val, err := strconv.ParseFloat(numPart, 64)
+	if err != nil || val < 0 {
+		return 0, fmt.Errorf("ตัวเลขไม่ถูกต้อง %q", raw)
+	}
+	return int64(val * float64(mult)), nil
+}
+
+// resolveMaxImageSize applies the usual flag > env > default precedence
+// every other ola setting follows.
+func resolveMaxImageSize(flagVal string) (int64, error) {
+	raw := flagVal
+	if raw == "" {
+		raw = os.Getenv("OLA_MAX_IMAGE_SIZE")
+	}
+	if raw == "" {
+		return defaultMaxImageSize, nil
+	}
+	size, err := parseByteSize(raw)
+	if err != nil {
+		return 0, fmt.Errorf("--max-image-size/OLA_MAX_IMAGE_SIZE ไม่ถูกต้อง: %v", err)
+	}
+	if size <= 0 {
+		return 0, fmt.Errorf("--max-image-size/OLA_MAX_IMAGE_SIZE ต้องมากกว่า 0 (got: %s)", flagVal)
+	}
+	return size, nil
+}
+
+// formatByteSize renders a byte count back the other direction, for
+// error messages shown to whoever sent an oversized image - picks
+// whichever unit keeps the number readable rather than always using the
+// same unit the limit happened to be configured in.
+func formatByteSize(n int64) string {
+	switch {
+	case n >= 1024*1024*1024:
+		return fmt.Sprintf("%.1fGB", float64(n)/(1024*1024*1024))
+	case n >= 1024*1024:
+		return fmt.Sprintf("%.1fMB", float64(n)/(1024*1024))
+	case n >= 1024:
+		return fmt.Sprintf("%.1fKB", float64(n)/1024)
+	default:
+		return fmt.Sprintf("%dB", n)
+	}
+}
+
 type chatBotCore struct {
 	client           *http.Client // unbounded (no Timeout) - see buildTelegramHTTPClients'/buildDiscordHTTPClients' own doc comments for why this must never be given a short timeout
 	systemPrompt     string
@@ -10311,6 +10486,7 @@ type chatBotCore struct {
 	contextDir       string
 	keepRecent       int
 	compactAfter     int
+	maxImageSize     int64 // bytes - see parseByteSize/--max-image-size; enforced by each platform's own image-download code before an image ever reaches the model
 	ntfyTopic        string
 	outFile          *os.File
 
@@ -10340,6 +10516,13 @@ func (c *chatBotCore) contextMutex(key string) *sync.Mutex {
 	return m
 }
 
+// chatBotNoTextWithImagePrompt fills in for an empty message when a user
+// sends an image with no caption at all - without this, the outgoing
+// model message would be an empty string plus an image, which some
+// backends handle poorly (or the model just doesn't know it's expected
+// to comment on the picture rather than treat the turn as blank).
+const chatBotNoTextWithImagePrompt = "(ผู้ใช้ส่งรูปภาพมาโดยไม่มีข้อความ กรุณาอธิบาย/ตอบคำถามเกี่ยวกับรูปนี้)"
+
 // recordAndRespond is the shared heart of handling one incoming message
 // in a group/channel-capable chat bot, used by both telegramSession and
 // discordSession. It always loads the chat's persistent context and
@@ -10352,12 +10535,26 @@ func (c *chatBotCore) contextMutex(key string) *sync.Mutex {
 // loop and returns an answer when addressed is true; otherwise it saves
 // the recorded turn and returns immediately with no error and no answer.
 //
+// images (base64-encoded, no data: prefix - see ollamaMessage.Images and
+// cmdAsk's own use of base64.StdEncoding for the same shape) are attached
+// to the OUTGOING message for this one round only. They are deliberately
+// NEVER written into the persisted chatTurn/context file - only a text
+// tag ("[แนบรูปภาพ N รูป]") is stored, so a conversation with several
+// image-heavy turns doesn't balloon the on-disk context file with
+// (base64, ~33% larger than the original) image bytes forever. The model
+// still genuinely sees and can respond to the image THIS round; it just
+// won't have the pixels available again once that turn scrolls past
+// --context-keep-recent or gets compacted. Callers are responsible for
+// downloading/validating (size, format) the image bytes themselves - see
+// each platform's own image-handling code - this function only attaches
+// whatever base64 strings it's given.
+//
 // Callers own everything platform-specific: deriving speaker (a display
 // name, or "" for DMs), deciding addressed (mention/reply/prefix
 // detection), and actually sending the returned answer back out - this
 // function never touches the network for the reply itself, only for the
 // model call inside runChatToolLoop.
-func (c *chatBotCore) recordAndRespond(key, speaker, text string, addressed bool) (answer string, err error) {
+func (c *chatBotCore) recordAndRespond(key, speaker, text string, addressed bool, images []string) (answer string, err error) {
 	cctx, err := loadChatContext(c.contextDir, key)
 	if err != nil {
 		return "", fmt.Errorf("โหลด context ไม่ได้: %v", err)
@@ -10367,7 +10564,16 @@ func (c *chatBotCore) recordAndRespond(key, speaker, text string, addressed bool
 		compactChatContext(c.client, c.pcfg, c.ctxSize, cctx, c.keepRecent, c.outFile)
 	}
 
-	userTurn := chatTurn{Role: "user", Speaker: speaker, Content: text, Time: time.Now()}
+	storedText := text
+	if len(images) > 0 {
+		tag := fmt.Sprintf("[แนบรูปภาพ %d รูป]", len(images))
+		if storedText == "" {
+			storedText = tag
+		} else {
+			storedText = storedText + "\n" + tag
+		}
+	}
+	userTurn := chatTurn{Role: "user", Speaker: speaker, Content: storedText, Time: time.Now()}
 
 	if !addressed {
 		cctx.Turns = append(cctx.Turns, userTurn)
@@ -10379,7 +10585,11 @@ func (c *chatBotCore) recordAndRespond(key, speaker, text string, addressed bool
 	}
 
 	messages := cctx.buildMessages(c.systemPrompt)
-	messages = append(messages, ollamaMessage{Role: "user", Content: formatChatTurnContent(speaker, text)})
+	outgoingText := text
+	if len(images) > 0 && text == "" {
+		outgoingText = chatBotNoTextWithImagePrompt
+	}
+	messages = append(messages, ollamaMessage{Role: "user", Content: formatChatTurnContent(speaker, outgoingText), Images: images})
 
 	answer, err = c.runChatToolLoop(messages)
 	if err != nil {
@@ -10709,9 +10919,13 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 
 	chat := msg.Chat
 	from := msg.From
+	photo, hasPhoto := largestPhoto(msg.Photo)
 	rawText := strings.TrimSpace(msg.Text)
-	if rawText == "" {
-		return // no tool here can act on photos/stickers/etc. - nothing to record or act on
+	if hasPhoto {
+		rawText = strings.TrimSpace(msg.Caption) // a photo message carries its accompanying text in Caption, not Text
+	}
+	if rawText == "" && !hasPhoto {
+		return // no tool here can act on stickers/voice/etc. with no text and no photo - nothing to record or act on
 	}
 
 	isGroup := chat.Type != "private"
@@ -10721,7 +10935,7 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 		addressed = telegramMessageAddressesBot(msg, s.botUsername)
 		if addressed {
 			text = stripBotMention(rawText, s.botUsername)
-			if text == "" {
+			if text == "" && !hasPhoto {
 				return // e.g. a message that's *just* the mention with nothing else - nothing to say or record
 			}
 		}
@@ -10783,13 +10997,42 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 		speaker = telegramDisplayName(from)
 	}
 
+	// Images are only actually downloaded for addressed messages -
+	// downloading (and having the model look at) a photo posted in a
+	// group chat nobody's asking the bot about would just be wasted
+	// bandwidth/inference. An unaddressed photo still gets a text note in
+	// its recorded turn (below) so the group's own history reflects that
+	// something visual was shared, even though the bot never actually
+	// looked at it.
+	var images []string
+	if hasPhoto && addressed {
+		if photo.FileSize > 0 && photo.FileSize > s.maxImageSize {
+			_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID,
+				fmt.Sprintf("รูปภาพมีขนาด %s เกินขีดจำกัด %s (--max-image-size)", formatByteSize(photo.FileSize), formatByteSize(s.maxImageSize)))
+			return
+		}
+		data, err := tgDownloadImage(s.client, s.apiBase, s.token, photo.FileID, s.maxImageSize)
+		if err != nil {
+			s.logf("[telegram_error] ดาวน์โหลดรูปภาพไม่ได้: %v\n", err)
+			_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID, fmt.Sprintf("ขออภัย ดาวน์โหลดรูปภาพไม่สำเร็จ: %v", err))
+			return
+		}
+		images = []string{base64.StdEncoding.EncodeToString(data)}
+	} else if hasPhoto {
+		if text == "" {
+			text = "[ส่งรูปภาพ]"
+		} else {
+			text = text + "\n[ส่งรูปภาพ]"
+		}
+	}
+
 	if addressed {
 		s.logf("\n=== chat=%d(%s) user=%d(%s) ===\n[user] %s\n", chat.ID, chat.Type, from.ID, from.Username, text)
 	} else {
 		s.logf("[telegram_record] chat=%d(%s) user=%d(%s): %s\n", chat.ID, chat.Type, from.ID, from.Username, text)
 	}
 
-	answer, err := s.recordAndRespond(key, speaker, text, addressed)
+	answer, err := s.recordAndRespond(key, speaker, text, addressed, images)
 	if err != nil {
 		s.logf("[telegram_error] chat=%d: %v\n", chat.ID, err)
 		if addressed {
@@ -10863,6 +11106,9 @@ func telegramUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  --telegram-api-base <url>   OLA_TELEGRAM_API_BASE (default: https://api.telegram.org - override สำหรับเทสต์)")
 		fmt.Println("  --poll-timeout <sec>        long-poll timeout ต่อ getUpdates (default 600 = 10 นาที)")
 		fmt.Println("  --telegram-max-concurrent <n>  จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส (default 4)")
+		fmt.Println("  --max-image-size <size>     OLA_MAX_IMAGE_SIZE   ขนาดรูปภาพสูงสุดที่รับได้ เช่น \"10K\", \"12M\" (default 10M)")
+		fmt.Println("                              ต้องใช้โมเดิลที่รองรับ vision จริง (เช่น llava, qwen2-vl) ถึงจะดูรูปได้ - โมเดิล")
+		fmt.Println("                              ข้อความล้วนจะได้แค่ข้อความ ไม่เห็นรูป")
 		fmt.Println("  -c/--ctx, -P/--provider, --api-base, -k/--key   เหมือน 'ola ask'")
 		fmt.Println("  -x/--topic     ntfy.sh topic (แจ้งเตือนเมื่อเกิด error ระหว่างประมวลผลข้อความ)")
 		fmt.Println("  -o/--output    log ไฟล์แบบเต็ม (default: telegrambot.log, เปิดแบบ append เสมอ - ต่างจาก 'ola ask')")
@@ -10926,6 +11172,7 @@ func cmdTelegramBot(args []string) int {
 	var pollTimeoutSec, maxConcurrent int
 	var searxngURL, ollamaSearchKey string
 	var flagNoWebSearch bool
+	var maxImageSizeRaw string
 	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
 
 	fs.StringVar(&model, "m", "", "")
@@ -10960,6 +11207,7 @@ func cmdTelegramBot(args []string) int {
 	fs.IntVar(&fetchConcurrency, "fetch-concurrency", 0, "")
 	fs.IntVar(&searchTimeoutSec, "search-timeout", 0, "")
 	fs.IntVar(&fetchTimeoutSec, "fetch-timeout", 0, "")
+	fs.StringVar(&maxImageSizeRaw, "max-image-size", "", "")
 	fs.StringVar(&topic, "x", "", "")
 	fs.StringVar(&topic, "topic", "", "")
 	fs.StringVar(&outputFile, "o", "", "")
@@ -11080,6 +11328,12 @@ func cmdTelegramBot(args []string) int {
 		searchCfg.OllamaAPIKey, searchCfg.OllamaBase = resolveOllamaSearchConfig(ollamaSearchKey)
 	}
 
+	maxImageSize, err := resolveMaxImageSize(maxImageSizeRaw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
 	tools := filterTools(builtinTools, "get_current_time", "delay")
 	if knowledgeCfg.enabled() {
 		tools = append(tools, searchKnowledgeTool, readKnowledgeTool)
@@ -11143,6 +11397,7 @@ func cmdTelegramBot(args []string) int {
 			keepRecent:       keepRecent,
 			compactAfter:     compactAfter,
 			ntfyTopic:        ntfyTopic,
+			maxImageSize:     maxImageSize,
 			outFile:          outFile,
 			locks:            map[string]*sync.Mutex{},
 		},
@@ -11367,6 +11622,23 @@ type discordMessageReference struct {
 	MessageID string `json:"message_id"`
 }
 
+type discordAttachment struct {
+	URL         string `json:"url"`
+	ContentType string `json:"content_type,omitempty"`
+	Size        int64  `json:"size,omitempty"`
+	Filename    string `json:"filename,omitempty"`
+}
+
+func (a discordAttachment) isImage() bool {
+	if strings.HasPrefix(a.ContentType, "image/") {
+		return true
+	}
+	// content_type isn't always populated by every client that can send a
+	// message - fall back to the file extension, same allowlist ask/coding
+	// use for their own --image attachments (imageExts).
+	return imageExts[strings.ToLower(filepath.Ext(a.Filename))]
+}
+
 type discordMessage struct {
 	ID               string                   `json:"id"`
 	ChannelID        string                   `json:"channel_id"`
@@ -11374,10 +11646,24 @@ type discordMessage struct {
 	Author           discordUser              `json:"author"`
 	Content          string                   `json:"content"`
 	Mentions         []discordUser            `json:"mentions"`
+	Attachments      []discordAttachment      `json:"attachments,omitempty"`
 	MessageReference *discordMessageReference `json:"message_reference,omitempty"`
 }
 
 func (m *discordMessage) isDM() bool { return m.GuildID == "" }
+
+// firstImageAttachment returns the first attachment that looks like an
+// image, or ok=false if there isn't one - Discord messages can carry
+// several attachments of mixed types (image + a text file, for instance),
+// but this bot only ever looks at one image per message for v1 simplicity.
+func firstImageAttachment(atts []discordAttachment) (discordAttachment, bool) {
+	for _, a := range atts {
+		if a.isImage() {
+			return a, true
+		}
+	}
+	return discordAttachment{}, false
+}
 
 // ─────────────────────────────────────────────────────────────────
 // REST client. Every call carries "Authorization: Bot <token>" (a
@@ -11532,6 +11818,31 @@ func discordSendMessage(client *http.Client, apiBase, token, channelID, text str
 		}
 	}
 	return nil
+}
+
+// discordDownloadImage fetches an attachment's URL directly (already
+// fully resolved by Discord - no getFile-style extra lookup the way
+// Telegram/LINE both need) and enforces maxSize the same way
+// tgDownloadImage/lineDownloadImage do: read at most maxSize+1 bytes via
+// io.LimitReader so an attachment whose reported Size lied (or wasn't
+// reported at all) can't make this buffer an unbounded amount of memory.
+func discordDownloadImage(client *http.Client, url string, maxSize int64) ([]byte, error) {
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("ดาวน์โหลดรูปภาพสถานะ %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("ดาวน์โหลดรูปภาพไม่สำเร็จ: %v", err)
+	}
+	if int64(len(data)) > maxSize {
+		return nil, fmt.Errorf("รูปภาพมีขนาดเกิน %s", formatByteSize(maxSize))
+	}
+	return data, nil
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -11892,8 +12203,9 @@ func (s *discordSession) handleDiscordMessage(msg *discordMessage) {
 	if msg.Author.Bot || msg.Author.ID == s.botUserID {
 		return // never respond to bots (including itself) - avoids echo loops with other bots in the same server
 	}
+	image, hasImage := firstImageAttachment(msg.Attachments)
 	rawText := strings.TrimSpace(msg.Content)
-	if rawText == "" {
+	if rawText == "" && !hasImage {
 		return
 	}
 
@@ -11904,7 +12216,7 @@ func (s *discordSession) handleDiscordMessage(msg *discordMessage) {
 		addressed = discordMessageAddressesBot(msg, s.botUserID)
 		if addressed {
 			text = stripDiscordMention(rawText, s.botUserID)
-			if text == "" {
+			if text == "" && !hasImage {
 				return // e.g. a message that's *just* the mention with nothing else - nothing to say or record
 			}
 		}
@@ -11951,13 +12263,39 @@ func (s *discordSession) handleDiscordMessage(msg *discordMessage) {
 		speaker = discordDisplayName(msg.Author)
 	}
 
+	// Images are only actually downloaded for addressed messages - see
+	// telegramSession.handleTelegramMessage's own comment on this exact
+	// point for the full reasoning (shared by all three chat bots that
+	// can receive images in a group setting).
+	var images []string
+	if hasImage && addressed {
+		if image.Size > 0 && image.Size > s.maxImageSize {
+			_ = discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID,
+				fmt.Sprintf("รูปภาพมีขนาด %s เกินขีดจำกัด %s (--max-image-size)", formatByteSize(image.Size), formatByteSize(s.maxImageSize)))
+			return
+		}
+		data, err := discordDownloadImage(s.client, image.URL, s.maxImageSize)
+		if err != nil {
+			s.logf("[discord_error] ดาวน์โหลดรูปภาพไม่ได้: %v\n", err)
+			_ = discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID, fmt.Sprintf("ขออภัย ดาวน์โหลดรูปภาพไม่สำเร็จ: %v", err))
+			return
+		}
+		images = []string{base64.StdEncoding.EncodeToString(data)}
+	} else if hasImage {
+		if text == "" {
+			text = "[ส่งรูปภาพ]"
+		} else {
+			text = text + "\n[ส่งรูปภาพ]"
+		}
+	}
+
 	if addressed {
 		s.logf("\n=== discord key=%s user=%s(%s) ===\n[user] %s\n", key, msg.Author.ID, msg.Author.Username, text)
 	} else {
 		s.logf("[discord_record] key=%s user=%s(%s): %s\n", key, msg.Author.ID, msg.Author.Username, text)
 	}
 
-	answer, err := s.recordAndRespond(key, speaker, text, addressed)
+	answer, err := s.recordAndRespond(key, speaker, text, addressed, images)
 	if err != nil {
 		s.logf("[discord_error] key=%s: %v\n", key, err)
 		if addressed {
@@ -12025,6 +12363,7 @@ func discordUsage(fs *flag.FlagSet) func() {
 		fmt.Println("Runtime:")
 		fmt.Println("  -c/--ctx, -P/--provider, --api-base, -k/--key   เหมือน 'ola ask'")
 		fmt.Println("  --discord-max-concurrent <n>   จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส (default 4)")
+		fmt.Println("  --max-image-size <size>        OLA_MAX_IMAGE_SIZE   ขนาดรูปภาพสูงสุด (default 10M) - ดู 'ola telegrambot -h'")
 		fmt.Println("  -x/--topic     ntfy.sh topic (แจ้งเตือนเมื่อเกิด error ระหว่างประมวลผลข้อความ)")
 		fmt.Println("  -o/--output    log ไฟล์แบบเต็ม (default: discordbot.log, เปิดแบบ append เสมอ)")
 		fmt.Println()
@@ -12054,6 +12393,7 @@ func cmdDiscordBot(args []string) int {
 	var maxConcurrent int
 	var searxngURL, ollamaSearchKey string
 	var flagNoWebSearch bool
+	var maxImageSizeRaw string
 	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
 
 	fs.StringVar(&model, "m", "", "")
@@ -12088,6 +12428,7 @@ func cmdDiscordBot(args []string) int {
 	fs.IntVar(&fetchConcurrency, "fetch-concurrency", 0, "")
 	fs.IntVar(&searchTimeoutSec, "search-timeout", 0, "")
 	fs.IntVar(&fetchTimeoutSec, "fetch-timeout", 0, "")
+	fs.StringVar(&maxImageSizeRaw, "max-image-size", "", "")
 	fs.StringVar(&topic, "x", "", "")
 	fs.StringVar(&topic, "topic", "", "")
 	fs.StringVar(&outputFile, "o", "", "")
@@ -12190,6 +12531,12 @@ func cmdDiscordBot(args []string) int {
 		searchCfg.OllamaAPIKey, searchCfg.OllamaBase = resolveOllamaSearchConfig(ollamaSearchKey)
 	}
 
+	maxImageSize, err := resolveMaxImageSize(maxImageSizeRaw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
 	tools := filterTools(builtinTools, "get_current_time", "delay")
 	if knowledgeCfg.enabled() {
 		tools = append(tools, searchKnowledgeTool, readKnowledgeTool)
@@ -12253,6 +12600,7 @@ func cmdDiscordBot(args []string) int {
 			keepRecent:       keepRecent,
 			compactAfter:     compactAfter,
 			ntfyTopic:        ntfyTopic,
+			maxImageSize:     maxImageSize,
 			outFile:          outFile,
 			locks:            map[string]*sync.Mutex{},
 		},
@@ -12347,6 +12695,13 @@ func cmdDiscordBot(args []string) int {
 // ─────────────────────────────────────────────────────────────────
 
 const defaultLineAPIBase = "https://api.line.me/v2/bot"
+
+// defaultLineDataAPIBase is the "get content" base URL for downloading
+// what a user actually sent (images/video/audio) - confirmed against
+// LINE's own API reference, not assumed: unlike every other Messaging
+// API call, content retrieval lives on a genuinely DIFFERENT host
+// (api-data.line.me, not api.line.me). See lineDownloadImage.
+const defaultLineDataAPIBase = "https://api-data.line.me/v2/bot"
 const defaultLineListenAddr = ":8080"
 const defaultLineWebhookPath = "/line/webhook"
 const defaultLineContextDir = "line-context"
@@ -12591,6 +12946,44 @@ func linePushMessage(client *http.Client, apiBase, token, to, text string) error
 	return nil
 }
 
+// lineDownloadImage fetches an image message's raw bytes via LINE's
+// content-retrieval endpoint, which lives on dataAPIBase (see
+// defaultLineDataAPIBase's own doc comment for why this is a different
+// host from every other LINE call, and cmdLineBot for how dataAPIBase
+// gets resolved - reusing lineAPIBase's own override when one is given,
+// e.g. for tests, since a mock server serves both from one place).
+// Doesn't reuse lineRESTRequest (built around JSON request/response) -
+// this needs a plain unbuffered-size GET. Enforces maxSize via
+// io.LimitReader the same way tgDownloadImage/discordDownloadImage do -
+// LINE's webhook event gives no advance size information the way
+// Telegram's PhotoSize or Discord's attachment object do, so the only way
+// to learn the size here is to read the response; this caps how much it
+// will ever read rather than fully buffering an arbitrarily large file
+// first.
+func lineDownloadImage(client *http.Client, dataAPIBase, token, messageID string, maxSize int64) ([]byte, error) {
+	httpReq, err := http.NewRequest(http.MethodGet, dataAPIBase+"/message/"+messageID+"/content", nil)
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("ดาวน์โหลดรูปภาพสถานะ %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("ดาวน์โหลดรูปภาพไม่สำเร็จ: %v", err)
+	}
+	if int64(len(data)) > maxSize {
+		return nil, fmt.Errorf("รูปภาพมีขนาดเกิน %s", formatByteSize(maxSize))
+	}
+	return data, nil
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Access control: allow-listed users (1-on-1) and groups. LINE's "room"
 // (an older multi-person chat concept LINE itself has been merging into
@@ -12755,6 +13148,7 @@ type lineSession struct {
 	chatBotCore
 	restClient    *http.Client // short-timeout client, LINE REST API only - never used for model calls, same separation as telegramSession.telegramClient/discordSession.restClient
 	apiBase       string
+	dataAPIBase   string // content-retrieval host (api-data.line.me in production) - see defaultLineDataAPIBase's own doc comment
 	channelSecret string
 	token         string
 	botUserID     string
@@ -12874,11 +13268,12 @@ func (s *lineSession) handleLineMessage(ev *lineEvent) {
 		return
 	}
 	msg := ev.Message
-	if msg == nil || msg.Type != "text" {
-		return // sticker/image/location/etc - nothing this bot can act on
+	if msg == nil || (msg.Type != "text" && msg.Type != "image") {
+		return // sticker/location/video/audio/etc - nothing this bot can act on
 	}
-	rawText := strings.TrimSpace(msg.Text)
-	if rawText == "" {
+	hasImage := msg.Type == "image"
+	rawText := strings.TrimSpace(msg.Text) // always "" for an image message - LINE has no caption field on those, unlike Telegram/Discord
+	if rawText == "" && !hasImage {
 		return
 	}
 
@@ -12887,11 +13282,24 @@ func (s *lineSession) handleLineMessage(ev *lineEvent) {
 	addressed := true
 	text := rawText
 	if isGroup {
-		addressed = lineMessageAddressesBot(msg, s.botUserID)
-		if addressed {
-			text = stripLineMention(msg)
-			if text == "" {
-				return // e.g. a message that's *just* the mention with nothing else - nothing to say or record
+		if hasImage {
+			// LINE's mention object only ever appears on a text message
+			// (see lineMention) - an image message has no text and so
+			// literally cannot carry an @mention, meaning there is no way
+			// for a group image to address the bot at all under the same
+			// mention/prefix scheme every other message uses. Treat it the
+			// same as any other unaddressed group message (recorded with a
+			// placeholder note below, never downloaded/analyzed) rather
+			// than inventing a different addressing rule just for this
+			// one message type.
+			addressed = false
+		} else {
+			addressed = lineMessageAddressesBot(msg, s.botUserID)
+			if addressed {
+				text = stripLineMention(msg)
+				if text == "" {
+					return // e.g. a message that's *just* the mention with nothing else - nothing to say or record
+				}
 			}
 		}
 	}
@@ -12933,13 +13341,34 @@ func (s *lineSession) handleLineMessage(ev *lineEvent) {
 		speaker = s.displayName(src.UserID, lineGroupOrRoomID(src))
 	}
 
+	// Images are only actually downloaded for addressed messages - see
+	// telegramSession.handleTelegramMessage's own comment on this exact
+	// point (shared reasoning across all three chat bots that can
+	// receive images in a group setting). LINE gives no advance file-size
+	// information the way Telegram's PhotoSize/Discord's attachment
+	// object do, so there's no pre-flight size check possible here before
+	// attempting the download - lineDownloadImage's own io.LimitReader
+	// cap is the only enforcement point.
+	var images []string
+	if hasImage && addressed {
+		data, err := lineDownloadImage(s.client, s.dataAPIBase, s.token, msg.ID, s.maxImageSize)
+		if err != nil {
+			s.logf("[line_error] ดาวน์โหลดรูปภาพไม่ได้: %v\n", err)
+			_ = s.sendReply(ev.ReplyToken, to, fmt.Sprintf("ขออภัย ดาวน์โหลดรูปภาพไม่สำเร็จ: %v", err))
+			return
+		}
+		images = []string{base64.StdEncoding.EncodeToString(data)}
+	} else if hasImage {
+		text = "[ส่งรูปภาพ]"
+	}
+
 	if addressed {
 		s.logf("\n=== line key=%s user=%s ===\n[user] %s\n", key, src.UserID, text)
 	} else {
 		s.logf("[line_record] key=%s user=%s: %s\n", key, src.UserID, text)
 	}
 
-	answer, err := s.recordAndRespond(key, speaker, text, addressed)
+	answer, err := s.recordAndRespond(key, speaker, text, addressed, images)
 	if err != nil {
 		s.logf("[line_error] key=%s: %v\n", key, err)
 		if addressed {
@@ -13047,6 +13476,7 @@ func lineUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  --line-webhook-path <path>   OLA_LINE_WEBHOOK_PATH  path ของ webhook (default /line/webhook)")
 		fmt.Println("  --line-api-base <url>        OLA_LINE_API_BASE      (default: https://api.line.me/v2/bot - override สำหรับทดสอบ)")
 		fmt.Println("  --line-max-concurrent <n>    จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส (default 4)")
+		fmt.Println("  --max-image-size <size>      OLA_MAX_IMAGE_SIZE   ขนาดรูปภาพสูงสุด (default 10M) - ดู 'ola telegrambot -h'")
 		fmt.Println("  -x/--topic     ntfy.sh topic (แจ้งเตือนเมื่อเกิด error ระหว่างประมวลผลข้อความ)")
 		fmt.Println("  -o/--output    log ไฟล์แบบเต็ม (default: linebot.log, เปิดแบบ append เสมอ)")
 		fmt.Println()
@@ -13078,6 +13508,7 @@ func cmdLineBot(args []string) int {
 	var maxConcurrent int
 	var searxngURL, ollamaSearchKey string
 	var flagNoWebSearch bool
+	var maxImageSizeRaw string
 	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
 
 	fs.StringVar(&model, "m", "", "")
@@ -13113,6 +13544,7 @@ func cmdLineBot(args []string) int {
 	fs.IntVar(&fetchConcurrency, "fetch-concurrency", 0, "")
 	fs.IntVar(&searchTimeoutSec, "search-timeout", 0, "")
 	fs.IntVar(&fetchTimeoutSec, "fetch-timeout", 0, "")
+	fs.StringVar(&maxImageSizeRaw, "max-image-size", "", "")
 	fs.StringVar(&topic, "x", "", "")
 	fs.StringVar(&topic, "topic", "", "")
 	fs.StringVar(&outputFile, "o", "", "")
@@ -13166,8 +13598,17 @@ func cmdLineBot(args []string) int {
 	if lineAPIBase == "" {
 		lineAPIBase = os.Getenv("OLA_LINE_API_BASE")
 	}
+	// If --line-api-base/OLA_LINE_API_BASE was explicitly set (e.g.
+	// pointing at a mock server for testing), reuse that SAME base for
+	// content downloads too, rather than always going to the real
+	// api-data.line.me - a mock server serves both from one place, and a
+	// test has no way to override just the content-download host
+	// separately. In production (no override) the two hosts are
+	// genuinely different - see defaultLineDataAPIBase's own doc comment.
+	lineDataAPIBase := lineAPIBase
 	if lineAPIBase == "" {
 		lineAPIBase = defaultLineAPIBase
+		lineDataAPIBase = defaultLineDataAPIBase
 	}
 	if listenAddr == "" {
 		listenAddr = os.Getenv("OLA_LINE_LISTEN_ADDR")
@@ -13239,6 +13680,12 @@ func cmdLineBot(args []string) int {
 		searchCfg.OllamaAPIKey, searchCfg.OllamaBase = resolveOllamaSearchConfig(ollamaSearchKey)
 	}
 
+	maxImageSize, err := resolveMaxImageSize(maxImageSizeRaw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
 	tools := filterTools(builtinTools, "get_current_time", "delay")
 	if knowledgeCfg.enabled() {
 		tools = append(tools, searchKnowledgeTool, readKnowledgeTool)
@@ -13294,11 +13741,13 @@ func cmdLineBot(args []string) int {
 			keepRecent:       keepRecent,
 			compactAfter:     compactAfter,
 			ntfyTopic:        ntfyTopic,
+			maxImageSize:     maxImageSize,
 			outFile:          outFile,
 			locks:            map[string]*sync.Mutex{},
 		},
 		restClient:    restClient,
 		apiBase:       lineAPIBase,
+		dataAPIBase:   lineDataAPIBase,
 		channelSecret: channelSecret,
 		token:         token,
 		botUserID:     me.UserID,
@@ -13652,6 +14101,25 @@ func (s *webBotSession) sessionHandler(w http.ResponseWriter, r *http.Request) {
 type webBotChatRequest struct {
 	SessionID string `json:"session_id"`
 	Message   string `json:"message"`
+	// Image is base64-encoded (optionally as a full "data:<mime>;base64,..."
+	// URL, which the browser's FileReader.readAsDataURL naturally produces -
+	// see stripDataURLPrefix) - at most one image per message for v1
+	// simplicity, matching telegrambot/discordbot/linebot's own "look at
+	// the first/only image attached to this message" behavior.
+	Image string `json:"image,omitempty"`
+}
+
+// stripDataURLPrefix removes a leading "data:<mime>;base64," prefix if
+// present, so the server accepts exactly what a browser's
+// FileReader.readAsDataURL already produces without requiring the
+// frontend JS to do its own string surgery first.
+func stripDataURLPrefix(s string) string {
+	if strings.HasPrefix(s, "data:") {
+		if idx := strings.Index(s, ";base64,"); idx != -1 {
+			return s[idx+len(";base64,"):]
+		}
+	}
+	return s
 }
 
 type webBotChatResponse struct {
@@ -13679,21 +14147,53 @@ func (s *webBotSession) writeChatError(w http.ResponseWriter, status int, messag
 // hand-rolling the small amount that's genuinely different keeps the
 // well-tested shared method's own contract simple rather than growing an
 // in-memory-mode flag into it.
+//
+// Images are attached to the outgoing model message for this turn only -
+// same rule as recordAndRespond's own (see that function's doc comment),
+// applied here by hand for consistency even though webbot's in-memory-
+// only session storage would technically tolerate keeping the raw bytes
+// around for the rest of the session with no disk-bloat concern. Kept
+// consistent across all four chat bots on purpose: one predictable rule
+// ("the model sees an image only in the turn it arrived") is worth more
+// than a per-bot special case, and it avoids a long image-heavy session
+// growing this process's memory usage without bound.
 func (s *webBotSession) chatHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	// The body can legitimately contain a base64-encoded image (~33%
+	// larger than the original file) alongside the JSON structure and
+	// message text - size the read limit off the configured image-size
+	// ceiling rather than a fixed constant that would silently reject a
+	// deliberately-raised --max-image-size.
+	bodyLimit := int64(base64.StdEncoding.EncodedLen(int(s.maxImageSize))) + 65536
 	var req webBotChatRequest
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
-		s.writeChatError(w, http.StatusBadRequest, "รูปแบบคำขอไม่ถูกต้อง")
+	if err := json.NewDecoder(io.LimitReader(r.Body, bodyLimit)).Decode(&req); err != nil {
+		s.writeChatError(w, http.StatusBadRequest, "รูปแบบคำขอไม่ถูกต้อง (หรือรูปภาพใหญ่เกินไป)")
 		return
 	}
 	text := strings.TrimSpace(req.Message)
-	if text == "" {
+
+	var images []string
+	if req.Image != "" {
+		raw, err := base64.StdEncoding.DecodeString(stripDataURLPrefix(req.Image))
+		if err != nil {
+			s.writeChatError(w, http.StatusBadRequest, "รูปภาพไม่ถูกต้อง (decode base64 ไม่ได้)")
+			return
+		}
+		if int64(len(raw)) > s.maxImageSize {
+			s.writeChatError(w, http.StatusBadRequest,
+				fmt.Sprintf("รูปภาพมีขนาด %s เกินขีดจำกัด %s (--max-image-size)", formatByteSize(int64(len(raw))), formatByteSize(s.maxImageSize)))
+			return
+		}
+		images = []string{stripDataURLPrefix(req.Image)}
+	}
+	if text == "" && len(images) == 0 {
 		s.writeChatError(w, http.StatusBadRequest, "ข้อความว่างเปล่า")
 		return
 	}
+
 	ctx, ok := s.getSession(req.SessionID)
 	if !ok {
 		s.writeChatError(w, http.StatusNotFound, "session หมดอายุหรือไม่พบ กรุณาโหลดหน้านี้ใหม่")
@@ -13708,10 +14208,24 @@ func (s *webBotSession) chatHandler(w http.ResponseWriter, r *http.Request) {
 		compactChatContext(s.client, s.pcfg, s.ctxSize, ctx, s.keepRecent, s.outFile)
 	}
 
-	messages := ctx.buildMessages(s.systemPrompt)
-	messages = append(messages, ollamaMessage{Role: "user", Content: text})
+	storedText := text
+	if len(images) > 0 {
+		tag := fmt.Sprintf("[แนบรูปภาพ %d รูป]", len(images))
+		if storedText == "" {
+			storedText = tag
+		} else {
+			storedText = storedText + "\n" + tag
+		}
+	}
 
-	s.logf("\n=== web session=%s ===\n[user] %s\n", req.SessionID, text)
+	messages := ctx.buildMessages(s.systemPrompt)
+	outgoingText := text
+	if len(images) > 0 && text == "" {
+		outgoingText = chatBotNoTextWithImagePrompt
+	}
+	messages = append(messages, ollamaMessage{Role: "user", Content: outgoingText, Images: images})
+
+	s.logf("\n=== web session=%s ===\n[user] %s\n", req.SessionID, storedText)
 	answer, err := s.runChatToolLoop(messages)
 	if err != nil {
 		s.logf("[webbot_error] session=%s: %v\n", req.SessionID, err)
@@ -13724,7 +14238,7 @@ func (s *webBotSession) chatHandler(w http.ResponseWriter, r *http.Request) {
 	s.logf("[assistant] %s\n", answer)
 
 	ctx.Turns = append(ctx.Turns,
-		chatTurn{Role: "user", Content: text, Time: time.Now()},
+		chatTurn{Role: "user", Content: storedText, Time: time.Now()},
 		chatTurn{Role: "assistant", Content: answer, Time: time.Now()},
 	)
 	ctx.LastActive = time.Now()
@@ -13900,6 +14414,34 @@ const webBotChatHTMLTemplate = `<!DOCTYPE html>
     cursor: not-allowed;
   }
   #inputbar button:hover:not(:disabled) { background: var(--aqua); }
+  #attachBtn {
+    background: var(--bg2); color: var(--fg1); border: none;
+    border-radius: 10px; width: 44px; height: 44px; flex-shrink: 0;
+    font-size: 1.2rem; cursor: pointer;
+  }
+  #attachBtn:hover:not(:disabled) { background: var(--bg3); }
+  #attachBtn:disabled { opacity: 0.5; cursor: not-allowed; }
+  #imagePreview {
+    display: none; align-items: center; gap: 10px;
+    padding: 8px 20px; background: var(--bg1); border-top: 1px solid var(--bg3);
+  }
+  #imagePreview img {
+    width: 48px; height: 48px; object-fit: cover; border-radius: 6px;
+    border: 1px solid var(--bg3);
+  }
+  #imagePreview span {
+    flex: 1; color: var(--fg4); font-size: 0.85rem;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #imagePreview button {
+    background: var(--bg2); color: var(--fg1); border: none;
+    border-radius: 6px; width: 28px; height: 28px; cursor: pointer; font-size: 0.9rem;
+  }
+  #imagePreview button:hover { background: var(--red); }
+  .msg img.msg-image {
+    max-width: 220px; max-height: 220px; border-radius: 10px;
+    display: block; margin-top: 6px; border: 1px solid var(--bg3);
+  }
   #chat::-webkit-scrollbar { width: 10px; }
   #chat::-webkit-scrollbar-track { background: var(--bg0); }
   #chat::-webkit-scrollbar-thumb { background: var(--bg2); border-radius: 6px; }
@@ -13924,7 +14466,14 @@ const webBotChatHTMLTemplate = `<!DOCTYPE html>
     <span class="status" id="status">กำลังเชื่อมต่อ...</span>
   </header>
   <div id="chat"></div>
+  <div id="imagePreview">
+    <img id="imagePreviewThumb" alt="">
+    <span id="imagePreviewName"></span>
+    <button id="imageRemoveBtn" type="button">✕</button>
+  </div>
   <div id="inputbar">
+    <input type="file" id="imageInput" accept="image/*" style="display:none">
+    <button id="attachBtn" type="button" title="แนบรูปภาพ" disabled>📎</button>
     <textarea id="input" placeholder="พิมพ์ข้อความ..." disabled rows="1"></textarea>
     <button id="send" disabled>ส่ง</button>
   </div>
@@ -13938,24 +14487,38 @@ var OLA_AVATAR = "{{.Avatar}}";
   var inputEl = document.getElementById('input');
   var sendEl = document.getElementById('send');
   var statusEl = document.getElementById('status');
+  var attachBtn = document.getElementById('attachBtn');
+  var imageInput = document.getElementById('imageInput');
+  var imagePreview = document.getElementById('imagePreview');
+  var imagePreviewThumb = document.getElementById('imagePreviewThumb');
+  var imagePreviewName = document.getElementById('imagePreviewName');
+  var imageRemoveBtn = document.getElementById('imageRemoveBtn');
   var sessionID = null;
+  var pendingImageDataURL = null;
 
-  function addMessage(role, text) {
+  function addMessage(role, text, imageDataURL) {
     var div = document.createElement('div');
     div.className = 'msg ' + role;
     if (role === 'assistant' && OLA_AVATAR) {
       div.className += ' has-avatar';
-      var img = document.createElement('img');
-      img.className = 'msg-avatar';
-      img.src = OLA_AVATAR;
-      img.alt = '';
-      div.appendChild(img);
+      var avatarImg = document.createElement('img');
+      avatarImg.className = 'msg-avatar';
+      avatarImg.src = OLA_AVATAR;
+      avatarImg.alt = '';
+      div.appendChild(avatarImg);
       var span = document.createElement('span');
       span.className = 'msg-text';
       span.textContent = text;
       div.appendChild(span);
     } else {
       div.textContent = text;
+    }
+    if (imageDataURL) {
+      var thumb = document.createElement('img');
+      thumb.className = 'msg-image';
+      thumb.src = imageDataURL;
+      thumb.alt = '';
+      div.appendChild(thumb);
     }
     chatEl.appendChild(div);
     chatEl.scrollTop = chatEl.scrollHeight;
@@ -13965,6 +14528,7 @@ var OLA_AVATAR = "{{.Avatar}}";
   function setBusy(busy) {
     inputEl.disabled = busy;
     sendEl.disabled = busy;
+    attachBtn.disabled = busy;
     if (!busy) { inputEl.focus(); }
   }
 
@@ -13994,18 +14558,46 @@ var OLA_AVATAR = "{{.Avatar}}";
     inputEl.style.height = next + 'px';
   }
 
+  function clearPendingImage() {
+    pendingImageDataURL = null;
+    imageInput.value = '';
+    imagePreview.style.display = 'none';
+  }
+
+  attachBtn.addEventListener('click', function() { imageInput.click(); });
+
+  imageInput.addEventListener('change', function() {
+    var file = imageInput.files[0];
+    if (!file) { return; }
+    var reader = new FileReader();
+    reader.onload = function() {
+      pendingImageDataURL = reader.result;
+      imagePreviewThumb.src = pendingImageDataURL;
+      imagePreviewName.textContent = file.name;
+      imagePreview.style.display = 'flex';
+    };
+    reader.readAsDataURL(file);
+  });
+
+  imageRemoveBtn.addEventListener('click', clearPendingImage);
+
   function sendMessage() {
     var text = inputEl.value.trim();
-    if (!text || !sessionID) { return; }
-    addMessage('user', text);
+    if (!text && !pendingImageDataURL) { return; }
+    if (!sessionID) { return; }
+    addMessage('user', text, pendingImageDataURL);
+    var imageToSend = pendingImageDataURL;
     inputEl.value = '';
     autoResize();
+    clearPendingImage();
     setBusy(true);
     var thinkingEl = addMessage('thinking', 'กำลังพิมพ์...');
+    var body = { session_id: sessionID, message: text };
+    if (imageToSend) { body.image = imageToSend; }
     fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionID, message: text })
+      body: JSON.stringify(body)
     })
       .then(function(res) {
         return res.json().then(function(data) { return { ok: res.ok, data: data }; });
@@ -14081,6 +14673,7 @@ func webBotUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  -c/--ctx, -P/--provider, --api-base, -k/--key   เหมือน 'ola ask'")
 		fmt.Println("  --webbot-listen-addr <addr>   OLA_WEBBOT_LISTEN_ADDR   ที่อยู่ที่ HTTP server ฟัง (default 127.0.0.1:8090)")
 		fmt.Println("  --webbot-session-ttl <sec>    อายุ session สูงสุดก่อนถูกเก็บกวาดทิ้งถ้าไม่มีการใช้งาน (default 7200 = 2 ชม.)")
+		fmt.Println("  --max-image-size <size>       OLA_MAX_IMAGE_SIZE   ขนาดรูปภาพสูงสุด (default 10M) - ดู 'ola telegrambot -h'")
 		fmt.Println("  -x/--topic     ntfy.sh topic (แจ้งเตือนเมื่อเกิด error ระหว่างประมวลผลข้อความ)")
 		fmt.Println("  -o/--output    log ไฟล์แบบเต็ม (default: webbot.log, เปิดแบบ append เสมอ)")
 		fmt.Println()
@@ -14110,6 +14703,7 @@ func cmdWebBot(args []string) int {
 	var keepRecent, compactAfter int
 	var searxngURL, ollamaSearchKey string
 	var flagNoWebSearch bool
+	var maxImageSizeRaw string
 	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
 
 	fs.StringVar(&model, "m", "", "")
@@ -14143,6 +14737,7 @@ func cmdWebBot(args []string) int {
 	fs.IntVar(&fetchConcurrency, "fetch-concurrency", 0, "")
 	fs.IntVar(&searchTimeoutSec, "search-timeout", 0, "")
 	fs.IntVar(&fetchTimeoutSec, "fetch-timeout", 0, "")
+	fs.StringVar(&maxImageSizeRaw, "max-image-size", "", "")
 	fs.StringVar(&topic, "x", "", "")
 	fs.StringVar(&topic, "topic", "", "")
 	fs.StringVar(&outputFile, "o", "", "")
@@ -14256,6 +14851,12 @@ func cmdWebBot(args []string) int {
 		searchCfg.OllamaAPIKey, searchCfg.OllamaBase = resolveOllamaSearchConfig(ollamaSearchKey)
 	}
 
+	maxImageSize, err := resolveMaxImageSize(maxImageSizeRaw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
 	tools := filterTools(builtinTools, "get_current_time", "delay")
 	if knowledgeCfg.enabled() {
 		tools = append(tools, searchKnowledgeTool, readKnowledgeTool)
@@ -14305,6 +14906,7 @@ func cmdWebBot(args []string) int {
 			keepRecent:       keepRecent,
 			compactAfter:     compactAfter,
 			ntfyTopic:        ntfyTopic,
+			maxImageSize:     maxImageSize,
 			outFile:          outFile,
 			locks:            map[string]*sync.Mutex{},
 		},

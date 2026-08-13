@@ -7114,6 +7114,7 @@ func newTestTelegramSession(t *testing.T, telegramSrv, ollamaSrv *httptest.Serve
 			knowledgeIdx: &knowledgeIndexStore{},
 			keepRecent:   defaultChatBotKeepRecentTurns,
 			compactAfter: defaultChatBotCompactAfterTurns,
+			maxImageSize: defaultMaxImageSize,
 			outFile:      logFile,
 			locks:        map[string]*sync.Mutex{},
 		},
@@ -8608,6 +8609,7 @@ func newTestDiscordSession(t *testing.T, discordSrv, ollamaSrv *httptest.Server,
 			knowledgeIdx: &knowledgeIndexStore{},
 			keepRecent:   defaultChatBotKeepRecentTurns,
 			compactAfter: defaultChatBotCompactAfterTurns,
+			maxImageSize: defaultMaxImageSize,
 			outFile:      logFile,
 			locks:        map[string]*sync.Mutex{},
 		},
@@ -9235,6 +9237,17 @@ func newMockLineRESTServer(t *testing.T) (*httptest.Server, *lineSentTracker, *s
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"displayName":"สมหญิง"}`)
 	})
+	mux.HandleFunc("/message/", func(w http.ResponseWriter, r *http.Request) {
+		// Exact patterns registered elsewhere ("/message/reply",
+		// "/message/push") always win over this prefix fallback in
+		// net/http's ServeMux - this only ever actually serves
+		// "/message/{id}/content" (image download).
+		if !strings.HasSuffix(r.URL.Path, "/content") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Write(minimalPNG)
+	})
 	mux.HandleFunc("/message/reply", func(w http.ResponseWriter, r *http.Request) {
 		setAuth(r)
 		var body struct {
@@ -9338,6 +9351,7 @@ func TestLineWebhookHandlerAcceptsValidSignatureAndDispatches(t *testing.T) {
 			knowledgeIdx: &knowledgeIndexStore{},
 			keepRecent:   defaultChatBotKeepRecentTurns,
 			compactAfter: defaultChatBotCompactAfterTurns,
+			maxImageSize: defaultMaxImageSize,
 			outFile:      logFile,
 			locks:        map[string]*sync.Mutex{},
 		},
@@ -9415,11 +9429,13 @@ func newTestLineSession(t *testing.T, lineSrv, ollamaSrv *httptest.Server, conte
 			knowledgeIdx: &knowledgeIndexStore{},
 			keepRecent:   defaultChatBotKeepRecentTurns,
 			compactAfter: defaultChatBotCompactAfterTurns,
+			maxImageSize: defaultMaxImageSize,
 			outFile:      logFile,
 			locks:        map[string]*sync.Mutex{},
 		},
 		restClient:    lineSrv.Client(),
 		apiBase:       lineSrv.URL,
+		dataAPIBase:   lineSrv.URL, // test mock serves both REST and content-download from the same server - see defaultLineDataAPIBase's own doc comment on why they differ in production
 		channelSecret: "secret",
 		token:         "test-token",
 		botUserID:     "Ubot",
@@ -9648,6 +9664,7 @@ func newTestWebBotSession(t *testing.T, ollamaSrv *httptest.Server, token string
 			ctxSize:      4096,
 			keepRecent:   defaultChatBotKeepRecentTurns,
 			compactAfter: defaultChatBotCompactAfterTurns,
+			maxImageSize: defaultMaxImageSize,
 			outFile:      logFile,
 			locks:        map[string]*sync.Mutex{},
 		},
@@ -10216,5 +10233,568 @@ func TestWebBotEmbeddingIndexPersistsToContextDir(t *testing.T) {
 	}
 	if len(session2.knowledgeIdx.get().Chunks) != len(session.knowledgeIdx.get().Chunks) {
 		t.Fatal("expected the reloaded index to have the same chunks as the original")
+	}
+}
+
+// ======================================================================
+// Section: image support (telegrambot/discordbot/linebot/webbot) and
+// --max-image-size/OLA_MAX_IMAGE_SIZE
+// ======================================================================
+
+func TestParseByteSize(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int64
+	}{
+		{"500", 500},
+		{"10K", 10 * 1024},
+		{"10k", 10 * 1024},
+		{"10KB", 10 * 1024},
+		{"12M", 12 * 1024 * 1024},
+		{"12MB", 12 * 1024 * 1024},
+		{"1G", 1024 * 1024 * 1024},
+		{"1.5M", int64(1.5 * 1024 * 1024)},
+		{"0", 0},
+	}
+	for _, c := range cases {
+		got, err := parseByteSize(c.in)
+		if err != nil {
+			t.Fatalf("parseByteSize(%q) error: %v", c.in, err)
+		}
+		if got != c.want {
+			t.Fatalf("parseByteSize(%q) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+func TestParseByteSizeRejectsInvalid(t *testing.T) {
+	cases := []string{"", "K", "abc", "10X", "-5M", "10 K K"}
+	for _, c := range cases {
+		if _, err := parseByteSize(c); err == nil {
+			t.Fatalf("expected parseByteSize(%q) to fail", c)
+		}
+	}
+}
+
+func TestFormatByteSize(t *testing.T) {
+	cases := []struct {
+		in   int64
+		want string
+	}{
+		{500, "500B"},
+		{10 * 1024, "10.0KB"},
+		{12 * 1024 * 1024, "12.0MB"},
+		{int64(1.5 * 1024 * 1024 * 1024), "1.5GB"},
+	}
+	for _, c := range cases {
+		if got := formatByteSize(c.in); got != c.want {
+			t.Fatalf("formatByteSize(%d) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestResolveMaxImageSize(t *testing.T) {
+	got, err := resolveMaxImageSize("")
+	if err != nil || got != defaultMaxImageSize {
+		t.Fatalf("expected default %d with no flag/env set, got %d, err=%v", defaultMaxImageSize, got, err)
+	}
+	got, err = resolveMaxImageSize("5M")
+	if err != nil || got != 5*1024*1024 {
+		t.Fatalf("expected 5M to resolve to %d, got %d, err=%v", 5*1024*1024, got, err)
+	}
+	if _, err := resolveMaxImageSize("not-a-size"); err == nil {
+		t.Fatal("expected an invalid size to return an error")
+	}
+	if _, err := resolveMaxImageSize("0"); err == nil {
+		t.Fatal("expected a zero size to be rejected (must be > 0)")
+	}
+	if _, err := resolveMaxImageSize("-5M"); err == nil {
+		t.Fatal("expected a negative size to be rejected")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Telegram: photo message handling
+// ─────────────────────────────────────────────────────────────────
+
+// newMockTelegramSendMessageAndFileServer extends
+// newMockTelegramSendMessageServer with getFile + file download support,
+// needed for photo-message tests. Serves a fixed image payload for any
+// file_id.
+func newMockTelegramSendMessageAndFileServer(t *testing.T, imageData []byte) (*httptest.Server, *[]struct {
+	ChatID int64
+	Text   string
+}, *int32) {
+	t.Helper()
+	var sent []struct {
+		ChatID int64
+		Text   string
+	}
+	var downloadCalls int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/bottest-token/sendMessage", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ChatID int64  `json:"chat_id"`
+			Text   string `json:"text"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		sent = append(sent, struct {
+			ChatID int64
+			Text   string
+		}{body.ChatID, body.Text})
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":true}`)
+	})
+	mux.HandleFunc("/bottest-token/getFile", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":true,"result":{"file_path":"photos/file_1.jpg"}}`)
+	})
+	mux.HandleFunc("/file/bottest-token/photos/file_1.jpg", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&downloadCalls, 1)
+		w.Write(imageData)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, &sent, &downloadCalls
+}
+
+func TestHandleTelegramMessagePhotoReachesModelAndIsNotPersistedRaw(t *testing.T) {
+	var lastReqBody string
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		lastReqBody = string(body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("รูปนี้เป็นวงจรไฟฟ้าครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	fakeImage := minimalPNG
+	telegramSrv, sent, downloadCalls := newMockTelegramSendMessageAndFileServer(t, fakeImage)
+
+	contextDir := t.TempDir()
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, contextDir, map[int64]bool{111: true})
+
+	msg := &tgMessage{
+		From:    tgUser{ID: 111, FirstName: "สมชาย"},
+		Chat:    tgChat{ID: 111, Type: "private"},
+		Caption: "นี่คือรูปอะไร",
+		Photo:   []tgPhotoSize{{FileID: "small-id", Width: 90, Height: 90}, {FileID: "big-id", Width: 800, Height: 800}},
+	}
+	session.handleTelegramMessage(msg)
+
+	if atomic.LoadInt32(downloadCalls) != 1 {
+		t.Fatalf("expected exactly 1 image download, got %d", *downloadCalls)
+	}
+	wantB64 := base64.StdEncoding.EncodeToString(fakeImage)
+	if !strings.Contains(lastReqBody, wantB64) {
+		t.Fatal("expected the downloaded image bytes to reach the actual model request")
+	}
+	if len(*sent) != 1 || (*sent)[0].Text != "รูปนี้เป็นวงจรไฟฟ้าครับ" {
+		t.Fatalf("expected the model's answer to be sent back, got: %#v", *sent)
+	}
+
+	cctx, err := loadChatContext(contextDir, telegramContextKey(msg.Chat))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	for _, turn := range cctx.Turns {
+		if strings.Contains(turn.Content, wantB64) {
+			t.Fatal("expected the persisted context turn to never contain raw image bytes")
+		}
+	}
+	if !strings.Contains(cctx.Turns[0].Content, "แนบรูปภาพ") {
+		t.Fatalf("expected the persisted turn to note an image was attached, got: %q", cctx.Turns[0].Content)
+	}
+}
+
+func TestHandleTelegramMessagePhotoOverSizeLimitRejectedWithoutDownload(t *testing.T) {
+	ollamaSrv := httptest.NewServer(http.NewServeMux()) // never called - request must be rejected before reaching the model
+	defer ollamaSrv.Close()
+	telegramSrv, sent, downloadCalls := newMockTelegramSendMessageAndFileServer(t, minimalPNG)
+
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, t.TempDir(), map[int64]bool{111: true})
+	session.maxImageSize = 100 // bytes - tiny, so the reported FileSize below trips the pre-flight check
+
+	msg := &tgMessage{
+		From:  tgUser{ID: 111, FirstName: "สมชาย"},
+		Chat:  tgChat{ID: 111, Type: "private"},
+		Photo: []tgPhotoSize{{FileID: "big-id", Width: 800, Height: 800, FileSize: 5_000_000}},
+	}
+	session.handleTelegramMessage(msg)
+
+	if atomic.LoadInt32(downloadCalls) != 0 {
+		t.Fatalf("expected the oversized photo to be rejected BEFORE downloading (using Telegram's own reported size), got %d download(s)", *downloadCalls)
+	}
+	if len(*sent) != 1 || !strings.Contains((*sent)[0].Text, "เกินขีดจำกัด") {
+		t.Fatalf("expected a size-limit-exceeded reply, got: %#v", *sent)
+	}
+}
+
+func TestHandleTelegramMessageUnaddressedGroupPhotoRecordsPlaceholderWithoutDownload(t *testing.T) {
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) { atomic.AddInt32(&ollamaCalls, 1) })
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	telegramSrv, sent, downloadCalls := newMockTelegramSendMessageAndFileServer(t, minimalPNG)
+
+	contextDir := t.TempDir()
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, contextDir, map[int64]bool{})
+	session.access.Groups = map[int64]bool{-999: true}
+
+	msg := &tgMessage{
+		From:  tgUser{ID: 111, FirstName: "สมชาย"},
+		Chat:  tgChat{ID: -999, Type: "group", Title: "ห้องเรียน"},
+		Photo: []tgPhotoSize{{FileID: "id", Width: 800, Height: 800}},
+	}
+	session.handleTelegramMessage(msg)
+
+	if atomic.LoadInt32(downloadCalls) != 0 {
+		t.Fatalf("expected no download for an unaddressed group photo, got %d", *downloadCalls)
+	}
+	if atomic.LoadInt32(&ollamaCalls) != 0 {
+		t.Fatal("expected no model call for an unaddressed group photo")
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("expected no reply, got: %#v", *sent)
+	}
+
+	cctx, err := loadChatContext(contextDir, telegramContextKey(msg.Chat))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	if len(cctx.Turns) != 1 || !strings.Contains(cctx.Turns[0].Content, "ส่งรูปภาพ") {
+		t.Fatalf("expected a placeholder note recorded for the un-downloaded photo, got: %#v", cctx.Turns)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Discord: attachment (image) handling
+// ─────────────────────────────────────────────────────────────────
+
+// newMockImageCDNServer serves fixed image bytes at /image.png - stands
+// in for Discord's real CDN host (attachments live on a different host
+// than the REST API itself, so this is deliberately a separate server
+// from newMockDiscordRESTServer).
+func newMockImageCDNServer(t *testing.T, imageData []byte) (*httptest.Server, *int32) {
+	t.Helper()
+	var calls int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/image.png", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.Write(imageData)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, &calls
+}
+
+func TestHandleDiscordMessageAttachmentReachesModelAndIsNotPersistedRaw(t *testing.T) {
+	var lastReqBody string
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		lastReqBody = string(body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("รูปนี้เป็นวงจรไฟฟ้าครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	discordSrv, sent, _ := newMockDiscordRESTServer(t)
+	cdnSrv, downloadCalls := newMockImageCDNServer(t, minimalPNG)
+
+	contextDir := t.TempDir()
+	session := newTestDiscordSession(t, discordSrv, ollamaSrv, contextDir, map[string]bool{"111": true})
+
+	msg := &discordMessage{
+		GuildID: "", ChannelID: "channel-1", // DM - always addressed
+		Author:      discordUser{ID: "111", Username: "somchai"},
+		Content:     "รูปนี้คืออะไร",
+		Attachments: []discordAttachment{{URL: cdnSrv.URL + "/image.png", ContentType: "image/png", Filename: "circuit.png"}},
+	}
+	session.handleDiscordMessage(msg)
+
+	if atomic.LoadInt32(downloadCalls) != 1 {
+		t.Fatalf("expected exactly 1 image download, got %d", *downloadCalls)
+	}
+	wantB64 := base64.StdEncoding.EncodeToString(minimalPNG)
+	if !strings.Contains(lastReqBody, wantB64) {
+		t.Fatal("expected the downloaded image bytes to reach the actual model request")
+	}
+	if len(*sent) != 1 || (*sent)[0].Content != "รูปนี้เป็นวงจรไฟฟ้าครับ" {
+		t.Fatalf("expected the model's answer to be sent back, got: %#v", *sent)
+	}
+
+	cctx, err := loadChatContext(contextDir, discordContextKey(msg))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	for _, turn := range cctx.Turns {
+		if strings.Contains(turn.Content, wantB64) {
+			t.Fatal("expected the persisted context turn to never contain raw image bytes")
+		}
+	}
+}
+
+func TestHandleDiscordMessageAttachmentOverSizeLimitRejectedWithoutDownload(t *testing.T) {
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	discordSrv, sent, _ := newMockDiscordRESTServer(t)
+	cdnSrv, downloadCalls := newMockImageCDNServer(t, minimalPNG)
+
+	session := newTestDiscordSession(t, discordSrv, ollamaSrv, t.TempDir(), map[string]bool{"111": true})
+	session.maxImageSize = 100
+
+	msg := &discordMessage{
+		ChannelID:   "channel-1",
+		Author:      discordUser{ID: "111", Username: "somchai"},
+		Content:     "ดูรูปนี้หน่อย",
+		Attachments: []discordAttachment{{URL: cdnSrv.URL + "/image.png", ContentType: "image/png", Size: 5_000_000, Filename: "big.png"}},
+	}
+	session.handleDiscordMessage(msg)
+
+	if atomic.LoadInt32(downloadCalls) != 0 {
+		t.Fatalf("expected the oversized attachment to be rejected BEFORE downloading (using Discord's own reported Size), got %d download(s)", *downloadCalls)
+	}
+	if len(*sent) != 1 || !strings.Contains((*sent)[0].Content, "เกินขีดจำกัด") {
+		t.Fatalf("expected a size-limit-exceeded reply, got: %#v", *sent)
+	}
+}
+
+func TestDiscordAttachmentIsImageDetection(t *testing.T) {
+	cases := []struct {
+		att  discordAttachment
+		want bool
+	}{
+		{discordAttachment{ContentType: "image/png"}, true},
+		{discordAttachment{ContentType: "image/jpeg"}, true},
+		{discordAttachment{ContentType: "text/plain"}, false},
+		{discordAttachment{ContentType: "", Filename: "photo.JPG"}, true}, // extension fallback, case-insensitive
+		{discordAttachment{ContentType: "", Filename: "document.pdf"}, false},
+	}
+	for _, c := range cases {
+		if got := c.att.isImage(); got != c.want {
+			t.Fatalf("isImage() for %#v = %v, want %v", c.att, got, c.want)
+		}
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// LINE: image message handling
+// ─────────────────────────────────────────────────────────────────
+
+func TestHandleLineMessageImageDMReachesModelAndIsNotPersistedRaw(t *testing.T) {
+	var lastReqBody string
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		lastReqBody = string(body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("รูปนี้เป็นวงจรไฟฟ้าครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	lineSrv, sent, _ := newMockLineRESTServer(t)
+
+	contextDir := t.TempDir()
+	session := newTestLineSession(t, lineSrv, ollamaSrv, contextDir, map[string]bool{"U111": true})
+
+	ev := &lineEvent{
+		Type:           "message",
+		Source:         lineSource{Type: "user", UserID: "U111"},
+		ReplyToken:     "rtoken",
+		Message:        &lineMessage{ID: "msg-1", Type: "image"},
+		WebhookEventID: "evt-img-1",
+	}
+	session.handleLineMessage(ev)
+
+	got := sent.snapshot()
+	wantB64 := base64.StdEncoding.EncodeToString(minimalPNG)
+	if !strings.Contains(lastReqBody, wantB64) {
+		t.Fatal("expected the downloaded image bytes to reach the actual model request")
+	}
+	if len(got) != 1 || got[0].Kind != "push" || got[0].Text != "รูปนี้เป็นวงจรไฟฟ้าครับ" {
+		t.Fatalf("expected the model's answer to be pushed back, got: %#v", got)
+	}
+
+	cctx, err := loadChatContext(contextDir, lineContextKey(ev.Source))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	for _, turn := range cctx.Turns {
+		if strings.Contains(turn.Content, wantB64) {
+			t.Fatal("expected the persisted context turn to never contain raw image bytes")
+		}
+	}
+}
+
+func TestHandleLineMessageImageInGroupIsAlwaysUnaddressed(t *testing.T) {
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) { atomic.AddInt32(&ollamaCalls, 1) })
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	lineSrv, sent, _ := newMockLineRESTServer(t)
+
+	contextDir := t.TempDir()
+	session := newTestLineSession(t, lineSrv, ollamaSrv, contextDir, map[string]bool{})
+	session.access.Groups = map[string]bool{"C999": true}
+
+	ev := &lineEvent{
+		Type:           "message",
+		Source:         lineSource{Type: "group", GroupID: "C999", UserID: "U111"},
+		ReplyToken:     "rtoken",
+		Message:        &lineMessage{ID: "msg-2", Type: "image"},
+		WebhookEventID: "evt-img-2",
+	}
+	session.handleLineMessage(ev)
+
+	// LINE image messages carry no mention object at all - see
+	// handleLineMessage's own comment on why a group image can never be
+	// "addressed" the way a text message with an @mention can.
+	if atomic.LoadInt32(&ollamaCalls) != 0 {
+		t.Fatal("expected a group image (unaddressable by definition) to never reach the model")
+	}
+	if len(sent.snapshot()) != 0 {
+		t.Fatalf("expected no reply, got: %#v", sent.snapshot())
+	}
+
+	cctx, err := loadChatContext(contextDir, lineContextKey(ev.Source))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	if len(cctx.Turns) != 1 || !strings.Contains(cctx.Turns[0].Content, "ส่งรูปภาพ") {
+		t.Fatalf("expected a placeholder note recorded for the group image, got: %#v", cctx.Turns)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// webbot: image upload handling
+// ─────────────────────────────────────────────────────────────────
+
+func TestWebBotChatHandlerImageUploadReachesModelAndIsNotPersistedRaw(t *testing.T) {
+	var lastReqBody string
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		lastReqBody = string(body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("รูปนี้เป็นวงจรไฟฟ้าครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	session := newTestWebBotSession(t, ollamaSrv, "")
+
+	sessRec := httptest.NewRecorder()
+	session.sessionHandler(sessRec, httptest.NewRequest(http.MethodPost, "/api/session", nil))
+	var sessResp webBotSessionResponse
+	_ = json.Unmarshal(sessRec.Body.Bytes(), &sessResp)
+
+	imgB64 := base64.StdEncoding.EncodeToString(minimalPNG)
+	chatBody, _ := json.Marshal(webBotChatRequest{
+		SessionID: sessResp.SessionID,
+		Message:   "รูปนี้คืออะไร",
+		Image:     "data:image/png;base64," + imgB64,
+	})
+	chatRec := httptest.NewRecorder()
+	session.chatHandler(chatRec, httptest.NewRequest(http.MethodPost, "/api/chat", bytes.NewReader(chatBody)))
+
+	if chatRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", chatRec.Code, chatRec.Body.String())
+	}
+	if !strings.Contains(lastReqBody, imgB64) {
+		t.Fatal("expected the image bytes to reach the actual model request")
+	}
+
+	ctx, ok := session.getSession(sessResp.SessionID)
+	if !ok {
+		t.Fatal("expected the session to still exist")
+	}
+	for _, turn := range ctx.Turns {
+		if strings.Contains(turn.Content, imgB64) {
+			t.Fatal("expected the in-memory session turn to never contain raw image bytes, only a text tag - consistent with the other three bots even though webbot's memory-only storage would otherwise tolerate it")
+		}
+	}
+}
+
+func TestWebBotChatHandlerImageWithNoCaptionUsesPlaceholderPrompt(t *testing.T) {
+	var lastReqBody string
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		lastReqBody = string(body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("โอเคครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	session := newTestWebBotSession(t, ollamaSrv, "")
+
+	sessRec := httptest.NewRecorder()
+	session.sessionHandler(sessRec, httptest.NewRequest(http.MethodPost, "/api/session", nil))
+	var sessResp webBotSessionResponse
+	_ = json.Unmarshal(sessRec.Body.Bytes(), &sessResp)
+
+	imgB64 := base64.StdEncoding.EncodeToString(minimalPNG)
+	chatBody, _ := json.Marshal(webBotChatRequest{SessionID: sessResp.SessionID, Image: "data:image/png;base64," + imgB64}) // no Message at all
+	chatRec := httptest.NewRecorder()
+	session.chatHandler(chatRec, httptest.NewRequest(http.MethodPost, "/api/chat", bytes.NewReader(chatBody)))
+
+	if chatRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 (an image with no caption is still a valid message), got %d: %s", chatRec.Code, chatRec.Body.String())
+	}
+	if !strings.Contains(lastReqBody, "อธิบาย") {
+		t.Fatalf("expected the placeholder prompt to be used when no caption text was given, got request: %s", lastReqBody)
+	}
+}
+
+func TestWebBotChatHandlerRejectsOversizedImage(t *testing.T) {
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	session := newTestWebBotSession(t, ollamaSrv, "")
+	session.maxImageSize = 10 // bytes - trivially smaller than any real image
+
+	sessRec := httptest.NewRecorder()
+	session.sessionHandler(sessRec, httptest.NewRequest(http.MethodPost, "/api/session", nil))
+	var sessResp webBotSessionResponse
+	_ = json.Unmarshal(sessRec.Body.Bytes(), &sessResp)
+
+	imgB64 := base64.StdEncoding.EncodeToString(minimalPNG)
+	chatBody, _ := json.Marshal(webBotChatRequest{SessionID: sessResp.SessionID, Message: "ดูรูปนี้", Image: "data:image/png;base64," + imgB64})
+	chatRec := httptest.NewRecorder()
+	session.chatHandler(chatRec, httptest.NewRequest(http.MethodPost, "/api/chat", bytes.NewReader(chatBody)))
+
+	if chatRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an oversized image, got %d", chatRec.Code)
+	}
+	var resp webBotChatResponse
+	_ = json.Unmarshal(chatRec.Body.Bytes(), &resp)
+	if !strings.Contains(resp.Error, "เกินขีดจำกัด") {
+		t.Fatalf("expected a size-limit-exceeded error, got: %q", resp.Error)
+	}
+}
+
+func TestStripDataURLPrefix(t *testing.T) {
+	if got := stripDataURLPrefix("data:image/png;base64,QUJD"); got != "QUJD" {
+		t.Fatalf("expected the data: URL prefix to be stripped, got %q", got)
+	}
+	if got := stripDataURLPrefix("QUJD"); got != "QUJD" {
+		t.Fatalf("expected a bare base64 string (no prefix) to pass through unchanged, got %q", got)
+	}
+}
+
+// TestBuildChatBotSystemPromptWarnsAgainstFabricatingImageDescriptions
+// pins the rule that keeps a non-vision-capable model honest about not
+// being able to see an attached image, rather than inventing a
+// plausible-sounding description - the same "don't fabricate" principle
+// the rules already apply to search results, now extended to images
+// since all four chat bots can now receive them.
+func TestBuildChatBotSystemPromptWarnsAgainstFabricatingImageDescriptions(t *testing.T) {
+	prompt := buildChatBotSystemPrompt("เว็บแชท", "")
+	if !strings.Contains(prompt, "ห้ามแต่งคำอธิบายรูปภาพขึ้นเอง") {
+		t.Fatal("expected the rules to warn against fabricating a description for an image the model can't actually see")
 	}
 }
