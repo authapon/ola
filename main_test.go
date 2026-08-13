@@ -17,6 +17,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -8991,5 +8993,963 @@ func TestChatBotDefaultsMatchRequestedValues(t *testing.T) {
 	}
 	if defaultTelegramPollTimeoutSec != 600 {
 		t.Fatalf("expected default poll-timeout to be 600, got %d", defaultTelegramPollTimeoutSec)
+	}
+}
+
+// ======================================================================
+// Section: linebot
+//
+// Unit tests for the pure helper functions (signature verification,
+// allowlist, mention detection/stripping, message splitting), REST client
+// tests via httptest, webhook HTTP handler tests (a real net/http.Handler
+// - no fake transport needed at all, simpler to test than either
+// telegrambot's long-poll loop or discordbot's Gateway state machine),
+// and end-to-end handleLineMessage tests mirroring the other two bots'
+// own test sections, confirming the shared chatBotCore behaves
+// identically from LINE's side of the fence too.
+// ======================================================================
+
+func TestVerifyLineSignature(t *testing.T) {
+	secret := "test-channel-secret"
+	body := []byte(`{"events":[]}`)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	validSig := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+
+	if !verifyLineSignature(body, validSig, secret) {
+		t.Fatal("expected a correctly computed signature to verify")
+	}
+	if verifyLineSignature(body, validSig, "wrong-secret") {
+		t.Fatal("expected verification to fail with the wrong secret")
+	}
+	if verifyLineSignature([]byte(`{"events":[],"tampered":true}`), validSig, secret) {
+		t.Fatal("expected verification to fail if the body was modified after signing")
+	}
+	if verifyLineSignature(body, "not-valid-base64!!!", secret) {
+		t.Fatal("expected verification to fail gracefully on a malformed signature header, not panic")
+	}
+	if verifyLineSignature(body, "", secret) {
+		t.Fatal("expected an empty signature header to fail verification")
+	}
+}
+
+func TestSplitLineMessageRespectsLineLimit(t *testing.T) {
+	got := splitLineMessage("สวัสดีครับ")
+	if len(got) != 1 || got[0] != "สวัสดีครับ" {
+		t.Fatalf("expected single unchanged chunk, got %#v", got)
+	}
+
+	var sb strings.Builder
+	for i := 0; i < 200; i++ {
+		sb.WriteString(strings.Repeat("a", 30))
+		sb.WriteString("\n")
+	}
+	chunks := splitLineMessage(sb.String())
+	if len(chunks) < 2 {
+		t.Fatalf("expected text longer than LINE's limit to split, got %d chunk(s)", len(chunks))
+	}
+	for _, c := range chunks {
+		if utf8.RuneCountInString(c) > lineMaxMessageRunes {
+			t.Fatalf("chunk exceeds lineMaxMessageRunes (%d): %d runes", lineMaxMessageRunes, utf8.RuneCountInString(c))
+		}
+	}
+}
+
+func TestParseLineIDList(t *testing.T) {
+	ids, warnings := parseLineIDList("U4af4980629, C1234567890abcdef, ")
+	if len(warnings) != 0 {
+		t.Fatalf("expected no warnings for LINE's opaque ID format, got: %v", warnings)
+	}
+	if len(ids) != 2 || !ids["U4af4980629"] || !ids["C1234567890abcdef"] {
+		t.Fatalf("unexpected ids: %v", ids)
+	}
+}
+
+func TestLineAccessConfigAllowed(t *testing.T) {
+	cfg := lineAccessConfig{
+		Users:  map[string]bool{"U111": true},
+		Groups: map[string]bool{"C222": true, "R333": true},
+	}
+	if !cfg.allowed(lineSource{Type: "user", UserID: "U111"}) {
+		t.Fatal("expected allow-listed 1-on-1 user to be allowed")
+	}
+	if cfg.allowed(lineSource{Type: "user", UserID: "U999"}) {
+		t.Fatal("expected non-allow-listed user to be denied")
+	}
+	if !cfg.allowed(lineSource{Type: "group", GroupID: "C222", UserID: "U999"}) {
+		t.Fatal("expected allow-listed group to be allowed regardless of sender")
+	}
+	if !cfg.allowed(lineSource{Type: "room", RoomID: "R333", UserID: "U999"}) {
+		t.Fatal("expected allow-listed room to be allowed (rooms share the Groups allowlist)")
+	}
+	if cfg.allowed(lineSource{Type: "group", GroupID: "C444", UserID: "U111"}) {
+		t.Fatal("expected a non-allow-listed group to be denied even for an allow-listed user")
+	}
+}
+
+func TestLineContextKeyNoCollisionWithOtherPlatforms(t *testing.T) {
+	userSrc := lineSource{Type: "user", UserID: "U111"}
+	groupSrc := lineSource{Type: "group", GroupID: "C222"}
+	if got := lineContextKey(userSrc); got != "line_user_U111" {
+		t.Fatalf("expected line_user_U111, got %q", got)
+	}
+	if got := lineContextKey(groupSrc); got != "line_group_C222" {
+		t.Fatalf("expected line_group_C222, got %q", got)
+	}
+	tgKey := telegramContextKey(tgChat{ID: 111, Type: "private"})
+	dcKey := discordContextKey(&discordMessage{Author: discordUser{ID: "111"}})
+	if lineContextKey(userSrc) == tgKey || lineContextKey(userSrc) == dcKey {
+		t.Fatal("expected LINE context keys to never collide with Telegram/Discord keys")
+	}
+}
+
+func TestLineMessageAddressesBotAndStripMention(t *testing.T) {
+	cases := []struct {
+		name    string
+		msg     *lineMessage
+		addr    bool
+		stripTo string
+	}{
+		{"mention", &lineMessage{Text: "@olabot สรุปให้หน่อย", Mention: &lineMention{Mentionees: []lineMentionee{{Index: 0, Length: 7, UserID: "Ubot"}}}}, true, "สรุปให้หน่อย"},
+		{"ola-prefix", &lineMessage{Text: "/ola สรุปให้หน่อย"}, true, "สรุปให้หน่อย"},
+		{"ask-prefix", &lineMessage{Text: "/ask hello"}, true, "hello"},
+		{"mentions-someone-else", &lineMessage{Text: "@friend hi", Mention: &lineMention{Mentionees: []lineMentionee{{Index: 0, Length: 7, UserID: "Uother"}}}}, false, ""},
+		{"unaddressed", &lineMessage{Text: "คุยกันเฉยๆ ไม่เกี่ยวกับบอท"}, false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := lineMessageAddressesBot(tc.msg, "Ubot")
+			if got != tc.addr {
+				t.Fatalf("lineMessageAddressesBot: got %v, want %v", got, tc.addr)
+			}
+			if tc.addr {
+				stripped := stripLineMention(tc.msg)
+				if stripped != tc.stripTo {
+					t.Fatalf("stripLineMention: got %q, want %q", stripped, tc.stripTo)
+				}
+			}
+		})
+	}
+}
+
+func TestLineAlreadyProcessedDedup(t *testing.T) {
+	logFile, _ := os.CreateTemp(t.TempDir(), "log")
+	defer logFile.Close()
+	s := &lineSession{chatBotCore: chatBotCore{outFile: logFile}, recentEvents: map[string]bool{}}
+
+	if s.alreadyProcessed("evt-1") {
+		t.Fatal("expected the first sighting of an event ID to not be flagged as a duplicate")
+	}
+	if !s.alreadyProcessed("evt-1") {
+		t.Fatal("expected a redelivered event ID to be recognized as a duplicate")
+	}
+	if s.alreadyProcessed("evt-2") {
+		t.Fatal("expected a different event ID to not be flagged as a duplicate")
+	}
+	if s.alreadyProcessed("") {
+		t.Fatal("expected an empty event ID (no dedup info available) to never be treated as a duplicate")
+	}
+}
+
+// newMockLineRESTServer returns an httptest.Server implementing the LINE
+// REST endpoints this bot calls (/info, /profile/{id}, /group/{gid}/
+// member/{uid}, /message/reply, /message/push), recording every reply/push
+// call and the last Authorization header seen (to verify the Bearer
+// scheme).
+// lineSentMessage is one recorded reply/push call the mock LINE REST
+// server received.
+type lineSentMessage struct {
+	Kind string // "reply" or "push"
+	To   string // replyToken for reply, recipient id for push
+	Text string
+}
+
+// lineSentTracker guards the mock server's recorded messages with a
+// mutex - necessary because, unlike telegramSession/discordSession's own
+// tests (which call handleTelegramMessage/handleDiscordMessage directly
+// and synchronously from the test goroutine), lineSession's webhookHandler
+// dispatches to handleLineMessage in its own goroutine (see
+// webhookHandler's own doc comment on why - LINE expects a fast ack).
+// That means the mock server's handlers run concurrently with the test
+// goroutine's own assertions; a plain unsynchronized slice here would be
+// a genuine data race, not just untidy code, and go test -race catches
+// exactly that.
+type lineSentTracker struct {
+	mu   sync.Mutex
+	sent []lineSentMessage
+}
+
+func (t *lineSentTracker) add(msg lineSentMessage) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.sent = append(t.sent, msg)
+}
+
+// snapshot returns a race-free copy of everything recorded so far.
+func (t *lineSentTracker) snapshot() []lineSentMessage {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]lineSentMessage, len(t.sent))
+	copy(out, t.sent)
+	return out
+}
+
+// waitForCount blocks (up to a short timeout) until at least n messages
+// have been recorded - used instead of polling an unrelated signal (like
+// a separate atomic counter on the model-call side) as a proxy for "the
+// async handler has finished sending its reply", which is exactly the
+// race the original version of this test harness had.
+func (t *lineSentTracker) waitForCount(n int) []lineSentMessage {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if s := t.snapshot(); len(s) >= n {
+			return s
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return t.snapshot()
+}
+
+func newMockLineRESTServer(t *testing.T) (*httptest.Server, *lineSentTracker, *string) {
+	t.Helper()
+	tracker := &lineSentTracker{}
+	var authMu sync.Mutex
+	var lastAuth string
+	setAuth := func(r *http.Request) {
+		authMu.Lock()
+		lastAuth = r.Header.Get("Authorization")
+		authMu.Unlock()
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/info", func(w http.ResponseWriter, r *http.Request) {
+		setAuth(r)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"userId":"Ubot","displayName":"olabot"}`)
+	})
+	mux.HandleFunc("/profile/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"displayName":"สมชาย"}`)
+	})
+	mux.HandleFunc("/group/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"displayName":"สมหญิง"}`)
+	})
+	mux.HandleFunc("/message/reply", func(w http.ResponseWriter, r *http.Request) {
+		setAuth(r)
+		var body struct {
+			ReplyToken string `json:"replyToken"`
+			Messages   []struct {
+				Text string `json:"text"`
+			} `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		for _, m := range body.Messages {
+			tracker.add(lineSentMessage{"reply", body.ReplyToken, m.Text})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{}`)
+	})
+	mux.HandleFunc("/message/push", func(w http.ResponseWriter, r *http.Request) {
+		setAuth(r)
+		var body struct {
+			To       string `json:"to"`
+			Messages []struct {
+				Text string `json:"text"`
+			} `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		for _, m := range body.Messages {
+			tracker.add(lineSentMessage{"push", body.To, m.Text})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, tracker, &lastAuth
+}
+
+func TestLineRESTAuthHeaderUsesBearerScheme(t *testing.T) {
+	srv, _, lastAuth := newMockLineRESTServer(t)
+	if _, err := lineGetBotInfo(srv.Client(), srv.URL, "test-token"); err != nil {
+		t.Fatalf("lineGetBotInfo error: %v", err)
+	}
+	if *lastAuth != "Bearer test-token" {
+		t.Fatalf("expected Authorization header 'Bearer test-token', got %q", *lastAuth)
+	}
+}
+
+func TestLineReplyThenPushRouting(t *testing.T) {
+	srv, sent, _ := newMockLineRESTServer(t)
+
+	// sendReply-equivalent: a direct reply call should show up as "reply"
+	if err := lineReplyMessage(srv.Client(), srv.URL, "tok", "rtoken-1", "hello"); err != nil {
+		t.Fatalf("lineReplyMessage error: %v", err)
+	}
+	// sendAnswer-equivalent: a direct push call should show up as "push"
+	if err := linePushMessage(srv.Client(), srv.URL, "tok", "U111", "answer"); err != nil {
+		t.Fatalf("linePushMessage error: %v", err)
+	}
+	if got := sent.snapshot(); len(got) != 2 || got[0].Kind != "reply" || got[1].Kind != "push" {
+		t.Fatalf("unexpected sent messages: %#v", got)
+	}
+}
+
+func TestLineWebhookHandlerRejectsBadSignature(t *testing.T) {
+	logFile, _ := os.CreateTemp(t.TempDir(), "log")
+	defer logFile.Close()
+	s := &lineSession{chatBotCore: chatBotCore{outFile: logFile}, channelSecret: "secret", recentEvents: map[string]bool{}}
+
+	body := []byte(`{"events":[]}`)
+	req := httptest.NewRequest(http.MethodPost, "/line/webhook", bytes.NewReader(body))
+	req.Header.Set("X-Line-Signature", "clearly-not-valid")
+	rec := httptest.NewRecorder()
+	s.webhookHandler(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for a bad signature, got %d", rec.Code)
+	}
+}
+
+func TestLineWebhookHandlerAcceptsValidSignatureAndDispatches(t *testing.T) {
+	lineSrv, sent, _ := newMockLineRESTServer(t)
+
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&ollamaCalls, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("สวัสดีครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	logFile, _ := os.CreateTemp(t.TempDir(), "log")
+	defer logFile.Close()
+	s := &lineSession{
+		chatBotCore: chatBotCore{
+			client:       ollamaSrv.Client(),
+			systemPrompt: buildChatBotSystemPrompt("LINE", ""),
+			tools:        filterTools(builtinTools, "get_current_time", "delay"),
+			pcfg:         providerConfig{Provider: providerOllama, Host: ollamaSrv.URL, Model: "mock-model"},
+			ctxSize:      4096,
+			contextDir:   t.TempDir(),
+			knowledgeIdx: &knowledgeIndexStore{},
+			keepRecent:   defaultChatBotKeepRecentTurns,
+			compactAfter: defaultChatBotCompactAfterTurns,
+			outFile:      logFile,
+			locks:        map[string]*sync.Mutex{},
+		},
+		restClient:    lineSrv.Client(),
+		apiBase:       lineSrv.URL,
+		channelSecret: "secret",
+		token:         "test-token",
+		botUserID:     "Ubot",
+		access:        lineAccessConfig{Users: map[string]bool{"U111": true}},
+		sem:           make(chan struct{}, 4),
+		nameCache:     map[string]string{},
+		recentEvents:  map[string]bool{},
+	}
+
+	bodyObj := lineWebhookBody{
+		Destination: "xxx",
+		Events: []lineEvent{
+			{
+				Type:           "message",
+				Source:         lineSource{Type: "user", UserID: "U111"},
+				ReplyToken:     "rtoken-1",
+				Message:        &lineMessage{Type: "text", Text: "สวัสดี"},
+				WebhookEventID: "evt-1",
+			},
+		},
+	}
+	body, _ := json.Marshal(bodyObj)
+	mac := hmac.New(sha256.New, []byte("secret"))
+	mac.Write(body)
+	sig := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+
+	req := httptest.NewRequest(http.MethodPost, "/line/webhook", bytes.NewReader(body))
+	req.Header.Set("X-Line-Signature", sig)
+	rec := httptest.NewRecorder()
+	s.webhookHandler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for a validly signed webhook, got %d", rec.Code)
+	}
+
+	// The event is dispatched asynchronously (goroutine - see
+	// webhookHandler's own doc comment on why) - wait on the tracker
+	// itself reaching the expected count, not on an unrelated signal like
+	// the model-call counter, which only proves the FIRST half of the
+	// async work finished, not the subsequent push call this assertion
+	// actually depends on.
+	got := sent.waitForCount(1)
+
+	if atomic.LoadInt32(&ollamaCalls) != 1 {
+		t.Fatalf("expected the webhook event to reach the model exactly once, got %d calls", ollamaCalls)
+	}
+	if len(got) != 1 || got[0].Kind != "push" || got[0].Text != "สวัสดีครับ" {
+		t.Fatalf("expected a single push reply with the model's answer, got: %#v", got)
+	}
+}
+
+// newTestLineSession builds a lineSession wired to mock LINE REST and
+// Ollama httptest servers, for driving handleLineMessage directly -
+// mirrors newTestTelegramSession/newTestDiscordSession.
+func newTestLineSession(t *testing.T, lineSrv, ollamaSrv *httptest.Server, contextDir string, users map[string]bool) *lineSession {
+	t.Helper()
+	logFile, err := os.CreateTemp(t.TempDir(), "linebot-test-log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { logFile.Close() })
+	return &lineSession{
+		chatBotCore: chatBotCore{
+			client:       ollamaSrv.Client(),
+			systemPrompt: buildChatBotSystemPrompt("LINE", ""),
+			tools:        filterTools(builtinTools, "get_current_time", "delay"),
+			pcfg:         providerConfig{Provider: providerOllama, Host: ollamaSrv.URL, Model: "mock-model"},
+			ctxSize:      4096,
+			contextDir:   contextDir,
+			knowledgeIdx: &knowledgeIndexStore{},
+			keepRecent:   defaultChatBotKeepRecentTurns,
+			compactAfter: defaultChatBotCompactAfterTurns,
+			outFile:      logFile,
+			locks:        map[string]*sync.Mutex{},
+		},
+		restClient:    lineSrv.Client(),
+		apiBase:       lineSrv.URL,
+		channelSecret: "secret",
+		token:         "test-token",
+		botUserID:     "Ubot",
+		access:        lineAccessConfig{Users: users, Groups: map[string]bool{}},
+		sem:           make(chan struct{}, 4),
+		nameCache:     map[string]string{},
+		recentEvents:  map[string]bool{},
+	}
+}
+
+func TestHandleLineMessageDeniedUserGetsNoAnswerFromModel(t *testing.T) {
+	lineSrv, sent, _ := newMockLineRESTServer(t)
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&ollamaCalls, 1)
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	session := newTestLineSession(t, lineSrv, ollamaSrv, t.TempDir(), map[string]bool{}) // nobody allowed
+
+	ev := &lineEvent{
+		Type:           "message",
+		Source:         lineSource{Type: "user", UserID: "U999"},
+		ReplyToken:     "rtoken",
+		Message:        &lineMessage{Type: "text", Text: "สวัสดี"},
+		WebhookEventID: "evt-denied",
+	}
+	session.handleLineMessage(ev)
+
+	if atomic.LoadInt32(&ollamaCalls) != 0 {
+		t.Fatal("expected a denied user's message to never reach the model")
+	}
+	if got := sent.snapshot(); len(got) != 1 || !strings.Contains(got[0].Text, "ยังไม่ได้รับอนุญาต") {
+		t.Fatalf("expected a single access-denied reply, got: %#v", got)
+	}
+}
+
+func TestHandleLineMessageRecordsUnaddressedGroupMessageWithSpeakerAttribution(t *testing.T) {
+	lineSrv, sent, _ := newMockLineRESTServer(t)
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&ollamaCalls, 1)
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	contextDir := t.TempDir()
+	session := newTestLineSession(t, lineSrv, ollamaSrv, contextDir, map[string]bool{})
+	session.access.Groups = map[string]bool{"C999": true}
+
+	ev := &lineEvent{
+		Type:           "message",
+		Source:         lineSource{Type: "group", GroupID: "C999", UserID: "U111"},
+		ReplyToken:     "rtoken",
+		Message:        &lineMessage{Type: "text", Text: "วันนี้อากาศดีจัง"},
+		WebhookEventID: "evt-1",
+	}
+	session.handleLineMessage(ev)
+
+	if atomic.LoadInt32(&ollamaCalls) != 0 {
+		t.Fatal("expected an unaddressed group message to never reach the model")
+	}
+	if got := sent.snapshot(); len(got) != 0 {
+		t.Fatalf("expected no reply to an unaddressed group message, got: %#v", got)
+	}
+
+	cctx, err := loadChatContext(contextDir, lineContextKey(ev.Source))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	if len(cctx.Turns) != 1 {
+		t.Fatalf("expected the unaddressed message to still be recorded, got %d turns", len(cctx.Turns))
+	}
+	// newMockLineRESTServer's /group/ handler always returns "สมหญิง" for
+	// group member profile lookups - confirms the group-member-profile
+	// endpoint (not the 1-on-1 /profile/ one) was used for a group turn.
+	if cctx.Turns[0].Speaker != "สมหญิง" {
+		t.Fatalf("expected speaker attribution from the group-member profile lookup, got speaker=%q", cctx.Turns[0].Speaker)
+	}
+}
+
+func TestHandleLineMessageMentionedRespondsAndUsesPush(t *testing.T) {
+	lineSrv, sent, _ := newMockLineRESTServer(t)
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("ได้เลยครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	session := newTestLineSession(t, lineSrv, ollamaSrv, t.TempDir(), map[string]bool{})
+	session.access.Groups = map[string]bool{"C999": true}
+
+	ev := &lineEvent{
+		Type:       "message",
+		Source:     lineSource{Type: "group", GroupID: "C999", UserID: "U111"},
+		ReplyToken: "rtoken-should-not-be-used-for-the-answer",
+		Message: &lineMessage{
+			Type: "text", Text: "@olabot ช่วยหน่อย",
+			Mention: &lineMention{Mentionees: []lineMentionee{{Index: 0, Length: 7, UserID: "Ubot"}}},
+		},
+		WebhookEventID: "evt-2",
+	}
+	session.handleLineMessage(ev)
+
+	got := sent.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 message sent, got %d: %#v", len(got), got)
+	}
+	if got[0].Kind != "push" {
+		t.Fatalf("expected the model's answer to go out via Push (never Reply, given the token's short lifetime), got kind=%q", got[0].Kind)
+	}
+	if got[0].To != "C999" {
+		t.Fatalf("expected the push target to be the group ID, got %q", got[0].To)
+	}
+	if got[0].Text != "ได้เลยครับ" {
+		t.Fatalf("unexpected answer text: %q", got[0].Text)
+	}
+}
+
+func TestHandleLineMessageWhoamiUsesReplyNotPush(t *testing.T) {
+	lineSrv, sent, _ := newMockLineRESTServer(t)
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+
+	session := newTestLineSession(t, lineSrv, ollamaSrv, t.TempDir(), map[string]bool{})
+
+	ev := &lineEvent{
+		Type:           "message",
+		Source:         lineSource{Type: "user", UserID: "U111"},
+		ReplyToken:     "rtoken-whoami",
+		Message:        &lineMessage{Type: "text", Text: "/whoami"},
+		WebhookEventID: "evt-whoami",
+	}
+	session.handleLineMessage(ev)
+
+	got := sent.snapshot()
+	if len(got) != 1 || got[0].Kind != "reply" {
+		t.Fatalf("expected /whoami to use the fast Reply path (no model call needed), got: %#v", got)
+	}
+	if !strings.Contains(got[0].Text, "U111") {
+		t.Fatalf("expected the reply to include the user's own ID, got: %s", got[0].Text)
+	}
+}
+
+func TestLineWebhookRedeliveryIsIgnored(t *testing.T) {
+	lineSrv, sent, _ := newMockLineRESTServer(t)
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&ollamaCalls, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("โอเค", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	session := newTestLineSession(t, lineSrv, ollamaSrv, t.TempDir(), map[string]bool{"U111": true})
+
+	ev := &lineEvent{
+		Type:           "message",
+		Source:         lineSource{Type: "user", UserID: "U111"},
+		ReplyToken:     "rtoken",
+		Message:        &lineMessage{Type: "text", Text: "ทดสอบ redelivery"},
+		WebhookEventID: "evt-redelivered",
+	}
+	session.handleLineMessage(ev)
+	session.handleLineMessage(ev) // simulate LINE redelivering the exact same event
+
+	if atomic.LoadInt32(&ollamaCalls) != 1 {
+		t.Fatalf("expected a redelivered webhook event to be processed exactly once, got %d model calls", ollamaCalls)
+	}
+	if got := sent.snapshot(); len(got) != 1 {
+		t.Fatalf("expected exactly 1 reply sent despite the redelivery, got %d: %#v", len(got), got)
+	}
+}
+
+// ======================================================================
+// Section: webbot
+//
+// Unit tests for the pure helper functions (session ID randomness, token
+// comparison, idle-session cleanup), HTTP handler tests via httptest
+// (index/session/chat, token gate, session-not-found), and an end-to-end
+// test proving the "bot introduces itself before the user can chat"
+// requirement and the "never touches disk" requirement both actually
+// hold, not just look right in the code.
+// ======================================================================
+
+// newTestWebBotSession builds a webBotSession wired to a mock Ollama
+// server, for driving the HTTP handlers directly - mirrors
+// newTestTelegramSession/newTestDiscordSession/newTestLineSession.
+func newTestWebBotSession(t *testing.T, ollamaSrv *httptest.Server, token string) *webBotSession {
+	t.Helper()
+	logFile, err := os.CreateTemp(t.TempDir(), "webbot-test-log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { logFile.Close() })
+	return &webBotSession{
+		chatBotCore: chatBotCore{
+			client:       ollamaSrv.Client(),
+			systemPrompt: buildChatBotSystemPrompt("เว็บแชท", ""),
+			tools:        filterTools(builtinTools, "get_current_time", "delay"),
+			pcfg:         providerConfig{Provider: providerOllama, Host: ollamaSrv.URL, Model: "mock-model"},
+			ctxSize:      4096,
+			keepRecent:   defaultChatBotKeepRecentTurns,
+			compactAfter: defaultChatBotCompactAfterTurns,
+			outFile:      logFile,
+			locks:        map[string]*sync.Mutex{},
+		},
+		token:    token,
+		sessions: map[string]*chatContext{},
+	}
+}
+
+func TestNewWebBotSessionIDIsRandomAndURLSafe(t *testing.T) {
+	seen := map[string]bool{}
+	for i := 0; i < 100; i++ {
+		id, err := newWebBotSessionID()
+		if err != nil {
+			t.Fatalf("newWebBotSessionID error: %v", err)
+		}
+		if len(id) == 0 {
+			t.Fatal("expected a non-empty session id")
+		}
+		if seen[id] {
+			t.Fatalf("expected unique session ids, got a duplicate: %s", id)
+		}
+		seen[id] = true
+		for _, r := range id {
+			if !strings.ContainsRune("0123456789abcdef", r) {
+				t.Fatalf("expected a hex-only (URL/cookie-safe) session id, got %q", id)
+			}
+		}
+	}
+}
+
+func TestTokensEqual(t *testing.T) {
+	if !tokensEqual("secret123", "secret123") {
+		t.Fatal("expected identical tokens to compare equal")
+	}
+	if tokensEqual("secret123", "secret124") {
+		t.Fatal("expected different tokens to compare unequal")
+	}
+	if tokensEqual("short", "muchlongertoken") {
+		t.Fatal("expected different-length tokens to compare unequal")
+	}
+	// Note: tokensEqual("", "") is mathematically true (both empty, same
+	// length, vacuously no differing bytes) - that's fine and not a
+	// vulnerability, because requireToken never calls tokensEqual at all
+	// when s.token=="" (see its own early return); this function doesn't
+	// need to special-case blank input itself.
+}
+
+func TestWebBotSessionStoreCreateGetAndCleanup(t *testing.T) {
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	session := newTestWebBotSession(t, ollamaSrv, "")
+
+	ctx, id, err := session.createSession()
+	if err != nil {
+		t.Fatalf("createSession error: %v", err)
+	}
+	if ctx.Key != id {
+		t.Fatalf("expected the context's Key to match the returned session id, got Key=%q id=%q", ctx.Key, id)
+	}
+
+	got, ok := session.getSession(id)
+	if !ok || got != ctx {
+		t.Fatal("expected getSession to return the exact same in-memory context just created")
+	}
+
+	if _, ok := session.getSession("does-not-exist"); ok {
+		t.Fatal("expected a lookup of an unknown session id to fail")
+	}
+
+	// Backdate LastActive to simulate an idle session, then confirm cleanup drops it.
+	ctx.LastActive = time.Now().Add(-1 * time.Hour)
+	session.cleanupIdleSessions(10 * time.Minute)
+	if _, ok := session.getSession(id); ok {
+		t.Fatal("expected an idle-past-ttl session to be swept by cleanupIdleSessions")
+	}
+}
+
+func TestWebBotSessionStoreCleanupKeepsActiveSessions(t *testing.T) {
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	session := newTestWebBotSession(t, ollamaSrv, "")
+
+	_, id, err := session.createSession()
+	if err != nil {
+		t.Fatalf("createSession error: %v", err)
+	}
+	session.cleanupIdleSessions(10 * time.Minute) // just created - well within the TTL
+	if _, ok := session.getSession(id); !ok {
+		t.Fatal("expected a freshly created (not idle) session to survive cleanup")
+	}
+}
+
+func TestWebBotRequireTokenNoTokenConfiguredAllowsAll(t *testing.T) {
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	session := newTestWebBotSession(t, ollamaSrv, "") // no token configured
+
+	called := false
+	handler := session.requireToken(func(w http.ResponseWriter, r *http.Request) { called = true })
+	rec := httptest.NewRecorder()
+	handler(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if !called || rec.Code != http.StatusOK {
+		t.Fatalf("expected the request to pass through unauthenticated when no token is configured, called=%v code=%d", called, rec.Code)
+	}
+}
+
+func TestWebBotRequireTokenRejectsMissingOrWrongToken(t *testing.T) {
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	session := newTestWebBotSession(t, ollamaSrv, "correct-token")
+
+	called := false
+	handler := session.requireToken(func(w http.ResponseWriter, r *http.Request) { called = true })
+
+	rec := httptest.NewRecorder()
+	handler(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if called || rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no token at all, got code=%d called=%v", rec.Code, called)
+	}
+
+	called = false
+	rec = httptest.NewRecorder()
+	handler(rec, httptest.NewRequest(http.MethodGet, "/?token=wrong-token", nil))
+	if called || rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with a wrong token, got code=%d called=%v", rec.Code, called)
+	}
+}
+
+func TestWebBotRequireTokenAcceptsQueryParamThenSetsCookie(t *testing.T) {
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	session := newTestWebBotSession(t, ollamaSrv, "correct-token")
+
+	called := false
+	handler := session.requireToken(func(w http.ResponseWriter, r *http.Request) { called = true })
+
+	rec := httptest.NewRecorder()
+	handler(rec, httptest.NewRequest(http.MethodGet, "/?token=correct-token", nil))
+	if !called || rec.Code != http.StatusOK {
+		t.Fatalf("expected the correct query-param token to be accepted, code=%d called=%v", rec.Code, called)
+	}
+	resp := rec.Result()
+	var cookieSet bool
+	for _, c := range resp.Cookies() {
+		if c.Name == webBotTokenCookieName && c.Value == "correct-token" {
+			cookieSet = true
+		}
+	}
+	if !cookieSet {
+		t.Fatal("expected a valid ?token= to set a session cookie for subsequent requests")
+	}
+
+	// A follow-up request with just the cookie (no query param) should also pass.
+	called = false
+	req2 := httptest.NewRequest(http.MethodGet, "/", nil)
+	req2.AddCookie(&http.Cookie{Name: webBotTokenCookieName, Value: "correct-token"})
+	rec2 := httptest.NewRecorder()
+	handler(rec2, req2)
+	if !called || rec2.Code != http.StatusOK {
+		t.Fatalf("expected the cookie alone to authenticate a follow-up request, code=%d called=%v", rec2.Code, called)
+	}
+}
+
+func TestWebBotIndexHandlerServesGruvboxAndPlaypenFont(t *testing.T) {
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	session := newTestWebBotSession(t, ollamaSrv, "")
+
+	rec := httptest.NewRecorder()
+	session.indexHandler(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "Playpen+Sans+Thai") {
+		t.Fatal("expected the page to load the Playpen Sans Thai Google Font")
+	}
+	if !strings.Contains(body, "#282828") || !strings.Contains(body, "#fabd2f") {
+		t.Fatal("expected gruvbox theme colors (background/yellow) to be present in the page")
+	}
+	if !strings.Contains(rec.Header().Get("Content-Type"), "text/html") {
+		t.Fatalf("expected Content-Type text/html, got %q", rec.Header().Get("Content-Type"))
+	}
+}
+
+func TestWebBotSessionHandlerGreetsBeforeAnyUserMessage(t *testing.T) {
+	var lastRequestBody string
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		lastRequestBody = string(body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("สวัสดีครับ ผมคือผู้ช่วย AI ยินดีให้บริการครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	session := newTestWebBotSession(t, ollamaSrv, "")
+
+	rec := httptest.NewRecorder()
+	session.sessionHandler(rec, httptest.NewRequest(http.MethodPost, "/api/session", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp webBotSessionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.SessionID == "" {
+		t.Fatal("expected a non-empty session_id")
+	}
+	if resp.Greeting != "sวัสดีครับ ผมคือผู้ช่วย AI ยินดีให้บริการครับ" && resp.Greeting != "สวัสดีครับ ผมคือผู้ช่วย AI ยินดีให้บริการครับ" {
+		t.Fatalf("expected the model-generated greeting to be returned, got: %q", resp.Greeting)
+	}
+	if !strings.Contains(lastRequestBody, "แนะนำตัวเอง") {
+		t.Fatalf("expected the greeting call to actually instruct the model to introduce itself, got request body: %s", lastRequestBody)
+	}
+
+	// The greeting must already be recorded as the session's first turn,
+	// with no user turn before it (nobody said anything yet).
+	ctx, ok := session.getSession(resp.SessionID)
+	if !ok {
+		t.Fatal("expected the session to exist after sessionHandler returns")
+	}
+	if len(ctx.Turns) != 1 || ctx.Turns[0].Role != "assistant" {
+		t.Fatalf("expected exactly 1 turn (the greeting, role=assistant) with nothing before it, got: %#v", ctx.Turns)
+	}
+}
+
+func TestWebBotSessionHandlerFallsBackToStaticGreetingOnModelFailure(t *testing.T) {
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	session := newTestWebBotSession(t, ollamaSrv, "")
+
+	rec := httptest.NewRecorder()
+	session.sessionHandler(rec, httptest.NewRequest(http.MethodPost, "/api/session", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected sessionHandler to still succeed (with a fallback greeting) even if the model call fails, got %d", rec.Code)
+	}
+	var resp webBotSessionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Greeting != webBotFallbackGreeting {
+		t.Fatalf("expected the static fallback greeting when the model call fails, got: %q", resp.Greeting)
+	}
+}
+
+func TestWebBotChatHandlerRequiresExistingSession(t *testing.T) {
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	session := newTestWebBotSession(t, ollamaSrv, "")
+
+	body, _ := json.Marshal(webBotChatRequest{SessionID: "does-not-exist", Message: "hi"})
+	rec := httptest.NewRecorder()
+	session.chatHandler(rec, httptest.NewRequest(http.MethodPost, "/api/chat", bytes.NewReader(body)))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for an unknown session id, got %d", rec.Code)
+	}
+	var resp webBotChatResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Error == "" {
+		t.Fatal("expected a non-empty error message")
+	}
+}
+
+func TestWebBotChatHandlerEndToEndAndNeverPersists(t *testing.T) {
+	var round int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&round, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if n == 1 {
+			fmt.Fprint(w, streamLine("สวัสดีครับ", "", "", true)) // greeting
+			return
+		}
+		fmt.Fprint(w, streamLine("2+2 เท่ากับ 4 ครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	// contextDir intentionally never set on chatBotCore for webbot - this
+	// test's real point is that nothing under diskDir ever gets written to
+	// regardless, confirmed below by checking the directory stays empty.
+	diskDir := t.TempDir()
+	session := newTestWebBotSession(t, ollamaSrv, "")
+
+	sessRec := httptest.NewRecorder()
+	session.sessionHandler(sessRec, httptest.NewRequest(http.MethodPost, "/api/session", nil))
+	var sessResp webBotSessionResponse
+	_ = json.Unmarshal(sessRec.Body.Bytes(), &sessResp)
+
+	chatBody, _ := json.Marshal(webBotChatRequest{SessionID: sessResp.SessionID, Message: "2+2 เท่ากับเท่าไหร่"})
+	chatRec := httptest.NewRecorder()
+	session.chatHandler(chatRec, httptest.NewRequest(http.MethodPost, "/api/chat", bytes.NewReader(chatBody)))
+
+	if chatRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", chatRec.Code, chatRec.Body.String())
+	}
+	var chatResp webBotChatResponse
+	_ = json.Unmarshal(chatRec.Body.Bytes(), &chatResp)
+	if chatResp.Answer != "2+2 เท่ากับ 4 ครับ" {
+		t.Fatalf("unexpected answer: %q", chatResp.Answer)
+	}
+
+	ctx, ok := session.getSession(sessResp.SessionID)
+	if !ok || len(ctx.Turns) != 3 {
+		t.Fatalf("expected 3 turns in memory (greeting + user + assistant), got: %#v", ctx)
+	}
+
+	entries, err := os.ReadDir(diskDir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected webbot to never write anything to disk for a session, found: %v", entries)
 	}
 }

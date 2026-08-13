@@ -188,7 +188,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/hmac"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -473,6 +476,10 @@ func main() {
 		os.Exit(cmdTelegramBot(os.Args[2:]))
 	case "discordbot":
 		os.Exit(cmdDiscordBot(os.Args[2:]))
+	case "linebot":
+		os.Exit(cmdLineBot(os.Args[2:]))
+	case "webbot":
+		os.Exit(cmdWebBot(os.Args[2:]))
 	case "-h", "--help", "help":
 		printTopUsage()
 		os.Exit(0)
@@ -506,7 +513,18 @@ func printTopUsage() {
 	fmt.Println("          over a persistent Gateway WebSocket connection instead of long-")
 	fmt.Println("          polling, since Discord has no polling endpoint.")
 	fmt.Println()
-	fmt.Println("Run 'ola ask -h', 'ola coding -h', 'ola telegrambot -h', or 'ola discordbot -h' for command-specific help.")
+	fmt.Println("  linebot      LINE counterpart of telegrambot/discordbot - same principles,")
+	fmt.Println("          but receives messages via an inbound webhook HTTP server (LINE")
+	fmt.Println("          calls you) instead of long-polling or a WebSocket - needs a public")
+	fmt.Println("          HTTPS endpoint reachable from LINE's platform.")
+	fmt.Println()
+	fmt.Println("  webbot       Single-page embedded web chat UI, same restrictive read-only")
+	fmt.Println("          toolset as the other three bots. No platform-verified user")
+	fmt.Println("          identity (binds 127.0.0.1 by default; optional shared token gate)")
+	fmt.Println("          and no persisted context - each browser session lives in memory")
+	fmt.Println("          only, for as long as that session lasts.")
+	fmt.Println()
+	fmt.Println("Run 'ola ask -h', 'ola coding -h', 'ola telegrambot -h', 'ola discordbot -h', 'ola linebot -h', or 'ola webbot -h' for command-specific help.")
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -12291,5 +12309,1926 @@ func cmdDiscordBot(args []string) int {
 	fmt.Println("\nกำลังหยุด ola discordbot...")
 	fmt.Fprintf(outFile, "=== ola discordbot หยุดทำงาน %s ===\n", time.Now().Format(time.RFC3339))
 	close(stopCh)
+	return 0
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Section: linebot (originally line.go)
+//
+// "ola linebot" is LINE's counterpart of telegrambot/discordbot - same
+// principles (allow-listed users/groups, additive persona, read-only
+// knowledge base + optional embedding search, per-chat persistent context
+// with LLM-based compaction, the same restrictive read-only toolset,
+// grounding markers, group-recording-with-speaker-attribution) via
+// chatBotCore (see that struct's own doc comment).
+//
+// THE BIG DIFFERENCE FROM TELEGRAM/DISCORD: LINE delivers messages by
+// calling YOUR server (a webhook HTTP POST), not the other way around -
+// the opposite direction from Telegram's long-polling (bot calls out, no
+// public endpoint needed) and Discord's Gateway (bot holds a persistent
+// outbound WebSocket open). linebot must run an HTTP server with a
+// genuinely public HTTPS address LINE can reach (normally behind a
+// reverse proxy - see lineUsage/README for the operational setup this
+// implies). Zero new external Go dependencies either way: the webhook
+// handler is plain net/http, and signature verification is HMAC-SHA256
+// from crypto/hmac+crypto/sha256, both stdlib.
+//
+// THE OTHER BIG DIFFERENCE: every webhook event carries a replyToken that
+// works exactly once and expires FAST - real-world reports put it as
+// short as ~10 seconds, nowhere near long enough to wait on a large local
+// model's inference. So this implementation never relies on the Reply API
+// for the model's actual answer - only for instant, no-inference replies
+// (/whoami, /tools, access-denied). The real answer always goes out via
+// the Push API instead (see lineSession.sendAnswer), which has no such
+// time limit - the tradeoff is that push messages count against LINE's
+// own monthly message quota in the traditional free-tier billing model,
+// where reply messages typically don't; worth watching if traffic grows.
+// ─────────────────────────────────────────────────────────────────
+
+const defaultLineAPIBase = "https://api.line.me/v2/bot"
+const defaultLineListenAddr = ":8080"
+const defaultLineWebhookPath = "/line/webhook"
+const defaultLineContextDir = "line-context"
+
+// lineMaxMessageRunes stays a little under LINE's documented 5000-
+// character text message cap (counted in UTF-16 code units - see
+// splitLineMessage's own comment on why a rune-count approximation is
+// fine for this bot's actual traffic).
+const lineMaxMessageRunes = 4900
+
+// ─────────────────────────────────────────────────────────────────
+// Webhook payload types (only the fields this bot actually uses - LINE's
+// real event objects have many more, e.g. sticker/image/location message
+// types this bot doesn't handle at all beyond ignoring them)
+// ─────────────────────────────────────────────────────────────────
+
+type lineSource struct {
+	Type    string `json:"type"` // "user", "group", or "room"
+	UserID  string `json:"userId,omitempty"`
+	GroupID string `json:"groupId,omitempty"`
+	RoomID  string `json:"roomId,omitempty"`
+}
+
+type lineMentionee struct {
+	Index  int    `json:"index"`  // UTF-16 code unit offset into the message text
+	Length int    `json:"length"` // UTF-16 code unit length of the @mention span
+	UserID string `json:"userId"`
+}
+
+type lineMention struct {
+	Mentionees []lineMentionee `json:"mentionees"`
+}
+
+type lineMessage struct {
+	ID      string       `json:"id"`
+	Type    string       `json:"type"` // only "text" is handled; other types are ignored
+	Text    string       `json:"text"`
+	Mention *lineMention `json:"mention,omitempty"`
+}
+
+type lineEvent struct {
+	Type            string       `json:"type"` // only "message" is handled; follow/unfollow/join/etc are ignored
+	Mode            string       `json:"mode"`
+	Timestamp       int64        `json:"timestamp"`
+	Source          lineSource   `json:"source"`
+	ReplyToken      string       `json:"replyToken,omitempty"`
+	Message         *lineMessage `json:"message,omitempty"`
+	WebhookEventID  string       `json:"webhookEventId"`
+	DeliveryContext struct {
+		IsRedelivery bool `json:"isRedelivery"`
+	} `json:"deliveryContext"`
+}
+
+type lineWebhookBody struct {
+	Destination string      `json:"destination"`
+	Events      []lineEvent `json:"events"`
+}
+
+// verifyLineSignature checks the X-Line-Signature header LINE attaches to
+// every webhook request: HMAC-SHA256 of the raw request body, keyed by
+// the channel secret, base64-encoded. hmac.Equal is used rather than a
+// plain == comparison so this isn't vulnerable to a timing side-channel.
+// A request that fails this check is not from LINE (or the channel
+// secret is wrong) and must never be processed.
+func verifyLineSignature(body []byte, signatureHeader, channelSecret string) bool {
+	mac := hmac.New(sha256.New, []byte(channelSecret))
+	mac.Write(body)
+	expected := mac.Sum(nil)
+	got, err := base64.StdEncoding.DecodeString(signatureHeader)
+	if err != nil {
+		return false
+	}
+	return hmac.Equal(expected, got)
+}
+
+// ─────────────────────────────────────────────────────────────────
+// REST client. Every call carries "Authorization: Bearer <channel access
+// token>" - a third distinct auth scheme, after Telegram's URL-embedded
+// token and Discord's "Bot <token>".
+// ─────────────────────────────────────────────────────────────────
+
+func lineRESTRequest(client *http.Client, apiBase, token, method, path string, body interface{}) ([]byte, int, error) {
+	var reqBody io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return nil, 0, fmt.Errorf("marshal request ไม่ได้: %v", err)
+		}
+		reqBody = strings.NewReader(string(data))
+	}
+	httpReq, err := http.NewRequest(method, apiBase+path, reqBody)
+	if err != nil {
+		return nil, 0, err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("อ่าน response body ไม่ได้: %v", err)
+	}
+	return respBody, resp.StatusCode, nil
+}
+
+type lineBotInfo struct {
+	UserID      string `json:"userId"`
+	DisplayName string `json:"displayName"`
+}
+
+func lineGetBotInfo(client *http.Client, apiBase, token string) (lineBotInfo, error) {
+	body, status, err := lineRESTRequest(client, apiBase, token, http.MethodGet, "/info", nil)
+	if err != nil {
+		return lineBotInfo{}, err
+	}
+	if status >= 400 {
+		return lineBotInfo{}, fmt.Errorf("GET /info สถานะ %d: %s", status, string(body))
+	}
+	var out lineBotInfo
+	if err := json.Unmarshal(body, &out); err != nil {
+		return lineBotInfo{}, fmt.Errorf("decode /info response ไม่ได้: %v", err)
+	}
+	return out, nil
+}
+
+type lineProfile struct {
+	DisplayName string `json:"displayName"`
+}
+
+// lineGetProfile fetches a 1-on-1 user's display name.
+func lineGetProfile(client *http.Client, apiBase, token, userID string) (string, error) {
+	body, status, err := lineRESTRequest(client, apiBase, token, http.MethodGet, "/profile/"+userID, nil)
+	if err != nil {
+		return "", err
+	}
+	if status >= 400 {
+		return "", fmt.Errorf("GET /profile/%s สถานะ %d: %s", userID, status, string(body))
+	}
+	var out lineProfile
+	if err := json.Unmarshal(body, &out); err != nil {
+		return "", fmt.Errorf("decode profile response ไม่ได้: %v", err)
+	}
+	return out.DisplayName, nil
+}
+
+// lineGetGroupMemberProfile fetches a group member's display name -
+// different endpoint from lineGetProfile because LINE only exposes group
+// member profiles through the group itself, not a bare userId lookup.
+func lineGetGroupMemberProfile(client *http.Client, apiBase, token, groupID, userID string) (string, error) {
+	body, status, err := lineRESTRequest(client, apiBase, token, http.MethodGet, "/group/"+groupID+"/member/"+userID, nil)
+	if err != nil {
+		return "", err
+	}
+	if status >= 400 {
+		return "", fmt.Errorf("GET /group/%s/member/%s สถานะ %d: %s", groupID, userID, status, string(body))
+	}
+	var out lineProfile
+	if err := json.Unmarshal(body, &out); err != nil {
+		return "", fmt.Errorf("decode group member profile response ไม่ได้: %v", err)
+	}
+	return out.DisplayName, nil
+}
+
+// splitLineMessage breaks text into chunks no longer than
+// lineMaxMessageRunes. LINE's own 5000-character limit is measured in
+// UTF-16 code units, not runes - for the Thai/English text this bot
+// actually produces (no astral-plane characters like rare CJK extension
+// ideographs or unusual emoji sequences in ordinary answers), rune count
+// and UTF-16 code unit count coincide, so treating them as equivalent
+// here is a safe, conservative approximation, same tradeoff already made
+// for Telegram/Discord's own message splitting.
+func splitLineMessage(text string) []string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		text = "(ไม่มีคำตอบ)"
+	}
+	runes := []rune(text)
+	if len(runes) <= lineMaxMessageRunes {
+		return []string{text}
+	}
+	var chunks []string
+	for len(runes) > 0 {
+		n := lineMaxMessageRunes
+		if n > len(runes) {
+			n = len(runes)
+		}
+		cut := n
+		if n == lineMaxMessageRunes {
+			for i := n - 1; i > n/2; i-- {
+				if runes[i] == '\n' {
+					cut = i + 1
+					break
+				}
+			}
+		}
+		chunk := strings.TrimSpace(string(runes[:cut]))
+		if chunk != "" {
+			chunks = append(chunks, chunk)
+		}
+		runes = runes[cut:]
+	}
+	if len(chunks) == 0 {
+		chunks = []string{"(ไม่มีคำตอบ)"}
+	}
+	return chunks
+}
+
+func lineReplyMessage(client *http.Client, apiBase, token, replyToken, text string) error {
+	for _, chunk := range splitLineMessage(text) {
+		body := map[string]interface{}{
+			"replyToken": replyToken,
+			"messages":   []map[string]string{{"type": "text", "text": chunk}},
+		}
+		respBody, status, err := lineRESTRequest(client, apiBase, token, http.MethodPost, "/message/reply", body)
+		if err != nil {
+			return err
+		}
+		if status >= 400 {
+			return fmt.Errorf("POST /message/reply สถานะ %d: %s", status, string(respBody))
+		}
+	}
+	return nil
+}
+
+func linePushMessage(client *http.Client, apiBase, token, to, text string) error {
+	for _, chunk := range splitLineMessage(text) {
+		body := map[string]interface{}{
+			"to":       to,
+			"messages": []map[string]string{{"type": "text", "text": chunk}},
+		}
+		respBody, status, err := lineRESTRequest(client, apiBase, token, http.MethodPost, "/message/push", body)
+		if err != nil {
+			return err
+		}
+		if status >= 400 {
+			return fmt.Errorf("POST /message/push สถานะ %d: %s", status, string(respBody))
+		}
+	}
+	return nil
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Access control: allow-listed users (1-on-1) and groups. LINE's "room"
+// (an older multi-person chat concept LINE itself has been merging into
+// "group" chats since app version 10.17.0) is folded into the same
+// Groups allowlist as "group" - operationally there is no meaningful
+// difference for this bot's purposes (both need a "many humans, allow-
+// list the whole chat" rule, not a per-user one), so this stays a
+// two-tier allowlist (users, groups) rather than three, unlike Discord's
+// three-tier one (users, guilds, channels) where the extra tier came from
+// a real structural difference (a guild containing many independent
+// channels) that has no LINE equivalent.
+// ─────────────────────────────────────────────────────────────────
+
+type lineAccessConfig struct {
+	Users  map[string]bool
+	Groups map[string]bool
+}
+
+// lineGroupOrRoomID returns whichever of GroupID/RoomID is set - LINE
+// only ever populates one of the two, matching Type.
+func lineGroupOrRoomID(src lineSource) string {
+	if src.GroupID != "" {
+		return src.GroupID
+	}
+	return src.RoomID
+}
+
+// lineSourceTypeLabel gives a human-readable label for a group/room
+// source type, used only in the /whoami- and access-denied-style replies
+// - a tiny fixed lookup rather than strings.Title (deprecated since Go
+// 1.18) since there are only ever two possible inputs here.
+func lineSourceTypeLabel(sourceType string) string {
+	if sourceType == "room" {
+		return "Room"
+	}
+	return "Group"
+}
+
+func (c lineAccessConfig) allowed(src lineSource) bool {
+	if src.Type == "user" {
+		return c.Users[src.UserID]
+	}
+	return c.Groups[lineGroupOrRoomID(src)]
+}
+
+func (c lineAccessConfig) empty() bool {
+	return len(c.Users) == 0 && len(c.Groups) == 0
+}
+
+func parseLineIDList(raw string) (map[string]bool, []string) {
+	ids := map[string]bool{}
+	var warnings []string
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		// LINE IDs are opaque hash-like strings (e.g. "U4af498...", "C1234...")
+		// not numeric snowflakes, so there's no numeric-format check to do
+		// here the way Telegram/Discord IDs get validated - any non-empty
+		// token is accepted as-is.
+		ids[part] = true
+	}
+	return ids, warnings
+}
+
+func resolveLineAccessConfig(usersFlag, groupsFlag string) (lineAccessConfig, []string) {
+	usersRaw := usersFlag
+	if usersRaw == "" {
+		usersRaw = os.Getenv("OLA_LINE_ALLOWED_USERS")
+	}
+	groupsRaw := groupsFlag
+	if groupsRaw == "" {
+		groupsRaw = os.Getenv("OLA_LINE_ALLOWED_GROUPS")
+	}
+	users, uw := parseLineIDList(usersRaw)
+	groups, gw := parseLineIDList(groupsRaw)
+	return lineAccessConfig{Users: users, Groups: groups}, append(uw, gw...)
+}
+
+// lineContextKey mirrors telegramContextKey/discordContextKey - see
+// chatContext's own doc comment for why the "line_" prefix matters (lets
+// all three bots safely share one --context-dir with no key collisions).
+func lineContextKey(src lineSource) string {
+	switch src.Type {
+	case "group":
+		return "line_group_" + src.GroupID
+	case "room":
+		return "line_room_" + src.RoomID
+	default:
+		return "line_user_" + src.UserID
+	}
+}
+
+// lineRecipientID is the "to" target for a push message - a user's own
+// ID for a 1-on-1 chat, or the shared group/room ID for a group chat
+// (LINE routes push messages to the whole group by its ID, same as
+// Discord routes by channel ID - there's no per-member push in a group).
+func lineRecipientID(src lineSource) string {
+	if src.Type == "user" {
+		return src.UserID
+	}
+	return lineGroupOrRoomID(src)
+}
+
+// lineMessageAddressesBot mirrors telegramMessageAddressesBot/
+// discordMessageAddressesBot's own reasoning: a group/room is a shared
+// space other humans are also talking in, only answer when clearly
+// addressed. LINE's mention detection comes from the message object's own
+// mention.mentionees array (each entry has the mentioned userId plus
+// where in the text it appears) - matched against the bot's own userId,
+// the same structured approach Discord's mentions array allows (not
+// fragile text parsing the way Telegram's "@username" has to be).
+func lineMessageAddressesBot(msg *lineMessage, botUserID string) bool {
+	if msg.Mention != nil {
+		for _, m := range msg.Mention.Mentionees {
+			if m.UserID == botUserID {
+				return true
+			}
+		}
+	}
+	trimmed := strings.TrimSpace(msg.Text)
+	return strings.HasPrefix(trimmed, "/ola") || strings.HasPrefix(trimmed, "/ask")
+}
+
+// stripLineMention removes every @mention span from the message text
+// using the mention object's own index/length (LINE gives these in UTF-16
+// code units - see splitLineMessage's own comment on why treating them as
+// rune offsets is an acceptable approximation for this bot's actual
+// traffic), working from the last mention backward so removing one span
+// doesn't shift the indices of the ones before it. Falls back to the
+// /ola or /ask prefix strip when there's no mention object at all (the
+// text-prefix addressing path).
+func stripLineMention(msg *lineMessage) string {
+	text := msg.Text
+	if msg.Mention != nil && len(msg.Mention.Mentionees) > 0 {
+		runes := []rune(text)
+		mentionees := append([]lineMentionee(nil), msg.Mention.Mentionees...)
+		sort.Slice(mentionees, func(i, j int) bool { return mentionees[i].Index > mentionees[j].Index })
+		for _, m := range mentionees {
+			start, end := m.Index, m.Index+m.Length
+			if start < 0 || end > len(runes) || start > end {
+				continue
+			}
+			runes = append(runes[:start], runes[end:]...)
+		}
+		return strings.TrimSpace(string(runes))
+	}
+	trimmed := strings.TrimSpace(text)
+	trimmed = strings.TrimPrefix(trimmed, "/ola")
+	trimmed = strings.TrimPrefix(trimmed, "/ask")
+	return strings.TrimSpace(trimmed)
+}
+
+// ─────────────────────────────────────────────────────────────────
+// lineSession embeds chatBotCore (see that struct's own doc comment) -
+// everything platform-agnostic is inherited from there unchanged. Only
+// the LINE-specific transport/addressing/naming pieces live here.
+// ─────────────────────────────────────────────────────────────────
+
+type lineSession struct {
+	chatBotCore
+	restClient    *http.Client // short-timeout client, LINE REST API only - never used for model calls, same separation as telegramSession.telegramClient/discordSession.restClient
+	apiBase       string
+	channelSecret string
+	token         string
+	botUserID     string
+	access        lineAccessConfig
+	sem           chan struct{}
+
+	nameMu    sync.Mutex
+	nameCache map[string]string // userId -> displayName, lazily populated - see displayName's own doc comment
+
+	eventMu      sync.Mutex
+	recentEvents map[string]bool // webhookEventId -> seen, for redelivery dedup - see alreadyProcessed
+}
+
+// displayName resolves a group-chat turn's speaker attribution (see
+// chatTurn.Speaker). Unlike Telegram (first name arrives inline on every
+// message) or Discord (username arrives inline too), LINE's webhook event
+// only ever includes the sender's bare userId - getting an actual display
+// name needs a separate REST call (a different endpoint for a 1-on-1 chat
+// vs a group member). Since every recorded group message would otherwise
+// trigger one of these calls, results are cached in memory per session
+// (never expired - display names change rarely enough that staying
+// slightly out of date for the life of one process is a fine tradeoff
+// against calling the API on every single message). Falls back to a
+// "user_<id>" label (same shape as Discord's own fallback) if the lookup
+// fails for any reason - naming should never be the reason a message
+// fails to get recorded.
+func (s *lineSession) displayName(userID, groupOrRoomID string) string {
+	s.nameMu.Lock()
+	if name, ok := s.nameCache[userID]; ok {
+		s.nameMu.Unlock()
+		return name
+	}
+	s.nameMu.Unlock()
+
+	var name string
+	var err error
+	if groupOrRoomID != "" {
+		name, err = lineGetGroupMemberProfile(s.restClient, s.apiBase, s.token, groupOrRoomID, userID)
+	} else {
+		name, err = lineGetProfile(s.restClient, s.apiBase, s.token, userID)
+	}
+	if err != nil || name == "" {
+		name = "user_" + userID
+	}
+
+	s.nameMu.Lock()
+	s.nameCache[userID] = name
+	s.nameMu.Unlock()
+	return name
+}
+
+// alreadyProcessed guards against LINE's own documented webhook
+// redelivery (the same event can arrive more than once, e.g. after a
+// network hiccup - see this section's header comment) using
+// webhookEventId, which LINE guarantees stays the same across redeliveries
+// of the same event. The dedup set is cleared wholesale once it grows
+// past a generous bound rather than maintaining a real LRU/TTL - this
+// only needs to cover LINE's own redelivery window (short), not be a
+// permanent record, so a crude periodic reset is a fine tradeoff for the
+// simplicity.
+func (s *lineSession) alreadyProcessed(eventID string) bool {
+	if eventID == "" {
+		return false // nothing to dedup against - process it
+	}
+	s.eventMu.Lock()
+	defer s.eventMu.Unlock()
+	if s.recentEvents[eventID] {
+		return true
+	}
+	s.recentEvents[eventID] = true
+	if len(s.recentEvents) > 10000 {
+		s.recentEvents = map[string]bool{}
+	}
+	return false
+}
+
+// sendReply is for instant, no-model-inference responses only
+// (/whoami, /tools, access-denied) where the reply token is still almost
+// certainly valid. Tries the Reply API first (free, and ties the response
+// visually to the triggering message in the LINE client) and falls back
+// to Push if that fails for any reason (e.g. the token already expired,
+// or replyToken is empty because this session has no send-time reply
+// path available). Never used for the model's actual answer - see
+// sendAnswer.
+func (s *lineSession) sendReply(replyToken, to, text string) error {
+	if replyToken != "" {
+		if err := lineReplyMessage(s.restClient, s.apiBase, s.token, replyToken, text); err == nil {
+			return nil
+		}
+	}
+	return linePushMessage(s.restClient, s.apiBase, s.token, to, text)
+}
+
+// sendAnswer is for the model's actual generated answer - always Push,
+// never Reply. By the time inference finishes the reply token has almost
+// certainly already expired (see this section's header comment on reply
+// token lifetime) - trying Reply first here would just be a wasted,
+// near-guaranteed-to-fail API call before falling back anyway.
+func (s *lineSession) sendAnswer(to, text string) error {
+	return linePushMessage(s.restClient, s.apiBase, s.token, to, text)
+}
+
+// handleLineMessage processes exactly one incoming message event end to
+// end. In a group/room, EVERY message from an allowed group gets recorded
+// into that group's persistent context (see chatBotCore.recordAndRespond)
+// so the bot already has the group's own back-and-forth as context
+// whenever it's later mentioned - but the tool-calling loop only actually
+// runs, and a reply only actually gets sent, when the message addresses
+// the bot (mention, or /ola|/ask prefix - see lineMessageAddressesBot).
+// A 1-on-1 chat is always "addressed": there's no other participant it
+// could be talking to.
+func (s *lineSession) handleLineMessage(ev *lineEvent) {
+	s.sem <- struct{}{}
+	defer func() { <-s.sem }()
+
+	if s.alreadyProcessed(ev.WebhookEventID) {
+		return
+	}
+	msg := ev.Message
+	if msg == nil || msg.Type != "text" {
+		return // sticker/image/location/etc - nothing this bot can act on
+	}
+	rawText := strings.TrimSpace(msg.Text)
+	if rawText == "" {
+		return
+	}
+
+	src := ev.Source
+	isGroup := src.Type == "group" || src.Type == "room"
+	addressed := true
+	text := rawText
+	if isGroup {
+		addressed = lineMessageAddressesBot(msg, s.botUserID)
+		if addressed {
+			text = stripLineMention(msg)
+			if text == "" {
+				return // e.g. a message that's *just* the mention with nothing else - nothing to say or record
+			}
+		}
+	}
+	to := lineRecipientID(src)
+
+	if addressed && (text == "/whoami" || text == "/start") {
+		reply := fmt.Sprintf("User ID ของคุณ: %s", src.UserID)
+		if isGroup {
+			reply += fmt.Sprintf("\n%s ID: %s", lineSourceTypeLabel(src.Type), to)
+		}
+		_ = s.sendReply(ev.ReplyToken, to, reply)
+		return
+	}
+
+	if !s.access.allowed(src) {
+		if addressed {
+			reply := fmt.Sprintf("คุณยังไม่ได้รับอนุญาตให้ใช้บอทนี้ ส่ง /whoami เพื่อดู ID แล้วแจ้งผู้ดูแลให้เพิ่มสิทธิ์\nUser ID: %s", src.UserID)
+			if isGroup {
+				reply += fmt.Sprintf("\n%s ID: %s", lineSourceTypeLabel(src.Type), to)
+			}
+			_ = s.sendReply(ev.ReplyToken, to, reply)
+			s.logf("[line_denied] user=%s source=%s:%s\n", src.UserID, src.Type, to)
+		}
+		return // not allowed: never record either way - the bot has no business remembering a group/user it isn't authorized for
+	}
+
+	if addressed && text == "/tools" {
+		_ = s.sendReply(ev.ReplyToken, to, s.toolsStatusText())
+		return
+	}
+
+	key := lineContextKey(src)
+	lock := s.contextMutex(key)
+	lock.Lock()
+	defer lock.Unlock()
+
+	speaker := ""
+	if isGroup {
+		speaker = s.displayName(src.UserID, lineGroupOrRoomID(src))
+	}
+
+	if addressed {
+		s.logf("\n=== line key=%s user=%s ===\n[user] %s\n", key, src.UserID, text)
+	} else {
+		s.logf("[line_record] key=%s user=%s: %s\n", key, src.UserID, text)
+	}
+
+	answer, err := s.recordAndRespond(key, speaker, text, addressed)
+	if err != nil {
+		s.logf("[line_error] key=%s: %v\n", key, err)
+		if addressed {
+			if s.ntfyTopic != "" {
+				sendNotification(s.ntfyTopic, truncateWords(fmt.Sprintf("[linebot error] key=%s: %v", key, err), maxNotificationWords))
+			}
+			_ = s.sendReply(ev.ReplyToken, to, "ขออภัย เกิดข้อผิดพลาดระหว่างประมวลผล ลองใหม่อีกครั้ง")
+		}
+		return
+	}
+	if !addressed {
+		return // recorded silently for future context - nothing to send back
+	}
+	s.logf("[assistant] %s\n", answer)
+
+	if err := s.sendAnswer(to, answer); err != nil {
+		s.logf("[line_error] ส่งข้อความกลับไม่ได้: %v\n", err)
+	}
+}
+
+// buildLineHTTPClients mirrors buildTelegramHTTPClients'/
+// buildDiscordHTTPClients' own reasoning exactly (see those functions'
+// doc comments for the full "why") - the model (Ollama/OpenAI) client
+// must stay unbounded, only the LINE REST client gets a short fail-fast
+// timeout.
+func buildLineHTTPClients() (rest, model *http.Client) {
+	rest = &http.Client{Timeout: 30 * time.Second}
+	model = newHTTPClient()
+	return rest, model
+}
+
+// webhookHandler is the actual net/http.HandlerFunc LINE's platform POSTs
+// to. It verifies the signature, acknowledges immediately (LINE expects a
+// fast response and may eventually suspend webhook delivery to a server
+// that doesn't - see this section's header comment), then processes each
+// message event in its own goroutine so a slow model call never blocks
+// the next incoming webhook delivery.
+func (s *lineSession) webhookHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	// LINE's own documented max request size is 2MB - capping the read
+	// here means a misbehaving or malicious sender can't make this
+	// handler buffer an unbounded body in memory.
+	body, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if !verifyLineSignature(body, r.Header.Get("X-Line-Signature"), s.channelSecret) {
+		s.logf("[line_error] signature ไม่ถูกต้อง - ปฏิเสธ request จาก %s\n", r.RemoteAddr)
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+
+	var payload lineWebhookBody
+	if err := json.Unmarshal(body, &payload); err != nil {
+		s.logf("[line_error] parse webhook body ไม่ได้: %v\n", err)
+		return
+	}
+	for i := range payload.Events {
+		ev := payload.Events[i]
+		if ev.Type != "message" {
+			continue // follow/unfollow/join/leave/postback/etc - not handled
+		}
+		go s.handleLineMessage(&ev)
+	}
+}
+
+func lineUsage(fs *flag.FlagSet) func() {
+	return func() {
+		fmt.Println("Usage: ola linebot [options]")
+		fmt.Println()
+		fmt.Println("รัน ola เป็น LINE Official Account bot - รับข้อความผ่าน webhook (LINE ยิง HTTP POST เข้ามาหา")
+		fmt.Println("เซิร์ฟเวอร์นี้ - ตรงข้ามกับ telegrambot ที่ long-poll ออกไป และ discordbot ที่เปิด WebSocket ค้างไว้)")
+		fmt.Println("หลักการ tool/persona/knowledge-base/context/group-recording เหมือน 'ola telegrambot' ทุกประการ")
+		fmt.Println("(ดู README หัวข้อ linebot สำหรับรายละเอียดที่ใช้ร่วมกัน)")
+		fmt.Println()
+		fmt.Println("⚠️  ต้องมี public HTTPS endpoint ชี้เข้ามาที่ webhook นี้ (ปกติวางไว้หลัง reverse proxy เช่น")
+		fmt.Println("    Caddy/nginx ที่จัดการ TLS ให้ - linebot เองฟังแค่ plain HTTP) แล้วเอา URL นั้นไปตั้งใน")
+		fmt.Println("    LINE Developers Console > Messaging API > Webhook URL")
+		fmt.Println("⚠️  ต้องเปิด \"Allow bot to join group chats\" ใน LINE Developers Console ด้วยมือ (ปิดโดย default)")
+		fmt.Println("    มิฉะนั้นจะเชิญบอทเข้ากลุ่มไม่ได้เลย")
+		fmt.Println()
+		fmt.Println("Required:")
+		fmt.Println("  OLA_LINE_CHANNEL_TOKEN    (env เท่านั้น) - channel access token จาก LINE Developers Console")
+		fmt.Println("  OLA_LINE_CHANNEL_SECRET   (env เท่านั้น) - channel secret ใช้ตรวจสอบ signature ของ webhook")
+		fmt.Println("  -m/--model หรือ OLA_OLLAMA_MODEL")
+		fmt.Println()
+		fmt.Println("Access control:")
+		fmt.Println("  --line-allowed-users <ids>   OLA_LINE_ALLOWED_USERS   comma-separated LINE user ID (1-on-1 chat)")
+		fmt.Println("  --line-allowed-groups <ids>  OLA_LINE_ALLOWED_GROUPS  comma-separated LINE group/room ID")
+		fmt.Println("                                ส่ง /whoami คุยกับบอทเพื่อดู ID ของตัวเอง (ใช้ได้แม้ยังไม่อยู่ใน allowlist)")
+		fmt.Println()
+		fmt.Println("Persona/Knowledge base/Context/Web search: เหมือน 'ola telegrambot' ทุก flag ทุกพฤติกรรม - ดู 'ola telegrambot -h'")
+		fmt.Println("  --persona, --persona-file, --knowledge-dir, --embed-model, --embed-top-k, --embed-min-score,")
+		fmt.Println("  --embed-refresh-interval, --context-dir (default: line-context), --context-keep-recent,")
+		fmt.Println("  --context-compact-after, --searxng-url, --ollama-search-key, --no-web-search, --search-*")
+		fmt.Println()
+		fmt.Println("Runtime:")
+		fmt.Println("  -c/--ctx, -P/--provider, --api-base, -k/--key   เหมือน 'ola ask'")
+		fmt.Println("  --line-listen-addr <addr>    OLA_LINE_LISTEN_ADDR   ที่อยู่ที่ HTTP server ฟัง (default :8080)")
+		fmt.Println("  --line-webhook-path <path>   OLA_LINE_WEBHOOK_PATH  path ของ webhook (default /line/webhook)")
+		fmt.Println("  --line-api-base <url>        OLA_LINE_API_BASE      (default: https://api.line.me/v2/bot - override สำหรับทดสอบ)")
+		fmt.Println("  --line-max-concurrent <n>    จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส (default 4)")
+		fmt.Println("  -x/--topic     ntfy.sh topic (แจ้งเตือนเมื่อเกิด error ระหว่างประมวลผลข้อความ)")
+		fmt.Println("  -o/--output    log ไฟล์แบบเต็ม (default: linebot.log, เปิดแบบ append เสมอ)")
+		fmt.Println()
+		fmt.Println("คำตอบจากโมเดิลจะถูกส่งด้วย Push API เสมอ (ไม่ใช้ Reply API ซึ่ง token หมดอายุเร็วเกินกว่าจะรอโมเดิลตอบทัน)")
+		fmt.Println("Reply API ใช้เฉพาะคำตอบที่ไม่ต้องรอโมเดิล (/whoami, /tools, ข้อความปฏิเสธ allowlist) เท่านั้น")
+		fmt.Println("พฤติกรรมใน group/room chat: ตอบเฉพาะเมื่อถูก @mention หรือขึ้นต้นด้วย /ola หรือ /ask เท่านั้น")
+		fmt.Println("คำสั่งในตัว: /whoami หรือ /start (ดู ID ของตัวเอง), /tools (เช็คสถานะ tool ปัจจุบัน - เฉพาะผู้ที่อยู่ใน allowlist)")
+		fs.PrintDefaults()
+	}
+}
+
+func cmdLineBot(args []string) int {
+	fs := flag.NewFlagSet("linebot", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+
+	var model, ctxStr, outputFile, topic string
+	var flagKey, flagHelp bool
+	var providerFlag, apiBaseFlag string
+	var lineAPIBase, listenAddr, webhookPath string
+	var allowedUsers, allowedGroups string
+	var persona, personaFile string
+	var knowledgeDir string
+	var embedModel string
+	var embedTopK int
+	var embedMinScore float64
+	var embedRefreshSec int
+	var contextDir string
+	var keepRecent, compactAfter int
+	var maxConcurrent int
+	var searxngURL, ollamaSearchKey string
+	var flagNoWebSearch bool
+	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
+
+	fs.StringVar(&model, "m", "", "")
+	fs.StringVar(&model, "model", "", "")
+	fs.StringVar(&ctxStr, "c", "", "")
+	fs.StringVar(&ctxStr, "ctx", "", "")
+	fs.BoolVar(&flagKey, "k", false, "")
+	fs.BoolVar(&flagKey, "key", false, "")
+	fs.StringVar(&providerFlag, "P", "", "")
+	fs.StringVar(&providerFlag, "provider", "", "")
+	fs.StringVar(&apiBaseFlag, "api-base", "", "")
+	fs.StringVar(&lineAPIBase, "line-api-base", "", "")
+	fs.StringVar(&listenAddr, "line-listen-addr", "", "")
+	fs.StringVar(&webhookPath, "line-webhook-path", "", "")
+	fs.StringVar(&allowedUsers, "line-allowed-users", "", "")
+	fs.StringVar(&allowedGroups, "line-allowed-groups", "", "")
+	fs.StringVar(&persona, "persona", "", "")
+	fs.StringVar(&personaFile, "persona-file", "", "")
+	fs.StringVar(&knowledgeDir, "knowledge-dir", "", "")
+	fs.StringVar(&embedModel, "embed-model", "", "")
+	fs.IntVar(&embedTopK, "embed-top-k", 0, "")
+	fs.Float64Var(&embedMinScore, "embed-min-score", 0, "")
+	fs.IntVar(&embedRefreshSec, "embed-refresh-interval", 0, "")
+	fs.StringVar(&contextDir, "context-dir", "", "")
+	fs.IntVar(&keepRecent, "context-keep-recent", 0, "")
+	fs.IntVar(&compactAfter, "context-compact-after", 0, "")
+	fs.IntVar(&maxConcurrent, "line-max-concurrent", 0, "")
+	fs.StringVar(&searxngURL, "searxng-url", "", "")
+	fs.StringVar(&ollamaSearchKey, "ollama-search-key", "", "")
+	fs.BoolVar(&flagNoWebSearch, "no-web-search", false, "")
+	fs.IntVar(&searchMaxResults, "search-max-results", 0, "")
+	fs.IntVar(&searchConcurrency, "search-concurrency", 0, "")
+	fs.IntVar(&fetchConcurrency, "fetch-concurrency", 0, "")
+	fs.IntVar(&searchTimeoutSec, "search-timeout", 0, "")
+	fs.IntVar(&fetchTimeoutSec, "fetch-timeout", 0, "")
+	fs.StringVar(&topic, "x", "", "")
+	fs.StringVar(&topic, "topic", "", "")
+	fs.StringVar(&outputFile, "o", "", "")
+	fs.StringVar(&outputFile, "output", "", "")
+	fs.BoolVar(&flagHelp, "h", false, "")
+	fs.BoolVar(&flagHelp, "help", false, "")
+
+	usage := lineUsage(fs)
+	fs.Usage = usage
+
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	if flagHelp {
+		usage()
+		return 0
+	}
+
+	quietMode = true // headless daemon - see cmdTelegramBot's own comment on this exact line for the full reasoning
+
+	token := strings.TrimSpace(os.Getenv("OLA_LINE_CHANNEL_TOKEN"))
+	if token == "" {
+		fmt.Fprintln(os.Stderr, "error: ต้องตั้งค่า OLA_LINE_CHANNEL_TOKEN (env เท่านั้น - ไม่มี flag รับ token โดยตรง เพื่อไม่ให้หลุดไปอยู่ใน shell history/ps)")
+		return 1
+	}
+	channelSecret := strings.TrimSpace(os.Getenv("OLA_LINE_CHANNEL_SECRET"))
+	if channelSecret == "" {
+		fmt.Fprintln(os.Stderr, "error: ต้องตั้งค่า OLA_LINE_CHANNEL_SECRET (env เท่านั้น - ใช้ตรวจสอบ signature ของ webhook request)")
+		return 1
+	}
+
+	pcfg, err := resolveProviderConfig(providerFlag, apiBaseFlag, model, flagKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
+	if ctxStr == "" {
+		ctxStr = os.Getenv("OLA_OLLAMA_CONTEXT_SIZE")
+	}
+	if ctxStr == "" {
+		ctxStr = "16384"
+	}
+	if !regexp.MustCompile(`^[0-9]+$`).MatchString(ctxStr) {
+		fmt.Fprintf(os.Stderr, "error: ctx ต้องเป็นตัวเลข (got: %s)\n", ctxStr)
+		return 1
+	}
+	ctxSize, _ := strconv.Atoi(ctxStr)
+
+	if lineAPIBase == "" {
+		lineAPIBase = os.Getenv("OLA_LINE_API_BASE")
+	}
+	if lineAPIBase == "" {
+		lineAPIBase = defaultLineAPIBase
+	}
+	if listenAddr == "" {
+		listenAddr = os.Getenv("OLA_LINE_LISTEN_ADDR")
+	}
+	if listenAddr == "" {
+		listenAddr = defaultLineListenAddr
+	}
+	if webhookPath == "" {
+		webhookPath = os.Getenv("OLA_LINE_WEBHOOK_PATH")
+	}
+	if webhookPath == "" {
+		webhookPath = defaultLineWebhookPath
+	}
+
+	if contextDir == "" {
+		contextDir = os.Getenv("OLA_CONTEXT_DIR")
+	}
+	if contextDir == "" {
+		contextDir = defaultLineContextDir
+	}
+	if keepRecent <= 0 {
+		keepRecent = defaultChatBotKeepRecentTurns
+	}
+	if compactAfter <= 0 {
+		compactAfter = defaultChatBotCompactAfterTurns
+	}
+	if compactAfter <= keepRecent {
+		fmt.Fprintf(os.Stderr, "error: --context-compact-after (%d) ต้องมากกว่า --context-keep-recent (%d)\n", compactAfter, keepRecent)
+		return 1
+	}
+	if maxConcurrent <= 0 {
+		maxConcurrent = defaultTelegramMaxConcurrent
+	}
+
+	access, accessWarnings := resolveLineAccessConfig(allowedUsers, allowedGroups)
+	for _, w := range accessWarnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
+	if access.empty() {
+		fmt.Fprintln(os.Stderr, "error: ไม่มีใครอยู่ใน allowlist เลย (--line-allowed-users/--line-allowed-groups หรือ OLA_LINE_ALLOWED_USERS/_GROUPS ว่างเปล่าทั้งคู่) - บอทจะปฏิเสธทุกคน ตั้งอย่างน้อยหนึ่งอย่าง")
+		return 1
+	}
+
+	persona, err = resolveChatBotPersona(persona, personaFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
+	knowledgeCfg, knowledgeWarnings := resolveKnowledgeConfig(knowledgeDir)
+	for _, w := range knowledgeWarnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
+
+	embedCfg := resolveEmbedConfig(embedModel, embedTopK, embedMinScore, embedRefreshSec)
+	if embedCfg.enabled() {
+		if !knowledgeCfg.enabled() {
+			fmt.Fprintln(os.Stderr, "error: --embed-model ตั้งไว้แต่ไม่มี --knowledge-dir - embedding search ใช้กับฐานความรู้เท่านั้น ไม่มีอะไรให้ index")
+			return 1
+		}
+		if pcfg.Provider != providerOllama {
+			fmt.Fprintln(os.Stderr, "error: --embed-model รองรับเฉพาะ --provider ollama ในตอนนี้ (เรียก Ollama's /api/embed โดยตรง)")
+			return 1
+		}
+	}
+
+	searchCfg := resolveSearchConfig(searxngURL, searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec, flagNoWebSearch)
+	if !flagNoWebSearch {
+		searchCfg.OllamaAPIKey, searchCfg.OllamaBase = resolveOllamaSearchConfig(ollamaSearchKey)
+	}
+
+	tools := filterTools(builtinTools, "get_current_time", "delay")
+	if knowledgeCfg.enabled() {
+		tools = append(tools, searchKnowledgeTool, readKnowledgeTool)
+	}
+	if searchCfg.searchEnabled() {
+		tools = append(tools, webSearchTool)
+	}
+	if searchCfg.fetchEnabled() {
+		tools = append(tools, webFetchTool)
+	}
+
+	systemPrompt := buildChatBotSystemPrompt("LINE", persona)
+
+	if outputFile == "" {
+		outputFile = os.Getenv("OLA_OUTPUT_FILE")
+	}
+	if outputFile == "" {
+		outputFile = "linebot.log"
+	}
+	outFile, err := os.OpenFile(outputFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: เปิดไฟล์ log %s ไม่ได้: %v\n", outputFile, err)
+		return 1
+	}
+	defer outFile.Close()
+
+	ntfyTopic := topic
+	if ntfyTopic == "" {
+		ntfyTopic = os.Getenv("OLA_TOPIC")
+	}
+
+	restClient, modelClient := buildLineHTTPClients()
+
+	me, err := lineGetBotInfo(restClient, lineAPIBase, token)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: เชื่อมต่อ LINE Messaging API ไม่ได้ (เช็ค OLA_LINE_CHANNEL_TOKEN และการเชื่อมต่อเน็ต): %v\n", err)
+		return 1
+	}
+
+	session := &lineSession{
+		chatBotCore: chatBotCore{
+			client:           modelClient,
+			systemPrompt:     systemPrompt,
+			tools:            tools,
+			knowledgeCfg:     knowledgeCfg,
+			embedCfg:         embedCfg,
+			knowledgeIdx:     &knowledgeIndexStore{},
+			knowledgeIdxPath: knowledgeIndexPath(contextDir),
+			searchCfg:        searchCfg,
+			pcfg:             pcfg,
+			ctxSize:          ctxSize,
+			contextDir:       contextDir,
+			keepRecent:       keepRecent,
+			compactAfter:     compactAfter,
+			ntfyTopic:        ntfyTopic,
+			outFile:          outFile,
+			locks:            map[string]*sync.Mutex{},
+		},
+		restClient:    restClient,
+		apiBase:       lineAPIBase,
+		channelSecret: channelSecret,
+		token:         token,
+		botUserID:     me.UserID,
+		access:        access,
+		sem:           make(chan struct{}, maxConcurrent),
+		nameCache:     map[string]string{},
+		recentEvents:  map[string]bool{},
+	}
+
+	if embedCfg.enabled() {
+		if prevIdx, err := loadKnowledgeIndex(session.knowledgeIdxPath); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: โหลด knowledge index เดิม (%s) ไม่ได้ (%v) - จะสร้างใหม่ทั้งหมด\n", session.knowledgeIdxPath, err)
+		} else {
+			session.knowledgeIdx.set(prevIdx)
+		}
+		fmt.Println("กำลัง embed ฐานความรู้ (embed-model: " + embedCfg.Model + ")...")
+		session.refreshKnowledgeIndex()
+		fmt.Printf("  embed เสร็จแล้ว: %d chunk(s) ใน index (%s)\n", len(session.knowledgeIdx.get().Chunks), session.knowledgeIdxPath)
+		session.startKnowledgeIndexRefresher(embedCfg.RefreshInterval)
+	}
+
+	displayName := me.DisplayName
+	if displayName == "" {
+		displayName = me.UserID
+	}
+	fmt.Printf("ola linebot: เชื่อมต่อสำเร็จเป็น %s (model: %s, provider: %s)\n", displayName, pcfg.Model, pcfg.Provider)
+	fmt.Printf("  allowlist: %d user(s), %d group(s)\n", len(access.Users), len(access.Groups))
+	fmt.Println("  " + strings.ReplaceAll(session.toolsStatusText(), "\n", "\n  "))
+	fmt.Printf("  context: %s (compact เมื่อเกิน %d turn, เหลือ %d turn ล่าสุด)\n", contextDir, compactAfter, keepRecent)
+	fmt.Printf("  log: %s (append)\n", outputFile)
+	fmt.Printf("  webhook: listen %s%s (ต้องมี HTTPS reverse proxy ชี้ URL จริงมาที่นี่ - ดู 'ola linebot -h')\n", listenAddr, webhookPath)
+	fmt.Println("กด Ctrl-C เพื่อหยุด")
+	fmt.Fprintf(outFile, "\n=== ola linebot เริ่มทำงาน %s (bot: %s) ===\n%s\n",
+		time.Now().Format(time.RFC3339), displayName, session.toolsStatusText())
+
+	mux := http.NewServeMux()
+	mux.HandleFunc(webhookPath, session.webhookHandler)
+	srv := &http.Server{Addr: listenAddr, Handler: mux}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	serverErrCh := make(chan error, 1)
+	go func() {
+		serverErrCh <- srv.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serverErrCh:
+		if err != nil && err != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "error: HTTP server ล้มเหลว: %v\n", err)
+			return 1
+		}
+	case <-sigCh:
+		fmt.Println("\nกำลังหยุด ola linebot...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: ปิด HTTP server ไม่ราบรื่น: %v\n", err)
+		}
+	}
+	fmt.Fprintf(outFile, "=== ola linebot หยุดทำงาน %s ===\n", time.Now().Format(time.RFC3339))
+	return 0
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Section: webbot (originally webbot.go)
+//
+// "ola webbot" is a small single-page web chat UI for talking to ola
+// directly from a browser - same restrictive toolset as telegrambot/
+// discordbot/linebot (search_knowledge/read_knowledge/web_search/
+// web_fetch/get_current_time/delay only, never the filesystem/shell tools
+// "ask"/"coding" have) via the same chatBotCore, but with two genuine
+// differences from the other three:
+//
+//  1. NO THIRD-PARTY PLATFORM IN FRONT. Telegram/Discord/LINE each hand
+//     ola a platform-verified user identity to check against an allowlist.
+//     webbot has no such thing - it's ola's own HTTP server, and anyone
+//     who can reach it can talk to it. Mitigated two ways: the server
+//     defaults to binding 127.0.0.1 only (never a public interface unless
+//     explicitly told to), and an optional shared --webbot-token gates
+//     every request behind a simple bearer-style check (constant-time
+//     compared - see requireToken).
+//  2. NO PERSISTENT CONTEXT, BY DESIGN (explicitly requested this way,
+//     not a limitation). Each browser session gets a chatContext that
+//     lives ONLY in memory for the lifetime of that session - .save() is
+//     never called anywhere in this section. Closing the tab or
+//     restarting the process both simply lose that conversation, which is
+//     the intended behavior here (contrast with telegrambot/discordbot/
+//     linebot, where losing history on restart would be a bug). Idle
+//     sessions are still swept periodically (see cleanupIdleSessions) so
+//     memory doesn't grow unbounded if tabs are left open indefinitely.
+//
+// The frontend is a single embedded HTML/CSS/JS page (see
+// webBotChatHTML) - no build step, no external JS framework, matching
+// the rest of this project's "one binary, nothing to install" philosophy
+// on the frontend side too. Kept as a Go string constant (not a
+// go:embed'd separate file) specifically so it stays inside main.go
+// rather than becoming an unavoidable exception to the project's
+// single-file convention the way platform_linux.go/platform_other.go are
+// (those two are split for a real technical reason - a build-tag file
+// must contain ONLY the tagged code; nothing forces the HTML out of
+// main.go the same way).
+// ─────────────────────────────────────────────────────────────────
+
+const defaultWebBotListenAddr = "127.0.0.1:8090"
+const defaultWebBotSessionTTL = 2 * time.Hour
+
+// webBotGreetingPrompt is never shown to the user - it's the synthetic
+// first "turn" that makes the bot introduce itself before any real
+// question exists, per an explicit request that the chat should open
+// with the bot's own introduction rather than a blank input box. Framed
+// as a system-style instruction (not really something "the user said")
+// so a model reading the replayed history later understands why the
+// first assistant turn exists with no matching real user turn before it.
+const webBotGreetingPrompt = "(ระบบ: นี่คือข้อความเริ่มต้นบทสนทนา ยังไม่มีคำถามจากผู้ใช้ ให้แนะนำตัวเองสั้นๆ 2-3 ประโยคตามชื่อ/บุคลิกที่กำหนดไว้ (ถ้ามี) แล้วเชิญชวนให้ผู้ใช้เริ่มถามคำถามได้เลย ห้ามตอบว่างเปล่าเด็ดขาด)"
+
+// webBotFallbackGreeting is shown only if the model itself fails to
+// produce a greeting (e.g. the backend is briefly unreachable) - a
+// broken first call should never permanently block the chat from ever
+// starting.
+const webBotFallbackGreeting = "สวัสดีครับ มีอะไรให้ช่วยไหมครับ 😊"
+
+// ─────────────────────────────────────────────────────────────────
+// webBotSession embeds chatBotCore (see that struct's own doc comment) -
+// the tool loop, knowledge base, compaction logic are all inherited
+// unchanged. Only the session store, token gate, and HTTP handlers are
+// genuinely webbot-specific.
+// ─────────────────────────────────────────────────────────────────
+
+type webBotSession struct {
+	chatBotCore
+	token string
+
+	sessMu   sync.Mutex
+	sessions map[string]*chatContext
+}
+
+// newWebBotSessionID returns a cryptographically random session
+// identifier. This is a real access credential (whoever holds it can
+// read and continue that conversation) so it comes from crypto/rand, not
+// math/rand - the same distinction that matters for the Discord Gateway's
+// heartbeat jitter (math/rand is fine there, nothing security-relevant
+// depends on it) but not here.
+func newWebBotSessionID() (string, error) {
+	b := make([]byte, 20)
+	if _, err := cryptorand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// createSession makes a brand-new, empty, in-memory-only chatContext -
+// nothing here ever touches disk (contrast with loadChatContext, which
+// telegramSession/discordSession/lineSession all use instead).
+func (s *webBotSession) createSession() (*chatContext, string, error) {
+	id, err := newWebBotSessionID()
+	if err != nil {
+		return nil, "", fmt.Errorf("สร้าง session ID ไม่ได้: %v", err)
+	}
+	ctx := &chatContext{Key: id, LastActive: time.Now()}
+	s.sessMu.Lock()
+	s.sessions[id] = ctx
+	s.sessMu.Unlock()
+	return ctx, id, nil
+}
+
+func (s *webBotSession) getSession(id string) (*chatContext, bool) {
+	s.sessMu.Lock()
+	defer s.sessMu.Unlock()
+	ctx, ok := s.sessions[id]
+	return ctx, ok
+}
+
+// cleanupIdleSessions drops sessions that haven't been touched in ttl -
+// otherwise a browser tab left open indefinitely (or someone hammering
+// /api/session) would grow this map forever, since nothing here ever
+// expires on its own the way a TTL'd cache entry would.
+func (s *webBotSession) cleanupIdleSessions(ttl time.Duration) {
+	s.sessMu.Lock()
+	defer s.sessMu.Unlock()
+	now := time.Now()
+	for id, ctx := range s.sessions {
+		if now.Sub(ctx.LastActive) > ttl {
+			delete(s.sessions, id)
+		}
+	}
+}
+
+func (s *webBotSession) startSessionCleanup(ttl time.Duration) {
+	interval := ttl / 4
+	if interval < time.Minute {
+		interval = time.Minute
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.cleanupIdleSessions(ttl)
+		}
+	}()
+}
+
+// generateGreeting runs one tool-calling round with no real user message
+// yet, just webBotGreetingPrompt - see that constant's own doc comment.
+func (s *webBotSession) generateGreeting() (string, error) {
+	messages := []ollamaMessage{
+		{Role: "system", Content: s.systemPrompt},
+		{Role: "user", Content: webBotGreetingPrompt},
+	}
+	return s.runChatToolLoop(messages)
+}
+
+const webBotTokenCookieName = "ola_webbot_token"
+
+// tokensEqual compares with subtle.ConstantTimeCompare rather than a
+// plain == - this token is a real access-control credential (see this
+// section's header comment on why webbot needs one at all, unlike the
+// other three bots), and a naive string comparison would leak timing
+// information about how many leading bytes matched.
+func tokensEqual(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+// requireToken is a no-op passthrough when --webbot-token/OLA_WEBBOT_TOKEN
+// was never set (the operator is relying entirely on network exposure -
+// e.g. bound to 127.0.0.1 only, or their own reverse proxy's auth - for
+// access control instead). When a token IS set, every request needs
+// either a valid session cookie already set by a previous visit, or a
+// matching ?token= query parameter (which then sets that cookie so
+// subsequent navigations/API calls don't need to repeat it) - one gate,
+// shared by the page load and every /api/* call alike, rather than a
+// separate mechanism for each.
+func (s *webBotSession) requireToken(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.token == "" {
+			next(w, r)
+			return
+		}
+		if c, err := r.Cookie(webBotTokenCookieName); err == nil && tokensEqual(c.Value, s.token) {
+			next(w, r)
+			return
+		}
+		if q := r.URL.Query().Get("token"); q != "" && tokensEqual(q, s.token) {
+			http.SetCookie(w, &http.Cookie{
+				Name: webBotTokenCookieName, Value: q, Path: "/",
+				HttpOnly: true, SameSite: http.SameSiteLaxMode,
+			})
+			next(w, r)
+			return
+		}
+		http.Error(w, "unauthorized - เข้าผ่าน URL ที่มี ?token=... ให้ถูกต้อง", http.StatusUnauthorized)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// HTTP handlers
+// ─────────────────────────────────────────────────────────────────
+
+func (s *webBotSession) indexHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(webBotChatHTML))
+}
+
+type webBotSessionResponse struct {
+	SessionID string `json:"session_id"`
+	Greeting  string `json:"greeting"`
+}
+
+// sessionHandler creates a new in-memory conversation and has the model
+// generate its own opening greeting before returning - the frontend keeps
+// the chat input disabled until this call completes, so the very first
+// thing a visitor sees is the bot introducing itself, never a blank box
+// waiting for them to speak first (an explicit requirement, not
+// incidental).
+func (s *webBotSession) sessionHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	ctx, id, err := s.createSession()
+	if err != nil {
+		s.logf("[webbot_error] สร้าง session ไม่ได้: %v\n", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "สร้าง session ไม่ได้ ลองใหม่อีกครั้ง"})
+		return
+	}
+
+	greeting, err := s.generateGreeting()
+	if err != nil || strings.TrimSpace(greeting) == "" {
+		s.logf("[webbot_error] สร้างคำทักทายไม่ได้ (%v) - ใช้คำทักทายสำรอง\n", err)
+		greeting = webBotFallbackGreeting
+	}
+	ctx.Turns = append(ctx.Turns, chatTurn{Role: "assistant", Content: greeting, Time: time.Now()})
+	ctx.LastActive = time.Now()
+
+	s.logf("\n=== web session=%s เริ่มต้น ===\n[assistant] %s\n", id, greeting)
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(webBotSessionResponse{SessionID: id, Greeting: greeting})
+}
+
+type webBotChatRequest struct {
+	SessionID string `json:"session_id"`
+	Message   string `json:"message"`
+}
+
+type webBotChatResponse struct {
+	Answer string `json:"answer,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+func (s *webBotSession) writeChatError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(webBotChatResponse{Error: message})
+}
+
+// chatHandler handles one message within an existing session. Deliberately
+// does NOT go through chatBotCore.recordAndRespond (the method
+// telegramSession/discordSession/lineSession all share) - that method is
+// built around the group-chat "record everything, only answer when
+// addressed" split (see its own doc comment) and always persists via
+// loadChatContext/.save(), neither of which applies here: every web
+// message is implicitly "addressed" (a 1:1 chat has no one else it could
+// be talking to), and this session's chatContext already lives entirely
+// in memory (see createSession) with .save() never called anywhere in
+// this section. Reusing the shared pieces that DO apply (buildMessages,
+// shouldCompactChatContext/compactChatContext, runChatToolLoop) while
+// hand-rolling the small amount that's genuinely different keeps the
+// well-tested shared method's own contract simple rather than growing an
+// in-memory-mode flag into it.
+func (s *webBotSession) chatHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req webBotChatRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		s.writeChatError(w, http.StatusBadRequest, "รูปแบบคำขอไม่ถูกต้อง")
+		return
+	}
+	text := strings.TrimSpace(req.Message)
+	if text == "" {
+		s.writeChatError(w, http.StatusBadRequest, "ข้อความว่างเปล่า")
+		return
+	}
+	ctx, ok := s.getSession(req.SessionID)
+	if !ok {
+		s.writeChatError(w, http.StatusNotFound, "session หมดอายุหรือไม่พบ กรุณาโหลดหน้านี้ใหม่")
+		return
+	}
+
+	lock := s.contextMutex(req.SessionID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	if shouldCompactChatContext(ctx, s.compactAfter) {
+		compactChatContext(s.client, s.pcfg, s.ctxSize, ctx, s.keepRecent, s.outFile)
+	}
+
+	messages := ctx.buildMessages(s.systemPrompt)
+	messages = append(messages, ollamaMessage{Role: "user", Content: text})
+
+	s.logf("\n=== web session=%s ===\n[user] %s\n", req.SessionID, text)
+	answer, err := s.runChatToolLoop(messages)
+	if err != nil {
+		s.logf("[webbot_error] session=%s: %v\n", req.SessionID, err)
+		if s.ntfyTopic != "" {
+			sendNotification(s.ntfyTopic, truncateWords(fmt.Sprintf("[webbot error] session=%s: %v", req.SessionID, err), maxNotificationWords))
+		}
+		s.writeChatError(w, http.StatusInternalServerError, "เกิดข้อผิดพลาดระหว่างประมวลผล ลองใหม่อีกครั้ง")
+		return
+	}
+	s.logf("[assistant] %s\n", answer)
+
+	ctx.Turns = append(ctx.Turns,
+		chatTurn{Role: "user", Content: text, Time: time.Now()},
+		chatTurn{Role: "assistant", Content: answer, Time: time.Now()},
+	)
+	ctx.LastActive = time.Now()
+	// deliberately no persistence call here - see this section's header
+	// comment on why webbot never writes a session to disk.
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(webBotChatResponse{Answer: answer})
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Frontend: a single embedded page - gruvbox dark theme, Google Font
+// "Playpen Sans Thai" (both per explicit request), vanilla JS (no
+// framework, no build step - matches this project's "one binary" bent on
+// the frontend side too). Deliberately no JS template literals anywhere
+// in here (string concatenation with + instead) so this can stay a plain
+// Go backtick-quoted raw string constant without needing to escape
+// anything - a backtick inside would otherwise terminate the Go string
+// early.
+// ─────────────────────────────────────────────────────────────────
+
+const webBotChatHTML = `<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ola webbot</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Playpen+Sans+Thai:wght@100..800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg0-hard: #1d2021;
+    --bg0: #282828;
+    --bg1: #3c3836;
+    --bg2: #504945;
+    --bg3: #665c54;
+    --fg1: #ebdbb2;
+    --fg4: #a89984;
+    --red: #fb4934;
+    --green: #b8bb26;
+    --yellow: #fabd2f;
+    --blue: #83a598;
+    --purple: #d3869b;
+    --aqua: #8ec07c;
+    --orange: #fe8019;
+    --gray: #928374;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg0-hard);
+    color: var(--fg1);
+  }
+  body {
+    display: flex; flex-direction: column; height: 100vh;
+    font-family: 'Playpen Sans Thai', sans-serif;
+  }
+  header {
+    padding: 14px 20px;
+    background: var(--bg1);
+    border-bottom: 3px solid var(--orange);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  header h1 {
+    font-size: 1.25rem; margin: 0; color: var(--yellow); font-weight: 700;
+  }
+  header .status {
+    font-size: 0.8rem; color: var(--gray);
+  }
+  #chat {
+    flex: 1; overflow-y: auto; padding: 20px;
+    display: flex; flex-direction: column; gap: 14px;
+    background: var(--bg0);
+  }
+  .msg {
+    max-width: 78%;
+    padding: 10px 14px;
+    border-radius: 14px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    font-size: 1.02rem;
+  }
+  .msg.user {
+    align-self: flex-end;
+    background: var(--blue);
+    color: var(--bg0-hard);
+    border-bottom-right-radius: 3px;
+  }
+  .msg.assistant {
+    align-self: flex-start;
+    background: var(--bg1);
+    color: var(--fg1);
+    border: 1px solid var(--bg3);
+    border-bottom-left-radius: 3px;
+  }
+  .msg.error {
+    align-self: center;
+    background: var(--bg1);
+    color: var(--red);
+    border: 1px solid var(--red);
+    font-size: 0.9rem;
+  }
+  .msg.thinking {
+    align-self: flex-start;
+    color: var(--gray);
+    font-style: italic;
+  }
+  #inputbar {
+    display: flex; gap: 10px;
+    padding: 14px 20px;
+    background: var(--bg1);
+    border-top: 3px solid var(--orange);
+  }
+  #inputbar textarea {
+    flex: 1;
+    resize: none;
+    background: var(--bg0-hard);
+    color: var(--fg1);
+    border: 1px solid var(--bg3);
+    border-radius: 10px;
+    padding: 10px 14px;
+    font-family: 'Playpen Sans Thai', sans-serif;
+    font-size: 1rem;
+    min-height: 44px;
+    max-height: 140px;
+  }
+  #inputbar textarea::placeholder { color: var(--fg4); }
+  #inputbar textarea:focus { outline: 2px solid var(--aqua); }
+  #inputbar button {
+    background: var(--green);
+    color: var(--bg0-hard);
+    border: none;
+    border-radius: 10px;
+    padding: 0 22px;
+    font-family: 'Playpen Sans Thai', sans-serif;
+    font-weight: 700;
+    font-size: 1rem;
+    cursor: pointer;
+  }
+  #inputbar button:disabled {
+    background: var(--bg3);
+    color: var(--gray);
+    cursor: not-allowed;
+  }
+  #inputbar button:hover:not(:disabled) { background: var(--aqua); }
+  #chat::-webkit-scrollbar { width: 10px; }
+  #chat::-webkit-scrollbar-track { background: var(--bg0); }
+  #chat::-webkit-scrollbar-thumb { background: var(--bg2); border-radius: 6px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>ola webbot</h1>
+    <span class="status" id="status">กำลังเชื่อมต่อ...</span>
+  </header>
+  <div id="chat"></div>
+  <div id="inputbar">
+    <textarea id="input" placeholder="พิมพ์ข้อความ..." disabled rows="1"></textarea>
+    <button id="send" disabled>ส่ง</button>
+  </div>
+
+<script>
+(function() {
+  var chatEl = document.getElementById('chat');
+  var inputEl = document.getElementById('input');
+  var sendEl = document.getElementById('send');
+  var statusEl = document.getElementById('status');
+  var sessionID = null;
+
+  function addMessage(role, text) {
+    var div = document.createElement('div');
+    div.className = 'msg ' + role;
+    div.textContent = text;
+    chatEl.appendChild(div);
+    chatEl.scrollTop = chatEl.scrollHeight;
+    return div;
+  }
+
+  function setBusy(busy) {
+    inputEl.disabled = busy;
+    sendEl.disabled = busy;
+    if (!busy) { inputEl.focus(); }
+  }
+
+  function startSession() {
+    statusEl.textContent = 'กำลังเชื่อมต่อ...';
+    fetch('/api/session', { method: 'POST' })
+      .then(function(res) {
+        if (!res.ok) { throw new Error('status ' + res.status); }
+        return res.json();
+      })
+      .then(function(data) {
+        sessionID = data.session_id;
+        addMessage('assistant', data.greeting);
+        statusEl.textContent = 'พร้อมสนทนา';
+        setBusy(false);
+      })
+      .catch(function(err) {
+        statusEl.textContent = 'เชื่อมต่อไม่สำเร็จ';
+        addMessage('error', 'เชื่อมต่อกับบอทไม่สำเร็จ (' + err.message + ') — ลองโหลดหน้านี้ใหม่');
+      });
+  }
+
+  function autoResize() {
+    inputEl.style.height = 'auto';
+    var next = inputEl.scrollHeight;
+    if (next > 140) { next = 140; }
+    inputEl.style.height = next + 'px';
+  }
+
+  function sendMessage() {
+    var text = inputEl.value.trim();
+    if (!text || !sessionID) { return; }
+    addMessage('user', text);
+    inputEl.value = '';
+    autoResize();
+    setBusy(true);
+    var thinkingEl = addMessage('thinking', 'กำลังพิมพ์...');
+    fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionID, message: text })
+    })
+      .then(function(res) {
+        return res.json().then(function(data) { return { ok: res.ok, data: data }; });
+      })
+      .then(function(result) {
+        thinkingEl.remove();
+        if (!result.ok || result.data.error) {
+          addMessage('error', result.data.error || 'เกิดข้อผิดพลาด ลองใหม่อีกครั้ง');
+        } else {
+          addMessage('assistant', result.data.answer);
+        }
+      })
+      .catch(function(err) {
+        thinkingEl.remove();
+        addMessage('error', 'ส่งข้อความไม่สำเร็จ (' + err.message + ')');
+      })
+      .then(function() { setBusy(false); });
+  }
+
+  inputEl.addEventListener('input', autoResize);
+  inputEl.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+  sendEl.addEventListener('click', sendMessage);
+
+  startSession();
+})();
+</script>
+</body>
+</html>
+`
+
+func webBotUsage(fs *flag.FlagSet) func() {
+	return func() {
+		fmt.Println("Usage: ola webbot [options]")
+		fmt.Println()
+		fmt.Println("รัน ola เป็นเว็บแอปแชทหน้าเดียว (HTML/CSS/JS ฝังอยู่ในตัวไบนารีเอง ไม่มี build step,")
+		fmt.Println("ไม่มี dependency ฝั่ง frontend) toolset แบบ read-only เหมือน telegrambot/discordbot/linebot")
+		fmt.Println("ทุกประการ (ไม่มี filesystem/shell access - ไม่ใช่ 'ola ask' เวอร์ชันเว็บ)")
+		fmt.Println()
+		fmt.Println("⚠️  ไม่มีระบบ allowlist แบบผู้ใช้/กลุ่มเหมือนสามบอทก่อนหน้า เพราะไม่มีแพลตฟอร์มภายนอก")
+		fmt.Println("    มายืนยันตัวตนให้ - ค่าเริ่มต้นจึงผูก 127.0.0.1 เท่านั้น (ไม่ใช่ public interface) และ")
+		fmt.Println("    แนะนำให้ตั้ง OLA_WEBBOT_TOKEN ไว้เสมอถ้าจะเปิดให้เข้าถึงได้กว้างกว่านั้น")
+		fmt.Println()
+		fmt.Println("⚠️  ไม่เก็บบทสนทนาลงดิสก์เลย (ตั้งใจออกแบบแบบนี้) - แต่ละ browser session อยู่ในหน่วยความจำ")
+		fmt.Println("    เท่านั้น ปิดแท็บ/รีสตาร์ท process แล้วบทสนทนานั้นหายไปเลย")
+		fmt.Println()
+		fmt.Println("Required:")
+		fmt.Println("  -m/--model หรือ OLA_OLLAMA_MODEL")
+		fmt.Println()
+		fmt.Println("Access:")
+		fmt.Println("  OLA_WEBBOT_TOKEN            (env เท่านั้น) - ถ้าตั้งไว้ ต้องเข้าผ่าน URL ที่มี ?token=...")
+		fmt.Println("                               ครั้งแรก (ตั้ง cookie ให้เองหลังจากนั้น) ไม่ตั้งไว้ = ไม่มีการตรวจสอบใดๆ")
+		fmt.Println()
+		fmt.Println("Persona/Knowledge base/Web search: เหมือน 'ola telegrambot' ทุก flag ทุกพฤติกรรม - ดู 'ola telegrambot -h'")
+		fmt.Println("  --persona, --persona-file, --knowledge-dir, --embed-model, --embed-top-k, --embed-min-score,")
+		fmt.Println("  --embed-refresh-interval, --context-keep-recent, --context-compact-after (compact ในหน่วยความจำ")
+		fmt.Println("  เท่านั้น ไม่มี --context-dir เพราะไม่มีอะไรให้เขียนลงดิสก์), --searxng-url, --ollama-search-key,")
+		fmt.Println("  --no-web-search, --search-*")
+		fmt.Println()
+		fmt.Println("Runtime:")
+		fmt.Println("  -c/--ctx, -P/--provider, --api-base, -k/--key   เหมือน 'ola ask'")
+		fmt.Println("  --webbot-listen-addr <addr>   OLA_WEBBOT_LISTEN_ADDR   ที่อยู่ที่ HTTP server ฟัง (default 127.0.0.1:8090)")
+		fmt.Println("  --webbot-session-ttl <sec>    อายุ session สูงสุดก่อนถูกเก็บกวาดทิ้งถ้าไม่มีการใช้งาน (default 7200 = 2 ชม.)")
+		fmt.Println("  -x/--topic     ntfy.sh topic (แจ้งเตือนเมื่อเกิด error ระหว่างประมวลผลข้อความ)")
+		fmt.Println("  -o/--output    log ไฟล์แบบเต็ม (default: webbot.log, เปิดแบบ append เสมอ)")
+		fmt.Println()
+		fmt.Println("บอทจะแนะนำตัวเองก่อนเสมอ (เรียกโมเดิลจริง ไม่ใช่ข้อความ hardcode) ก่อนที่ผู้ใช้จะเริ่มพิมพ์ได้")
+		fs.PrintDefaults()
+	}
+}
+
+func cmdWebBot(args []string) int {
+	fs := flag.NewFlagSet("webbot", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+
+	var model, ctxStr, outputFile, topic string
+	var flagHelp bool
+	var providerFlag, apiBaseFlag string
+	var flagKey bool
+	var listenAddr string
+	var sessionTTLSec int
+	var persona, personaFile string
+	var knowledgeDir string
+	var embedModel string
+	var embedTopK int
+	var embedMinScore float64
+	var embedRefreshSec int
+	var keepRecent, compactAfter int
+	var searxngURL, ollamaSearchKey string
+	var flagNoWebSearch bool
+	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
+
+	fs.StringVar(&model, "m", "", "")
+	fs.StringVar(&model, "model", "", "")
+	fs.StringVar(&ctxStr, "c", "", "")
+	fs.StringVar(&ctxStr, "ctx", "", "")
+	fs.BoolVar(&flagKey, "k", false, "")
+	fs.BoolVar(&flagKey, "key", false, "")
+	fs.StringVar(&providerFlag, "P", "", "")
+	fs.StringVar(&providerFlag, "provider", "", "")
+	fs.StringVar(&apiBaseFlag, "api-base", "", "")
+	fs.StringVar(&listenAddr, "webbot-listen-addr", "", "")
+	fs.IntVar(&sessionTTLSec, "webbot-session-ttl", 0, "")
+	fs.StringVar(&persona, "persona", "", "")
+	fs.StringVar(&personaFile, "persona-file", "", "")
+	fs.StringVar(&knowledgeDir, "knowledge-dir", "", "")
+	fs.StringVar(&embedModel, "embed-model", "", "")
+	fs.IntVar(&embedTopK, "embed-top-k", 0, "")
+	fs.Float64Var(&embedMinScore, "embed-min-score", 0, "")
+	fs.IntVar(&embedRefreshSec, "embed-refresh-interval", 0, "")
+	fs.IntVar(&keepRecent, "context-keep-recent", 0, "")
+	fs.IntVar(&compactAfter, "context-compact-after", 0, "")
+	fs.StringVar(&searxngURL, "searxng-url", "", "")
+	fs.StringVar(&ollamaSearchKey, "ollama-search-key", "", "")
+	fs.BoolVar(&flagNoWebSearch, "no-web-search", false, "")
+	fs.IntVar(&searchMaxResults, "search-max-results", 0, "")
+	fs.IntVar(&searchConcurrency, "search-concurrency", 0, "")
+	fs.IntVar(&fetchConcurrency, "fetch-concurrency", 0, "")
+	fs.IntVar(&searchTimeoutSec, "search-timeout", 0, "")
+	fs.IntVar(&fetchTimeoutSec, "fetch-timeout", 0, "")
+	fs.StringVar(&topic, "x", "", "")
+	fs.StringVar(&topic, "topic", "", "")
+	fs.StringVar(&outputFile, "o", "", "")
+	fs.StringVar(&outputFile, "output", "", "")
+	fs.BoolVar(&flagHelp, "h", false, "")
+	fs.BoolVar(&flagHelp, "help", false, "")
+
+	usage := webBotUsage(fs)
+	fs.Usage = usage
+
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	if flagHelp {
+		usage()
+		return 0
+	}
+
+	quietMode = true // headless daemon - see cmdTelegramBot's own comment on this exact line for the full reasoning
+
+	token := strings.TrimSpace(os.Getenv("OLA_WEBBOT_TOKEN"))
+
+	pcfg, err := resolveProviderConfig(providerFlag, apiBaseFlag, model, flagKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
+	if ctxStr == "" {
+		ctxStr = os.Getenv("OLA_OLLAMA_CONTEXT_SIZE")
+	}
+	if ctxStr == "" {
+		ctxStr = "16384"
+	}
+	if !regexp.MustCompile(`^[0-9]+$`).MatchString(ctxStr) {
+		fmt.Fprintf(os.Stderr, "error: ctx ต้องเป็นตัวเลข (got: %s)\n", ctxStr)
+		return 1
+	}
+	ctxSize, _ := strconv.Atoi(ctxStr)
+
+	if listenAddr == "" {
+		listenAddr = os.Getenv("OLA_WEBBOT_LISTEN_ADDR")
+	}
+	if listenAddr == "" {
+		listenAddr = defaultWebBotListenAddr
+	}
+	sessionTTL := defaultWebBotSessionTTL
+	if sessionTTLSec > 0 {
+		sessionTTL = time.Duration(sessionTTLSec) * time.Second
+	}
+
+	if keepRecent <= 0 {
+		keepRecent = defaultChatBotKeepRecentTurns
+	}
+	if compactAfter <= 0 {
+		compactAfter = defaultChatBotCompactAfterTurns
+	}
+	if compactAfter <= keepRecent {
+		fmt.Fprintf(os.Stderr, "error: --context-compact-after (%d) ต้องมากกว่า --context-keep-recent (%d)\n", compactAfter, keepRecent)
+		return 1
+	}
+
+	persona, err = resolveChatBotPersona(persona, personaFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
+	knowledgeCfg, knowledgeWarnings := resolveKnowledgeConfig(knowledgeDir)
+	for _, w := range knowledgeWarnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
+
+	embedCfg := resolveEmbedConfig(embedModel, embedTopK, embedMinScore, embedRefreshSec)
+	if embedCfg.enabled() {
+		if !knowledgeCfg.enabled() {
+			fmt.Fprintln(os.Stderr, "error: --embed-model ตั้งไว้แต่ไม่มี --knowledge-dir - embedding search ใช้กับฐานความรู้เท่านั้น ไม่มีอะไรให้ index")
+			return 1
+		}
+		if pcfg.Provider != providerOllama {
+			fmt.Fprintln(os.Stderr, "error: --embed-model รองรับเฉพาะ --provider ollama ในตอนนี้ (เรียก Ollama's /api/embed โดยตรง)")
+			return 1
+		}
+	}
+
+	searchCfg := resolveSearchConfig(searxngURL, searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec, flagNoWebSearch)
+	if !flagNoWebSearch {
+		searchCfg.OllamaAPIKey, searchCfg.OllamaBase = resolveOllamaSearchConfig(ollamaSearchKey)
+	}
+
+	tools := filterTools(builtinTools, "get_current_time", "delay")
+	if knowledgeCfg.enabled() {
+		tools = append(tools, searchKnowledgeTool, readKnowledgeTool)
+	}
+	if searchCfg.searchEnabled() {
+		tools = append(tools, webSearchTool)
+	}
+	if searchCfg.fetchEnabled() {
+		tools = append(tools, webFetchTool)
+	}
+
+	systemPrompt := buildChatBotSystemPrompt("เว็บแชท", persona)
+
+	if outputFile == "" {
+		outputFile = os.Getenv("OLA_OUTPUT_FILE")
+	}
+	if outputFile == "" {
+		outputFile = "webbot.log"
+	}
+	outFile, err := os.OpenFile(outputFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: เปิดไฟล์ log %s ไม่ได้: %v\n", outputFile, err)
+		return 1
+	}
+	defer outFile.Close()
+
+	ntfyTopic := topic
+	if ntfyTopic == "" {
+		ntfyTopic = os.Getenv("OLA_TOPIC")
+	}
+
+	modelClient := newHTTPClient() // unbounded, same reasoning as every other chat bot's own model client - see buildTelegramHTTPClients' doc comment
+
+	session := &webBotSession{
+		chatBotCore: chatBotCore{
+			client:       modelClient,
+			systemPrompt: systemPrompt,
+			tools:        tools,
+			knowledgeCfg: knowledgeCfg,
+			embedCfg:     embedCfg,
+			knowledgeIdx: &knowledgeIndexStore{},
+			searchCfg:    searchCfg,
+			pcfg:         pcfg,
+			ctxSize:      ctxSize,
+			keepRecent:   keepRecent,
+			compactAfter: compactAfter,
+			ntfyTopic:    ntfyTopic,
+			outFile:      outFile,
+			locks:        map[string]*sync.Mutex{},
+		},
+		token:    token,
+		sessions: map[string]*chatContext{},
+	}
+
+	if embedCfg.enabled() {
+		// webbot has no --context-dir (nothing on disk at all - see this
+		// section's header comment), so the knowledge embedding index -
+		// unlike the other three bots - has nowhere durable to cache to
+		// either. It's rebuilt in memory only, from scratch, every time
+		// this process starts, and re-walked periodically same as always.
+		session.knowledgeIdxPath = ""
+		fmt.Println("กำลัง embed ฐานความรู้ (embed-model: " + embedCfg.Model + ")...")
+		session.refreshKnowledgeIndex()
+		fmt.Printf("  embed เสร็จแล้ว: %d chunk(s) ใน index (เก็บในหน่วยความจำเท่านั้น ไม่มีการ cache ลงดิสก์)\n", len(session.knowledgeIdx.get().Chunks))
+		session.startKnowledgeIndexRefresher(embedCfg.RefreshInterval)
+	}
+
+	session.startSessionCleanup(sessionTTL)
+
+	fmt.Printf("ola webbot: พร้อมทำงาน (model: %s, provider: %s)\n", pcfg.Model, pcfg.Provider)
+	fmt.Println("  " + strings.ReplaceAll(session.toolsStatusText(), "\n", "\n  "))
+	if token != "" {
+		fmt.Printf("  token: เปิดใช้ - เข้าครั้งแรกผ่าน http://%s/?token=%s\n", listenAddr, token)
+	} else {
+		fmt.Println("  token: ปิด (ไม่มีการตรวจสอบสิทธิ์เข้าถึง - ตั้ง OLA_WEBBOT_TOKEN ถ้าจะเปิดให้เข้าถึงได้กว้างกว่า localhost)")
+	}
+	fmt.Printf("  session: เก็บในหน่วยความจำเท่านั้น (ไม่ persist ลงดิสก์), หมดอายุถ้าไม่ใช้งานเกิน %s\n", sessionTTL)
+	fmt.Printf("  log: %s (append)\n", outputFile)
+	fmt.Printf("  ฟังที่: http://%s\n", listenAddr)
+	fmt.Println("กด Ctrl-C เพื่อหยุด")
+	fmt.Fprintf(outFile, "\n=== ola webbot เริ่มทำงาน %s ===\n%s\n",
+		time.Now().Format(time.RFC3339), session.toolsStatusText())
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", session.requireToken(session.indexHandler))
+	mux.HandleFunc("/api/session", session.requireToken(session.sessionHandler))
+	mux.HandleFunc("/api/chat", session.requireToken(session.chatHandler))
+	srv := &http.Server{Addr: listenAddr, Handler: mux}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	serverErrCh := make(chan error, 1)
+	go func() {
+		serverErrCh <- srv.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serverErrCh:
+		if err != nil && err != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "error: HTTP server ล้มเหลว: %v\n", err)
+			return 1
+		}
+	case <-sigCh:
+		fmt.Println("\nกำลังหยุด ola webbot...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: ปิด HTTP server ไม่ราบรื่น: %v\n", err)
+		}
+	}
+	fmt.Fprintf(outFile, "=== ola webbot หยุดทำงาน %s ===\n", time.Now().Format(time.RFC3339))
 	return 0
 }

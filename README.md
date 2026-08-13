@@ -2,7 +2,7 @@
 
 **ola** เป็น CLI (คำสั่งเดียว, ไบนารีเดียว, เขียนด้วย Go ล้วน ไม่พึ่งพา `curl`/`jq`/`perl`/`base64` ภายนอก) สำหรับคุยกับ LLM ผ่าน Ollama (หรือ endpoint แบบ OpenAI-compatible ใดก็ได้) พร้อม **tool calling ที่เปิดใช้งานเสมอ** — โมเดลไม่ได้แค่ตอบข้อความ แต่ *อ่าน/เขียน/แก้ไฟล์จริงบนดิสก์*, รันคำสั่ง shell, ค้นเว็บ, เรียก API, โอนไฟล์ข้าม host, และถามคุณกลับเมื่อจำเป็น ทั้งหมดนี้ sandbox อยู่ใน current directory ที่คุณรัน `ola` เท่านั้น
 
-โปรเจกต์นี้มีสี่คำสั่งย่อย:
+โปรเจกต์นี้มีหกคำสั่งย่อย:
 
 | คำสั่ง | ใช้เมื่อไหร่ |
 |---|---|
@@ -10,8 +10,10 @@
 | [`ola coding`](#ola-coding) | ให้ทำงานยาว ๆ แบบไม่มีคนเฝ้า: ป้อนไฟล์ requirements แล้วปล่อยให้มันวางแผน → เขียนโค้ด → build/test เอง → แก้จนผ่านจริง |
 | [`ola telegrambot`](#ola-telegrambot) | รัน ola เป็น Telegram bot แบบ long-running ตอบเฉพาะ user/group ที่กำหนดไว้ล่วงหน้า ใช้ toolset แบบ read-only (ไม่แตะไฟล์/shell) พร้อมความจำต่อแชทที่ persist ข้าม process |
 | [`ola discordbot`](#ola-discordbot) | Discord counterpart ของ `telegrambot` — หลักการ/toolset/ความจำเหมือนกันทุกประการ ต่างแค่วิธีเชื่อมต่อกับแพลตฟอร์ม (Gateway WebSocket แทน long-polling) |
+| [`ola linebot`](#ola-linebot) | LINE counterpart ของ `telegrambot`/`discordbot` — หลักการ/toolset/ความจำเหมือนกันทุกประการ ต่างแค่วิธีเชื่อมต่อ (รับ webhook เข้ามาแทนที่จะ poll/เปิด connection ออกไปเอง) |
+| [`ola webbot`](#ola-webbot) | เว็บแอปแชทหน้าเดียวฝังในตัวไบนารี toolset เดียวกับสามบอทข้างบน แต่ไม่มี allowlist ผู้ใช้ (ป้องกันด้วย network binding + token แทน) และไม่ persist context ลงดิสก์เลย |
 
-> ทั้งสี่คำสั่งพูดได้สองภาษา (protocol): Ollama's native `/api/chat` (ค่าเริ่มต้น) หรือ endpoint แบบ OpenAI chat-completions (`-P openai`) — ดู [Provider](#provider-ollama-vs-openai-compatible)
+> ทั้งหกคำสั่งพูดได้สองภาษา (protocol): Ollama's native `/api/chat` (ค่าเริ่มต้น) หรือ endpoint แบบ OpenAI chat-completions (`-P openai`) — ดู [Provider](#provider-ollama-vs-openai-compatible)
 
 ---
 
@@ -25,17 +27,19 @@
 6. [`ola coding`](#ola-coding)
 7. [`ola telegrambot`](#ola-telegrambot)
 8. [`ola discordbot`](#ola-discordbot)
-9. [Provider: ollama vs openai-compatible](#provider-ollama-vs-openai-compatible)
-10. [Web search / web fetch](#web-search--web-fetch)
-11. [ตั้งค่า SearXNG ด้วย `websearch.yml`](#ตั้งค่า-searxng-ด้วย-websearchyml)
-12. [Skills system](#skills-system)
-13. [scp_copy — โอนไฟล์ข้าม host](#scp_copy--โอนไฟล์ข้าม-host)
-14. [api_request — เรียก HTTP API](#api_request--เรียก-http-api)
-15. [Quiet mode](#quiet-mode)
-16. [ntfy.sh push notifications](#ntfysh-push-notifications)
-17. [ไฟล์แพลตฟอร์ม (`platform_linux.go` / `platform_other.go`)](#ไฟล์แพลตฟอร์ม)
-18. [การรันเทสต์](#การรันเทสต์)
-19. [ข้อจำกัด/สิ่งที่ควรรู้](#ข้อจำกัดสิ่งที่ควรรู้)
+9. [`ola linebot`](#ola-linebot)
+10. [`ola webbot`](#ola-webbot)
+11. [Provider: ollama vs openai-compatible](#provider-ollama-vs-openai-compatible)
+12. [Web search / web fetch](#web-search--web-fetch)
+13. [ตั้งค่า SearXNG ด้วย `websearch.yml`](#ตั้งค่า-searxng-ด้วย-websearchyml)
+14. [Skills system](#skills-system)
+15. [scp_copy — โอนไฟล์ข้าม host](#scp_copy--โอนไฟล์ข้าม-host)
+16. [api_request — เรียก HTTP API](#api_request--เรียก-http-api)
+17. [Quiet mode](#quiet-mode)
+18. [ntfy.sh push notifications](#ntfysh-push-notifications)
+19. [ไฟล์แพลตฟอร์ม (`platform_linux.go` / `platform_other.go`)](#ไฟล์แพลตฟอร์ม)
+20. [การรันเทสต์](#การรันเทสต์)
+21. [ข้อจำกัด/สิ่งที่ควรรู้](#ข้อจำกัดสิ่งที่ควรรู้)
 
 ---
 
@@ -46,9 +50,9 @@
 - **เขียนไฟล์จริง ไม่ใช่ข้อความให้ copy-paste** — ola รุ่นเก่าเคยมีกลไก marker พิเศษ (`<<<ooo FILENAME ooo>>> ... <<<xxx FILENAME xxx>>>`) กับคำสั่งย่อย `extract` ให้มนุษย์ค่อยแยกไฟล์เอาทีหลัง กลไกนั้นถูกถอดออกไปแล้ว — ตอนนี้ `write_file`/`edit_file` แก้ไฟล์บนดิสก์ทันที
 - **System prompt คงที่ ตายตัวในไบนารี** — ไม่มี `-s/--system` ให้เปลี่ยนจากภายนอกอีกต่อไป เพราะ contract ของ tool calling (tool มีอะไรบ้าง, sandbox ยังไง, เมื่อไหร่ต้องถาม user) สำคัญเกินกว่าจะให้ override แบบเสี่ยง prompt พังตอนรันจริง ข้อยกเว้นเดียวคือส่วน "AVAILABLE SKILLS" ที่ *เติมต่อ* ท้าย prompt เมื่อตั้งค่า skills เท่านั้น (ดู [Skills system](#skills-system))
 - **ไม่เชื่อคำพูดโมเดิลเปล่า ๆ** — เมื่อโมเดิลแก้ไฟล์โค้ด ola จะรัน build/test ของโปรเจกต์เองอย่างอิสระอีกครั้งก่อนยอมรับว่า "เสร็จ" (`ola ask`) หรือบังคับ gate หลายชั้น (`ola coding`) แทนที่จะเชื่อว่าโมเดิลพูดว่า "compiles/passes tests" แล้วจบ
-- **โครงสร้างซอร์สโค้ด** — โปรเจกต์รวมไฟล์ทั้งหมดเหลือน้อยไฟล์ (file-count cleanup): `main.go` (entry point + tool-calling loop ของทั้งสี่คำสั่งย่อย + integrations ทั้งหมด รวม `telegrambot`/`discordbot`), `main_test.go` (เทสต์ทั้งหมด), และ `platform_linux.go`/`platform_other.go` ที่แยกเฉพาะโค้ดที่ผูกกับ build tag (`//go:build linux` / `//go:build !linux`) เพราะไฟล์แบบ build-tag ต้องมี "เฉพาะ" โค้ดที่ตรงเงื่อนไขเท่านั้น เลยรวมเข้า `main.go` ไม่ได้
-- **`telegrambot`/`discordbot` เป็น trust model คนละแบบกับ `ask`/`coding`** — สองคำสั่งนั้นรันในเทอร์มินัลของผู้ดำเนินการเอง แต่แชทบอททั้งสองรับข้อความจากคนอื่นผ่านอินเทอร์เน็ต จึงมี toolset แบบ read-only เท่านั้น (ไม่มี `read_file`/`write_file`/`run_command`/ฯลฯ) และ dispatcher tool ของตัวเอง (`dispatchChatToolCall`) แยกจาก `ask`/`coding` โดยเจตนา — ดู [`ola telegrambot`](#ola-telegrambot)/[`ola discordbot`](#ola-discordbot)
-- **`telegrambot`/`discordbot` ใช้ core ร่วมกัน** — persona, ฐานความรู้ (grep + embedding search), context compaction, grounding marker กัน hallucination, และ tool-calling loop ล้วนอยู่ใน `chatBotCore` ที่ทั้งสองบอท embed ใช้ร่วมกัน มีแค่การเชื่อมต่อ/รับส่งข้อความกับแพลตฟอร์มเท่านั้นที่ต่างกันจริงๆ — บั๊กที่แก้ในส่วน core จะได้ประโยชน์กับทั้งสองบอทพร้อมกันเสมอ
+- **โครงสร้างซอร์สโค้ด** — โปรเจกต์รวมไฟล์ทั้งหมดเหลือน้อยไฟล์ (file-count cleanup): `main.go` (entry point + tool-calling loop ของทั้งหกคำสั่งย่อย + integrations ทั้งหมด รวม `telegrambot`/`discordbot`/`linebot`/`webbot`), `main_test.go` (เทสต์ทั้งหมด), และ `platform_linux.go`/`platform_other.go` ที่แยกเฉพาะโค้ดที่ผูกกับ build tag (`//go:build linux` / `//go:build !linux`) เพราะไฟล์แบบ build-tag ต้องมี "เฉพาะ" โค้ดที่ตรงเงื่อนไขเท่านั้น เลยรวมเข้า `main.go` ไม่ได้
+- **`telegrambot`/`discordbot`/`linebot`/`webbot` เป็น trust model คนละแบบกับ `ask`/`coding`** — สองคำสั่งนั้นรันในเทอร์มินัลของผู้ดำเนินการเอง แต่แชทบอททั้งสี่รับข้อความจากคนอื่นผ่านอินเทอร์เน็ต (หรือเครือข่ายท้องถิ่น กรณี `webbot`) จึงมี toolset แบบ read-only เท่านั้น (ไม่มี `read_file`/`write_file`/`run_command`/ฯลฯ) และ dispatcher tool ของตัวเอง (`dispatchChatToolCall`) แยกจาก `ask`/`coding` โดยเจตนา — ดู [`ola telegrambot`](#ola-telegrambot)/[`ola discordbot`](#ola-discordbot)/[`ola linebot`](#ola-linebot)/[`ola webbot`](#ola-webbot)
+- **`telegrambot`/`discordbot`/`linebot`/`webbot` ใช้ core ร่วมกัน** — persona, ฐานความรู้ (grep + embedding search), context compaction, grounding marker กัน hallucination, และ tool-calling loop ล้วนอยู่ใน `chatBotCore` ที่ทั้งสี่บอท embed ใช้ร่วมกัน มีแค่การเชื่อมต่อ/รับส่งข้อความกับแพลตฟอร์มเท่านั้นที่ต่างกันจริงๆ (และ `webbot` ไม่เรียก `.save()` เลย เพราะตั้งใจไม่ persist ลงดิสก์ — ดู [`ola webbot`](#ola-webbot)) — บั๊กที่แก้ในส่วน core จะได้ประโยชน์กับทุกบอทพร้อมกันเสมอ
 - **ต้องมี `github.com/gorilla/websocket` เป็น Go dependency เดียว** — เพราะ Discord ไม่มี long-polling ต้องเปิด WebSocket connection ค้างไว้ (Gateway) ซึ่ง Go stdlib ไม่มี WebSocket client ให้ใช้ ส่วนที่เหลือทั้งหมด (Gateway protocol เอง, REST client, ทุก integration อื่น) ยังเขียนด้วย stdlib ล้วนเหมือนเดิม — ดู [`ola discordbot`](#ola-discordbot) สำหรับรายละเอียดการตัดสินใจนี้
 
 ---
@@ -660,6 +664,147 @@ Discord ซ้อนโครงสร้างลึกกว่า Telegram: S
 | — | `-o, --output` | `discordbot.log` | log ไฟล์แบบเต็ม เปิดแบบ append เสมอ |
 
 ตัวแปรที่เหลือทั้งหมด (`--persona`/`--persona-file`/`OLA_PERSONA`/`OLA_PERSONA_FILE`, `--knowledge-dir`/`OLA_KNOWLEDGE_DIR`, `--embed-model`/`OLA_EMBED_MODEL`/`--embed-top-k`/`--embed-min-score`/`--embed-refresh-interval`, `--context-dir`/`OLA_CONTEXT_DIR` (default ต่างกัน: `discord-context` ที่นี่ vs `telegram-context` ฝั่ง telegrambot ถ้าไม่ได้ตั้ง แต่**ตัวแปร env ตัวเดียวกัน** — ตั้ง `OLA_CONTEXT_DIR` แล้วสองบอทจะไปที่เดียวกันได้ถ้าต้องการ)/`--context-keep-recent`/`--context-compact-after`, การเชื่อมต่อโมเดล, web search/fetch ทั้งชุด) **ใช้ร่วมกับ `ola telegrambot` ทุก flag ทุกพฤติกรรมเป๊ะๆ** — ดู [`ola telegrambot`](#ola-telegrambot) และ [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด)
+
+---
+
+## `ola linebot`
+
+LINE counterpart ของ `ola telegrambot`/`ola discordbot` — **หลักการ, toolset, persona, ฐานความรู้ (grep + embedding search), context compaction, grounding marker, group-recording+speaker attribution ทั้งหมดเหมือนกันทุกประการ** เพราะทั้งสามบอทใช้ `chatBotCore` ตัวเดียวกัน — **หัวข้อนี้จะพูดถึงเฉพาะส่วนที่ต่างจากสองบอทแรกเท่านั้น** ดูรายละเอียดส่วนที่เหมือนกันได้ที่ [`ola telegrambot`](#ola-telegrambot)
+
+### ความต่างสำคัญที่สุด: LINE ยิง webhook เข้าหาเรา (ทิศทางตรงข้ามกับสองบอทแรก)
+
+Telegram = long-poll ออกไปเอง (ไม่ต้องมี public endpoint), Discord = เปิด WebSocket ค้างไว้เอง (connection ออกไปเช่นกัน) — **LINE ตรงข้ามเลย**: ต้องมี **public HTTPS endpoint** ให้ LINE ยิง HTTP POST เข้ามาหาทุกครั้งที่มีข้อความ `ola linebot` รัน HTTP server เองด้วย `net/http` ตรงๆ (ไม่มี Go dependency ใหม่เลย ต่างจาก discordbot ที่ต้องมี `gorilla/websocket`) แต่**ต้องมี reverse proxy (เช่น Caddy/nginx) ที่จัดการ TLS ให้อยู่ข้างหน้า** เพราะตัว `ola linebot` เองฟังแค่ plain HTTP — เอา URL ของ reverse proxy (เช่น `https://yourdomain.com/line/webhook`) ไปตั้งใน LINE Developers Console → Messaging API → Webhook URL
+
+ทุก request จาก LINE จะมี header `X-Line-Signature` แนบมาด้วยเสมอ (HMAC-SHA256 ของ request body คีย์ด้วย channel secret) — `ola linebot` ตรวจสอบทุก request ก่อนประมวลผล ถ้า signature ไม่ตรงจะตอบ `401` ทันทีโดยไม่แตะเนื้อหาเลย (ป้องกันคนอื่นปลอมแปลง request ยิงเข้ามาโดยไม่รู้ channel secret จริง)
+
+### ความต่างสำคัญอันดับสอง: reply token หมดอายุเร็วเกินกว่าจะรอโมเดิลตอบ
+
+ทุก webhook event ของ LINE มาพร้อม `replyToken` ที่ใช้ตอบได้**ครั้งเดียว**และ**หมดอายุเร็วมาก** (มีรายงานจากนักพัฒนาจริงว่าสั้นถึงราว 10 วินาที — LINE ไม่ได้ประกาศตัวเลขที่แน่นอนอย่างเป็นทางการ) สั้นกว่าเวลาที่โมเดิลใหญ่ใช้ตอบจริงมาก จึงออกแบบให้:
+- คำตอบสำเร็จรูปที่ไม่รอโมเดิล (`/whoami`, `/tools`, ข้อความปฏิเสธ allowlist) → ใช้ **Reply API** (เร็วพอ, ฟรี) โดยมี Push เป็น fallback ถ้า token หมดอายุไปแล้วพอดี
+- **คำตอบที่มาจากการเรียกโมเดิลจริง → ใช้ Push API เสมอ ไม่มีข้อยกเว้น** (ไม่ลอง Reply ก่อนเลย เพราะแทบจะหมดอายุแน่ๆ ตอนโมเดิลตอบเสร็จ) — ข้อแลกเปลี่ยนคือ push message นับรวมโควตารายเดือนของ LINE Official Account ในโมเดลบิลลิ่งแบบดั้งเดิม (reply message มักไม่นับ) ควรมอนิเตอร์ผ่าน LINE Official Account Manager ถ้าปริมาณการใช้งานเริ่มสูง
+
+### ⚠️ ต้องเปิด "Allow bot to join group chats" ด้วยมือใน LINE Developers Console
+
+เหมือนกับ Discord's Message Content Intent — ปิดโดย default ต้องไปเปิดเองที่ Console → Messaging API tab → Allow bot to join group chats **ลืมเปิดจุดนี้คือสาเหตุที่เชิญบอทเข้ากลุ่มไม่ได้เลย**
+
+### เริ่มต้นใช้งาน
+
+```bash
+export OLA_LINE_CHANNEL_TOKEN='your-channel-access-token-from-line-developers-console'
+export OLA_LINE_CHANNEL_SECRET='your-channel-secret'
+export OLA_OLLAMA_MODEL=qwen3.6:27b
+
+# ยังไม่รู้ user id ของตัวเอง? ทัก /whoami กับบอทหลังแอด friend แล้ว (ทำงานแม้ยังไม่อยู่ใน allowlist)
+ola linebot --line-allowed-users U0000000000000000000000000000000
+
+# ใช้งานจริง
+ola linebot \
+  --line-allowed-users U1111111111111111111111111111111 \
+  --line-allowed-groups C2222222222222222222222222222222 \
+  --persona 'คุณคือผู้ช่วยตอบคำถามวิชา Network Security ของภาควิชา ตอบสุภาพ กระชับ เป็นภาษาไทย' \
+  --knowledge-dir /srv/course-docs/network-security \
+  --embed-model bge-m3 \
+  --line-listen-addr 127.0.0.1:8080
+```
+
+ตัวอย่างนี้ให้ `ola linebot` ฟังที่ `127.0.0.1:8080` เท่านั้น (ไม่ผูก public interface โดยตรง) แล้ววาง reverse proxy ไว้ข้างหน้าให้จัดการ TLS + forward มาที่นี่แทน — ปลอดภัยกว่าให้ `ola linebot` ฟัง public interface เองตรงๆ
+
+### Allowlist สองชั้น (user + group — room ของเก่ารวมอยู่ในกลุ่มเดียวกับ group)
+
+| Flag | ความหมาย |
+|---|---|
+| `--line-allowed-users` | user ID ที่แชท 1-on-1 ได้ (เหมือน `--telegram-allowed-users`) |
+| `--line-allowed-groups` | group/room ID ที่บอทตอบได้ (LINE's "room" เป็นแนวคิดเก่าที่ LINE เองค่อยๆ รวมเข้ากับ "group" อยู่แล้ว จึงใช้ allowlist ชุดเดียวกัน ไม่แยกเหมือน Discord ที่มี channel เป็นชั้นที่สาม) |
+
+### พฤติกรรมในกลุ่ม (group/room)
+
+ตอบเฉพาะเมื่อถูก **@mention** (เช็คจาก `message.mention.mentionees` ที่ LINE ส่ง index/length ของแต่ละ mention มาให้แล้ว ไม่ได้ regex จาก text เอง) หรือขึ้นต้นด้วย `/ola`/`/ask`
+
+### ชื่อผู้พูดในกลุ่มต้องเรียก API แยก (ต่างจาก Telegram/Discord)
+
+Telegram (first name) และ Discord (username) ส่งชื่อผู้ส่งมาพร้อมกับข้อความในตัว webhook event เลย แต่ **LINE ส่งมาแค่ `userId` เปล่าๆ** — ต้องเรียก `GET /v2/bot/profile/{userId}` (แชท 1-on-1) หรือ `GET /v2/bot/group/{groupId}/member/{userId}` (สมาชิกในกลุ่ม) แยกต่างหากถึงจะได้ display name จริง เพราะฟีเจอร์บันทึกทุกข้อความในกลุ่ม (ดู [`ola telegrambot`](#ola-telegrambot)) ทำให้มีข้อความให้บันทึกถี่กว่าที่ต้องรู้ชื่อคนพูดบ่อยขึ้นมาก `ola linebot` เลย**แคชชื่อที่ดึงมาแล้วไว้ในหน่วยความจำตลอดอายุ process** กันเรียก API ซ้ำทุกข้อความจากคนเดิม (ชื่อคนแทบไม่เปลี่ยนบ่อย พอจะ cache ได้โดยไม่ refresh)
+
+### ความจำต่อแชท
+
+`line_user_<id>.json` (1-on-1), `line_group_<id>.json`/`line_room_<id>.json` (กลุ่ม) — คีย์ขึ้นต้นด้วย `line_` เสมอ ชนกับ Telegram/Discord ไม่ได้ **ใช้ `--context-dir` เดียวกับอีกสองบอทได้อย่างปลอดภัย** ถ้าอยากรันพร้อมกันหลายบอท
+
+### Redelivery ของ webhook
+
+LINE อาจส่ง webhook event ซ้ำได้เอง (เช่น ปัญหา network ระหว่างทาง) — `ola linebot` กันด้วย `webhookEventId` ที่ LINE รับประกันว่าเหมือนเดิมทุกครั้งที่ event เดียวกันถูกส่งซ้ำ ถ้าเจอ ID ที่เคยประมวลผลไปแล้วจะข้ามทันที ไม่เรียกโมเดิลซ้ำ ไม่ส่งข้อความซ้ำ
+
+### Flags / Environment variables
+
+| ตัวแปร | Flag | ค่าเริ่มต้น | หมายเหตุ |
+|---|---|---|---|
+| `OLA_LINE_CHANNEL_TOKEN` | *(env เท่านั้น)* | — | **จำเป็น** — channel access token จาก LINE Developers Console |
+| `OLA_LINE_CHANNEL_SECRET` | *(env เท่านั้น)* | — | **จำเป็น** — channel secret ใช้ตรวจสอบ signature ของ webhook request |
+| `OLA_LINE_ALLOWED_USERS` | `--line-allowed-users` | — | comma-separated LINE user ID |
+| `OLA_LINE_ALLOWED_GROUPS` | `--line-allowed-groups` | — | comma-separated LINE group/room ID |
+| `OLA_LINE_API_BASE` | `--line-api-base` | `https://api.line.me/v2/bot` | override สำหรับทดสอบกับ mock server |
+| `OLA_LINE_LISTEN_ADDR` | `--line-listen-addr` | `:8080` | ที่อยู่ที่ HTTP server ฟัง — แนะนำผูกแค่ `127.0.0.1:8080` แล้ววาง reverse proxy ไว้ข้างหน้า |
+| `OLA_LINE_WEBHOOK_PATH` | `--line-webhook-path` | `/line/webhook` | path ของ webhook (ต้องตรงกับที่ตั้งใน LINE Developers Console) |
+| — | `--line-max-concurrent` | `4` | จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส |
+| — | `-o, --output` | `linebot.log` | log ไฟล์แบบเต็ม เปิดแบบ append เสมอ |
+
+ตัวแปรที่เหลือทั้งหมด (`--persona`/`--persona-file`, `--knowledge-dir`, `--embed-model`/`--embed-top-k`/`--embed-min-score`/`--embed-refresh-interval`, `--context-dir`/`OLA_CONTEXT_DIR` (default `line-context` ถ้าไม่ได้ตั้ง — ตัวแปรเดียวกับอีกสองบอท), `--context-keep-recent`/`--context-compact-after`, การเชื่อมต่อโมเดล, web search/fetch ทั้งชุด) **ใช้ร่วมกับ `ola telegrambot` ทุก flag ทุกพฤติกรรมเป๊ะๆ** — ดู [`ola telegrambot`](#ola-telegrambot) และ [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด)
+
+---
+
+## `ola webbot`
+
+เว็บแอปแชทหน้าเดียว (HTML/CSS/JS ฝังอยู่ในตัวไบนารีเอง — ไม่มี build step, ไม่มี npm, ไม่มีไฟล์แยกให้ deploy คู่กัน) **toolset แบบ read-only เดียวกับ telegrambot/discordbot/linebot ทุกประการ ผ่าน `chatBotCore` ตัวเดียวกัน** (persona, ฐานความรู้, grounding marker ฯลฯ เหมือนกันหมด — ดูรายละเอียดที่ [`ola telegrambot`](#ola-telegrambot)) **ไม่ใช่ `ola ask` เวอร์ชันเว็บ** — ไม่มี `read_file`/`write_file`/`run_command` ให้เรียกเลย
+
+### ความต่างจากสามบอทก่อนหน้า: ไม่มีแพลตฟอร์มภายนอกยืนยันตัวตนให้
+
+Telegram/Discord/LINE ต่างมี "แพลตฟอร์ม" ที่ยืนยัน user identity มาให้ก่อนแล้ว เทียบกับ allowlist ได้เลย — **`webbot` ไม่มีสิ่งนี้** เพราะเป็น HTTP server ของ ola เองตรงๆ ป้องกันด้วยสองชั้น:
+
+1. **ผูก `127.0.0.1` เป็นค่าเริ่มต้นเสมอ** (`--webbot-listen-addr`) ไม่ใช่ public interface — ถ้าจะให้เข้าถึงจากเน็ตได้จริง ต้องตั้งใจวาง reverse proxy ไว้ข้างหน้าเอง
+2. **`OLA_WEBBOT_TOKEN`** (env เท่านั้น, ไม่มี flag — หลักการเดียวกับ token ของอีกสามบอท) — ถ้าตั้งไว้ ทุก request (ทั้งโหลดหน้าเว็บและเรียก API) ต้องผ่าน `?token=...` อย่างน้อยครั้งแรก (ระบบตั้ง cookie ให้เองหลังจากนั้น ไม่ต้องแปะ token ซ้ำทุกครั้ง) เทียบ token แบบ constant-time (`crypto/subtle`) กันการโจมตีแบบ timing attack ไม่ตั้งไว้ = ไม่มีการตรวจสอบสิทธิ์เลย (พึ่ง network exposure อย่างเดียว)
+
+### ไม่เก็บบทสนทนาลงดิสก์เลย — ตามที่ตั้งใจออกแบบไว้
+
+แต่ละ browser session ได้ `chatContext` ของตัวเองที่อยู่ใน**หน่วยความจำล้วนๆ** ตลอดอายุ session — ไม่มีการเรียก `.save()` ที่ไหนในโค้ดส่วนนี้เลยสักที่ ปิดแท็บหรือรีสตาร์ท process แล้วบทสนทนานั้นหายไปทันที (ตรงข้ามกับ telegrambot/discordbot/linebot ที่การหายไปแบบนี้ถือเป็นบั๊ก — ที่นี่คือพฤติกรรมที่ตั้งใจ) session ที่ไม่มีการใช้งานเกิน `--webbot-session-ttl` (default 2 ชั่วโมง) จะถูกเก็บกวาดทิ้งอัตโนมัติเป็นระยะ กัน memory โตไม่มีที่สิ้นสุดถ้ามีคนเปิดแท็บทิ้งไว้นานๆ หลายแท็บ
+
+ถ้าเปิด `--embed-model` ด้วย ตัว knowledge index ก็อยู่ในหน่วยความจำเช่นกัน (ไม่มี `--context-dir` ให้ cache ลงดิสก์ข้ามการรีสตาร์ท) — รีสตาร์ท `ola webbot` แล้วต้อง embed ฐานความรู้ใหม่ทั้งหมดทุกครั้ง (ต่างจากสามบอทก่อนที่ embed เฉพาะไฟล์ที่เปลี่ยนหลัง restart)
+
+### บอทแนะนำตัวเองก่อนเสมอ ก่อนผู้ใช้จะเริ่มพิมพ์ได้
+
+ตามที่ขอไว้ — หน้าเว็บจะปิด input ไว้ก่อน แล้วเรียก `/api/session` ที่ให้**โมเดิลจริงสร้างคำแนะนำตัวเอง**ตามชื่อ/บุคลิกใน persona (ไม่ใช่ข้อความ hardcode ตายตัว) ก่อนจะเปิดให้พิมพ์ได้ ถ้าเรียกโมเดิลไม่สำเร็จ (เช่น backend ล่มชั่วคราว) จะ fallback เป็นข้อความทักทายสำรองแทน ไม่ปล่อยให้หน้าเว็บค้างรอเฉยๆ
+
+### Theme และฟอนต์
+
+**Gruvbox** (dark) และ **Playpen Sans Thai** (Google Font) ตามที่ระบุไว้ — โหลดฟอนต์ผ่าน `<link>` ไปยัง Google Fonts ตรงๆ (ต้องมีอินเทอร์เน็ตตอนเปิดหน้าเว็บถึงจะได้ฟอนต์ตามที่ตั้งใจ ไม่มีอินเทอร์เน็ตจะ fallback เป็น `sans-serif` ของเบราว์เซอร์แทนแต่หน้าเว็บยังใช้งานได้ปกติ)
+
+### เริ่มต้นใช้งาน
+
+```bash
+export OLA_OLLAMA_MODEL=qwen3.6:27b
+
+# ใช้งานแบบง่ายที่สุด (localhost เท่านั้น ไม่มี token)
+ola webbot --persona 'คุณคือผู้ช่วยตอบคำถามวิชา Network Security ของภาควิชา' --knowledge-dir /srv/course-docs
+
+# เปิดให้เข้าถึงได้กว้างกว่า localhost ผ่าน reverse proxy (แนะนำตั้ง token เสมอถ้าทำแบบนี้)
+export OLA_WEBBOT_TOKEN='เลือกวลีที่เดายากเอง'
+ola webbot \
+  --persona 'คุณคือผู้ช่วยตอบคำถามวิชา Network Security ของภาควิชา' \
+  --knowledge-dir /srv/course-docs \
+  --embed-model bge-m3 \
+  --searxng-url http://127.0.0.1:3001 \
+  --webbot-listen-addr 127.0.0.1:8090
+```
+
+เปิดเบราว์เซอร์ไปที่ `http://127.0.0.1:8090/` (หรือ `http://127.0.0.1:8090/?token=...` ถ้าตั้ง token ไว้) — ตัวอย่างนี้ตั้งใจให้ `ola webbot` ฟังแค่ `127.0.0.1` เท่านั้น แล้ววาง reverse proxy (Caddy/nginx) ไว้ข้างหน้าจัดการ TLS + forward เข้ามาแทนถ้าจะเปิดให้เข้าถึงจากเน็ตจริง — ปลอดภัยกว่าให้ `ola webbot` ฟัง public interface เองตรงๆ
+
+### Flags / Environment variables
+
+| ตัวแปร | Flag | ค่าเริ่มต้น | หมายเหตุ |
+|---|---|---|---|
+| `OLA_WEBBOT_TOKEN` | *(env เท่านั้น)* | — | shared token gate — ไม่ตั้ง = ไม่มีการตรวจสอบสิทธิ์เข้าถึงเลย |
+| `OLA_WEBBOT_LISTEN_ADDR` | `--webbot-listen-addr` | `127.0.0.1:8090` | ที่อยู่ที่ HTTP server ฟัง |
+| — | `--webbot-session-ttl` | `7200` วินาที (2 ชม.) | อายุ session สูงสุดก่อนถูกเก็บกวาดทิ้งถ้าไม่มีการใช้งาน |
+| — | `-o, --output` | `webbot.log` | log ไฟล์แบบเต็ม เปิดแบบ append เสมอ |
+
+ตัวแปรที่เหลือทั้งหมด (`--persona`/`--persona-file`, `--knowledge-dir`, `--embed-model`/`--embed-top-k`/`--embed-min-score`/`--embed-refresh-interval`, `--context-keep-recent`/`--context-compact-after` (compact ในหน่วยความจำเท่านั้น — **ไม่มี** `--context-dir` เพราะไม่มีอะไรให้เขียนลงดิสก์), การเชื่อมต่อโมเดล, web search/fetch ทั้งชุด) **ใช้ร่วมกับ `ola telegrambot` ทุก flag ทุกพฤติกรรมเป๊ะๆ** — ดู [`ola telegrambot`](#ola-telegrambot) และ [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด) **ไม่มี** flag allowlist แบบ `--*-allowed-users`/`--*-allowed-groups` เหมือนสามบอทก่อน เพราะไม่มีแนวคิด "ผู้ใช้แต่ละคน" ให้ allowlist — การควบคุมการเข้าถึงทำผ่าน network binding + token เท่านั้น
 
 ---
 
