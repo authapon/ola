@@ -11590,3 +11590,24 @@ func TestCompactChatContextInstructsPreservingPicsPathsVerbatim(t *testing.T) {
 		t.Fatalf("expected an explicit verbatim-preservation instruction, got: %s", sentSystemPrompt)
 	}
 }
+
+// TestBuildChatBotSystemPromptInstructsProactiveReadPicUse is a
+// regression test for a real reported case: a user posted a photo, then
+// (separately) mentioned the bot asking "what is this picture" - with no
+// image attached to that specific message, only a "[แนบรูปภาพ: pics/...]"
+// tag on the earlier turn. The model answered describing something
+// completely unrelated (a wristwatch, for an actual photo of a dog)
+// rather than either calling read_pic or admitting it couldn't see
+// anything - because nothing in the rules ever told it it MUST call
+// read_pic in this situation before answering; readPicTool's own
+// description mentioning appropriate use wasn't a strong enough signal
+// on its own. This pins the explicit rule addition.
+func TestBuildChatBotSystemPromptInstructsProactiveReadPicUse(t *testing.T) {
+	prompt := buildChatBotSystemPrompt("เว็บแชท", "")
+	if !strings.Contains(prompt, "read_pic") {
+		t.Fatal("expected the rules to mention read_pic at all")
+	}
+	if !strings.Contains(prompt, "ต้องเรียก read_pic ด้วย path จาก tag นั้นก่อนเสมอ") {
+		t.Fatal("expected an explicit, unconditional instruction to call read_pic before answering when a question refers to a picture not attached to the current message")
+	}
+}
