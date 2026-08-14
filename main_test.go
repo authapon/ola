@@ -11279,3 +11279,250 @@ func TestCmdBotFunctionsWireSaveImagesIntoChatBotCore(t *testing.T) {
 		}
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────
+// --save-images now also downloads+saves an UNADDRESSED image's picture
+// (never analyzed/attached to a model call, since there's no model call
+// happening for an unaddressed message anyway) so it can be referenced
+// in a LATER, addressed turn via read_pic. Off (--save-images not set),
+// behavior is unchanged from before: no download at all for an
+// unaddressed image.
+// ─────────────────────────────────────────────────────────────────
+
+func TestHandleTelegramMessageUnaddressedGroupPhotoIsSavedWhenSaveImagesOn(t *testing.T) {
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) { atomic.AddInt32(&ollamaCalls, 1) })
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	telegramSrv, sent, downloadCalls := newMockTelegramSendMessageAndFileServer(t, minimalPNG)
+
+	contextDir := t.TempDir()
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, contextDir, map[int64]bool{})
+	session.access.Groups = map[int64]bool{-999: true}
+	session.saveImages = true
+
+	msg := &tgMessage{
+		From:  tgUser{ID: 111, FirstName: "สมชาย"},
+		Chat:  tgChat{ID: -999, Type: "group", Title: "ห้องเรียน"},
+		Photo: []tgPhotoSize{{FileID: "id", Width: 800, Height: 800}},
+	}
+	session.handleTelegramMessage(msg)
+
+	if atomic.LoadInt32(downloadCalls) != 1 {
+		t.Fatalf("expected the image to be downloaded once even though unaddressed, since --save-images is on, got %d", *downloadCalls)
+	}
+	if atomic.LoadInt32(&ollamaCalls) != 0 {
+		t.Fatal("expected no model call at all - saving is not the same as analyzing")
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("expected no reply for an unaddressed message, got: %#v", *sent)
+	}
+
+	cctx, err := loadChatContext(contextDir, telegramContextKey(msg.Chat))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	if len(cctx.Turns) != 1 || !strings.Contains(cctx.Turns[0].Content, "pics/group_-999/") {
+		t.Fatalf("expected the stored turn to reference the saved pics/ path even though unaddressed, got: %#v", cctx.Turns)
+	}
+	entries, err := os.ReadDir(filepath.Join(contextDir, "pics", "group_-999"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected exactly one saved file under pics/group_-999/, got %v (err=%v)", entries, err)
+	}
+}
+
+func TestHandleTelegramMessageUnaddressedGroupPhotoStillSkipsDownloadWhenSaveImagesOff(t *testing.T) {
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	telegramSrv, sent, downloadCalls := newMockTelegramSendMessageAndFileServer(t, minimalPNG)
+
+	contextDir := t.TempDir()
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, contextDir, map[int64]bool{})
+	session.access.Groups = map[int64]bool{-999: true}
+	// saveImages deliberately left false - confirms the original,
+	// bandwidth-conscious behavior is unchanged when the operator hasn't
+	// opted in.
+
+	msg := &tgMessage{
+		From:  tgUser{ID: 111, FirstName: "สมชาย"},
+		Chat:  tgChat{ID: -999, Type: "group", Title: "ห้องเรียน"},
+		Photo: []tgPhotoSize{{FileID: "id", Width: 800, Height: 800}},
+	}
+	session.handleTelegramMessage(msg)
+
+	if atomic.LoadInt32(downloadCalls) != 0 {
+		t.Fatalf("expected no download at all when --save-images is off, got %d", *downloadCalls)
+	}
+	if len(*sent) != 0 {
+		t.Fatal("expected no reply")
+	}
+	cctx, err := loadChatContext(contextDir, telegramContextKey(msg.Chat))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	if len(cctx.Turns) != 1 || cctx.Turns[0].Content != "[ส่งรูปภาพ]" {
+		t.Fatalf("expected the bare placeholder tag with no pics/ reference, got: %#v", cctx.Turns)
+	}
+}
+
+func TestHandleDiscordMessageUnaddressedImageIsSavedWhenSaveImagesOn(t *testing.T) {
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) { atomic.AddInt32(&ollamaCalls, 1) })
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	discordSrv, sent, _ := newMockDiscordRESTServer(t)
+	cdnSrv, downloadCalls := newMockImageCDNServer(t, minimalPNG)
+
+	contextDir := t.TempDir()
+	session := newTestDiscordSession(t, discordSrv, ollamaSrv, contextDir, map[string]bool{})
+	session.access.Guilds = map[string]bool{"guild-1": true}
+	session.saveImages = true
+
+	msg := &discordMessage{
+		GuildID: "guild-1", ChannelID: "channel-1",
+		Author:      discordUser{ID: "111", Username: "somchai"},
+		Attachments: []discordAttachment{{URL: cdnSrv.URL + "/image.png", ContentType: "image/png", Filename: "circuit.png"}},
+	}
+	session.handleDiscordMessage(msg)
+
+	if atomic.LoadInt32(downloadCalls) != 1 {
+		t.Fatalf("expected the image to be downloaded once even though unaddressed, got %d", *downloadCalls)
+	}
+	if atomic.LoadInt32(&ollamaCalls) != 0 {
+		t.Fatal("expected no model call")
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("expected no reply for an unaddressed message, got: %#v", *sent)
+	}
+
+	cctx, err := loadChatContext(contextDir, discordContextKey(msg))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	if len(cctx.Turns) != 1 || !strings.Contains(cctx.Turns[0].Content, "pics/discord_channel_channel-1/") {
+		t.Fatalf("expected the stored turn to reference the saved pics/ path, got: %#v", cctx.Turns)
+	}
+}
+
+func TestHandleLineMessageUnaddressedGroupImageIsSavedWhenSaveImagesOn(t *testing.T) {
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) { atomic.AddInt32(&ollamaCalls, 1) })
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	lineSrv, sent, _ := newMockLineRESTServer(t)
+
+	contextDir := t.TempDir()
+	session := newTestLineSession(t, lineSrv, ollamaSrv, contextDir, map[string]bool{})
+	session.access.Groups = map[string]bool{"C999": true}
+	session.saveImages = true
+
+	ev := &lineEvent{
+		Type:           "message",
+		Source:         lineSource{Type: "group", GroupID: "C999", UserID: "U111"},
+		ReplyToken:     "rtoken",
+		Message:        &lineMessage{ID: "msg-3", Type: "image"},
+		WebhookEventID: "evt-img-unaddr-save",
+	}
+	session.handleLineMessage(ev)
+
+	// LINE group images are ALWAYS unaddressed (no mention mechanism on
+	// image messages - see handleLineMessage's own comment) - this is
+	// precisely the case --save-images's extension to unaddressed
+	// messages matters most for, since without it a LINE group image
+	// could never be saved/referenced at all.
+	if atomic.LoadInt32(&ollamaCalls) != 0 {
+		t.Fatal("expected no model call - LINE group images are never addressable, only ever saved")
+	}
+	if len(sent.snapshot()) != 0 {
+		t.Fatalf("expected no reply, got: %#v", sent.snapshot())
+	}
+
+	cctx, err := loadChatContext(contextDir, lineContextKey(ev.Source))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	if len(cctx.Turns) != 1 || !strings.Contains(cctx.Turns[0].Content, "pics/line_group_C999/") {
+		t.Fatalf("expected the stored turn to reference the saved pics/ path, got: %#v", cctx.Turns)
+	}
+	entries, err := os.ReadDir(filepath.Join(contextDir, "pics", "line_group_C999"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected exactly one saved file under pics/line_group_C999/, got %v (err=%v)", entries, err)
+	}
+}
+
+// TestUnaddressedSavedImageCanLaterBeReReadViaReadPic is the full
+// end-to-end proof this feature exists for: an image dropped into a
+// group WITHOUT mentioning the bot still ends up referenceable once the
+// bot IS mentioned in a later, separate turn.
+func TestUnaddressedSavedImageCanLaterBeReReadViaReadPic(t *testing.T) {
+	round := 0
+	var thirdRoundBody string
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		round++
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if round == 1 {
+			// The model decides to call read_pic on the path it sees in
+			// its own context history from the earlier unaddressed turn.
+			fmt.Fprint(w, streamLine("", "read_pic", `{"path":"`+lastUnaddrSavedRef+`"}`, true))
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		thirdRoundBody = string(body)
+		fmt.Fprint(w, streamLine("รูปที่ส่งไปก่อนหน้าเป็นวงจร RC ครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	telegramSrv, sent, _ := newMockTelegramSendMessageAndFileServer(t, minimalPNG)
+
+	contextDir := t.TempDir()
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, contextDir, map[int64]bool{})
+	session.access.Groups = map[int64]bool{-999: true}
+	session.saveImages = true
+	session.tools = append(session.tools, readPicTool)
+	session.botUsername = "olabot"
+
+	chat := tgChat{ID: -999, Type: "group", Title: "ห้องเรียน"}
+
+	// Someone drops a photo into the group with no mention at all.
+	session.handleTelegramMessage(&tgMessage{
+		From: tgUser{ID: 111, FirstName: "สมชาย"}, Chat: chat,
+		Photo: []tgPhotoSize{{FileID: "id1", Width: 800, Height: 800}},
+	})
+
+	cctx, err := loadChatContext(contextDir, telegramContextKey(chat))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	idx := strings.Index(cctx.Turns[0].Content, "pics/")
+	if idx == -1 {
+		t.Fatalf("expected a saved pics/ reference in the unaddressed turn, got: %#v", cctx.Turns)
+	}
+	end := strings.IndexAny(cctx.Turns[0].Content[idx:], "]\n")
+	if end == -1 {
+		end = len(cctx.Turns[0].Content) - idx
+	}
+	lastUnaddrSavedRef = cctx.Turns[0].Content[idx : idx+end]
+
+	// Later, someone else mentions the bot about that same photo.
+	session.handleTelegramMessage(&tgMessage{
+		From: tgUser{ID: 222, FirstName: "สมหญิง"}, Chat: chat,
+		Text: "@olabot รูปที่สมชายส่งไปก่อนหน้า เป็นวงจรอะไรนะ",
+	})
+
+	if round != 2 {
+		t.Fatalf("expected 2 model rounds (read_pic call, then the real answer after the follow-up image), got %d", round)
+	}
+	wantB64 := base64.StdEncoding.EncodeToString(minimalPNG)
+	if !strings.Contains(thirdRoundBody, wantB64) {
+		t.Fatal("expected the re-read image's bytes to reach the model in the follow-up round")
+	}
+	if len(*sent) != 1 || (*sent)[0].Text != "รูปที่ส่งไปก่อนหน้าเป็นวงจร RC ครับ" {
+		t.Fatalf("expected the real answer to be sent, got: %#v", *sent)
+	}
+}
+
+var lastUnaddrSavedRef string

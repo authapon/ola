@@ -10164,6 +10164,20 @@ func savePicture(contextDir, chatKey string, data []byte) (string, error) {
 	return filepath.ToSlash(filepath.Join("pics", chatKey, filename)), nil
 }
 
+// appendChatBotTag appends a bracketed note (e.g. "[ส่งรูปภาพ]" or the
+// path-bearing tag recordAndRespond builds) onto a message's text,
+// putting it on its own line when there's already real text and standing
+// alone when there isn't - the same small formatting decision every
+// platform handler needs whenever it notes something about an image
+// inline with the user's own words, factored out once rather than
+// repeated at each call site.
+func appendChatBotTag(text, tag string) string {
+	if text == "" {
+		return tag
+	}
+	return text + "\n" + tag
+}
+
 // imageExtForBytes sniffs the actual file content (never trusts a
 // platform-reported content-type/filename, which can be missing or
 // simply wrong) to pick a sensible file extension for savePicture.
@@ -10739,7 +10753,16 @@ func (c *chatBotCore) recordAndRespond(key, speaker, text string, addressed bool
 	}
 
 	storedText := text
-	if len(images) > 0 {
+	// Condition is len(images) > 0 OR len(imageRefs) > 0, not just images -
+	// an unaddressed message with --save-images on gets its picture
+	// downloaded and saved (see each platform's own handler) WITHOUT ever
+	// attaching it to a model call (there's no model call happening for an
+	// unaddressed message anyway - addressed is false below), so images
+	// stays empty in that case while imageRefs alone carries the saved
+	// path. Both paths need the same "[แนบรูปภาพ: ...]" tag in the stored
+	// turn so a LATER, addressed turn can see the path in its own context
+	// history and call read_pic on it.
+	if len(images) > 0 || len(imageRefs) > 0 {
 		var tag string
 		if len(imageRefs) > 0 {
 			tag = fmt.Sprintf("[แนบรูปภาพ: %s]", strings.Join(imageRefs, ", "))
@@ -11196,16 +11219,21 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 		speaker = telegramDisplayName(from)
 	}
 
-	// Images are only actually downloaded for addressed messages -
-	// downloading (and having the model look at) a photo posted in a
-	// group chat nobody's asking the bot about would just be wasted
-	// bandwidth/inference. An unaddressed photo still gets a text note in
-	// its recorded turn (below) so the group's own history reflects that
-	// something visual was shared, even though the bot never actually
-	// looked at it.
+	// Images are only ever attached to a MODEL CALL for addressed
+	// messages - downloading (and having the model look at) a photo
+	// posted in a group chat nobody's asking the bot about would just be
+	// wasted inference, and there's no model call happening for an
+	// unaddressed message anyway. But when --save-images is on, an
+	// unaddressed photo still gets downloaded and saved to pics/ (never
+	// analyzed this round) so that a LATER addressed turn - possibly
+	// days apart - already has its path in context history and can call
+	// read_pic on it if the conversation ends up needing it. When
+	// --save-images is off, an unaddressed photo is left completely
+	// undownloaded as before, just noted with a bare placeholder.
 	var images []string
 	var imageRefs []string
-	if hasPhoto && addressed {
+	switch {
+	case hasPhoto && addressed:
 		if photo.FileSize > 0 && photo.FileSize > s.maxImageSize {
 			_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID,
 				fmt.Sprintf("รูปภาพมีขนาด %s เกินขีดจำกัด %s (--max-image-size)", formatByteSize(photo.FileSize), formatByteSize(s.maxImageSize)))
@@ -11225,12 +11253,29 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 				imageRefs = []string{ref}
 			}
 		}
-	} else if hasPhoto {
-		if text == "" {
-			text = "[ส่งรูปภาพ]"
-		} else {
-			text = text + "\n[ส่งรูปภาพ]"
+	case hasPhoto && s.saveImages:
+		// Not addressed, but save-images is on - download+save silently
+		// (no reply either way, matching how any other unaddressed
+		// message is handled - it's only ever recorded, never replied to).
+		if photo.FileSize > 0 && photo.FileSize > s.maxImageSize {
+			text = appendChatBotTag(text, "[ส่งรูปภาพ - ขนาดเกินจำกัด ไม่ได้บันทึก]")
+			break
 		}
+		data, err := tgDownloadImage(s.client, s.apiBase, s.token, photo.FileID, s.maxImageSize)
+		if err != nil {
+			s.logf("[telegram_error] ดาวน์โหลดรูปภาพ (unaddressed) ไม่ได้: %v\n", err)
+			text = appendChatBotTag(text, "[ส่งรูปภาพ]")
+			break
+		}
+		ref, err := savePicture(s.contextDir, key, data)
+		if err != nil {
+			s.logf("[telegram_error] บันทึกรูปภาพไม่ได้: %v\n", err)
+			text = appendChatBotTag(text, "[ส่งรูปภาพ]")
+			break
+		}
+		imageRefs = []string{ref} // recordAndRespond builds the path-bearing tag from this
+	case hasPhoto:
+		text = appendChatBotTag(text, "[ส่งรูปภาพ]")
 	}
 
 	if addressed {
@@ -12480,13 +12525,16 @@ func (s *discordSession) handleDiscordMessage(msg *discordMessage) {
 		speaker = discordDisplayName(msg.Author)
 	}
 
-	// Images are only actually downloaded for addressed messages - see
-	// telegramSession.handleTelegramMessage's own comment on this exact
-	// point for the full reasoning (shared by all three chat bots that
-	// can receive images in a group setting).
+	// Images are only ever attached to a MODEL CALL for addressed
+	// messages - see telegramSession.handleTelegramMessage's own comment
+	// on this exact point (shared reasoning across all three chat bots
+	// that can receive images in a group setting) for why, and for why an
+	// unaddressed image still gets downloaded and saved (never analyzed)
+	// when --save-images is on.
 	var images []string
 	var imageRefs []string
-	if hasImage && addressed {
+	switch {
+	case hasImage && addressed:
 		if image.Size > 0 && image.Size > s.maxImageSize {
 			_ = discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID,
 				fmt.Sprintf("รูปภาพมีขนาด %s เกินขีดจำกัด %s (--max-image-size)", formatByteSize(image.Size), formatByteSize(s.maxImageSize)))
@@ -12506,12 +12554,29 @@ func (s *discordSession) handleDiscordMessage(msg *discordMessage) {
 				imageRefs = []string{ref}
 			}
 		}
-	} else if hasImage {
-		if text == "" {
-			text = "[ส่งรูปภาพ]"
-		} else {
-			text = text + "\n[ส่งรูปภาพ]"
+	case hasImage && s.saveImages:
+		// Not addressed, but save-images is on - download+save silently
+		// (no reply either way, matching how any other unaddressed
+		// message is handled).
+		if image.Size > 0 && image.Size > s.maxImageSize {
+			text = appendChatBotTag(text, "[ส่งรูปภาพ - ขนาดเกินจำกัด ไม่ได้บันทึก]")
+			break
 		}
+		data, err := discordDownloadImage(s.client, image.URL, s.maxImageSize)
+		if err != nil {
+			s.logf("[discord_error] ดาวน์โหลดรูปภาพ (unaddressed) ไม่ได้: %v\n", err)
+			text = appendChatBotTag(text, "[ส่งรูปภาพ]")
+			break
+		}
+		ref, err := savePicture(s.contextDir, key, data)
+		if err != nil {
+			s.logf("[discord_error] บันทึกรูปภาพไม่ได้: %v\n", err)
+			text = appendChatBotTag(text, "[ส่งรูปภาพ]")
+			break
+		}
+		imageRefs = []string{ref} // recordAndRespond builds the path-bearing tag from this
+	case hasImage:
+		text = appendChatBotTag(text, "[ส่งรูปภาพ]")
 	}
 
 	if addressed {
@@ -13574,17 +13639,24 @@ func (s *lineSession) handleLineMessage(ev *lineEvent) {
 		speaker = s.displayName(src.UserID, lineGroupOrRoomID(src))
 	}
 
-	// Images are only actually downloaded for addressed messages - see
-	// telegramSession.handleTelegramMessage's own comment on this exact
-	// point (shared reasoning across all three chat bots that can
-	// receive images in a group setting). LINE gives no advance file-size
-	// information the way Telegram's PhotoSize/Discord's attachment
-	// object do, so there's no pre-flight size check possible here before
-	// attempting the download - lineDownloadImage's own io.LimitReader
-	// cap is the only enforcement point.
+	// Images are only ever attached to a MODEL CALL for addressed
+	// messages - see telegramSession.handleTelegramMessage's own comment
+	// on this exact point (shared reasoning across all three chat bots
+	// that can receive images in a group setting) for why, and for why an
+	// unaddressed image still gets downloaded and saved (never analyzed)
+	// when --save-images is on. This matters more for LINE than the other
+	// two platforms: a LINE image message can NEVER be "addressed" at all
+	// (see isGroup's own comment above on why - no mention object exists
+	// on image messages), so without this, a group image sent via LINE
+	// could never be saved or referenced later no matter what. LINE gives
+	// no advance file-size information the way Telegram's PhotoSize/
+	// Discord's attachment object do, so there's no pre-flight size check
+	// possible here before attempting the download - lineDownloadImage's
+	// own io.LimitReader cap is the only enforcement point either way.
 	var images []string
 	var imageRefs []string
-	if hasImage && addressed {
+	switch {
+	case hasImage && addressed:
 		data, err := lineDownloadImage(s.client, s.dataAPIBase, s.token, msg.ID, s.maxImageSize)
 		if err != nil {
 			s.logf("[line_error] ดาวน์โหลดรูปภาพไม่ได้: %v\n", err)
@@ -13599,8 +13671,25 @@ func (s *lineSession) handleLineMessage(ev *lineEvent) {
 				imageRefs = []string{ref}
 			}
 		}
-	} else if hasImage {
-		text = "[ส่งรูปภาพ]"
+	case hasImage && s.saveImages:
+		// Not addressed (or, for LINE, un-addressable at all), but
+		// save-images is on - download+save silently (no reply either
+		// way, matching how any other unaddressed message is handled).
+		data, err := lineDownloadImage(s.client, s.dataAPIBase, s.token, msg.ID, s.maxImageSize)
+		if err != nil {
+			s.logf("[line_error] ดาวน์โหลดรูปภาพ (unaddressed) ไม่ได้: %v\n", err)
+			text = appendChatBotTag(text, "[ส่งรูปภาพ]")
+			break
+		}
+		ref, err := savePicture(s.contextDir, key, data)
+		if err != nil {
+			s.logf("[line_error] บันทึกรูปภาพไม่ได้: %v\n", err)
+			text = appendChatBotTag(text, "[ส่งรูปภาพ]")
+			break
+		}
+		imageRefs = []string{ref} // recordAndRespond builds the path-bearing tag from this
+	case hasImage:
+		text = appendChatBotTag(text, "[ส่งรูปภาพ]")
 	}
 
 	if addressed {
