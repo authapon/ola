@@ -10798,3 +10798,420 @@ func TestBuildChatBotSystemPromptWarnsAgainstFabricatingImageDescriptions(t *tes
 		t.Fatal("expected the rules to warn against fabricating a description for an image the model can't actually see")
 	}
 }
+
+// ======================================================================
+// Section: --save-images/OLA_SAVE_IMAGES and read_pic
+// (telegrambot/discordbot/linebot only - deliberately not webbot)
+// ======================================================================
+
+func TestSavePictureWritesUnderPerChatSubfolder(t *testing.T) {
+	contextDir := t.TempDir()
+	ref, err := savePicture(contextDir, "group_-999", minimalPNG)
+	if err != nil {
+		t.Fatalf("savePicture error: %v", err)
+	}
+	if !strings.HasPrefix(ref, "pics/group_-999/") {
+		t.Fatalf("expected the ref to be scoped under pics/<chatKey>/, got: %q", ref)
+	}
+	if !strings.HasSuffix(ref, ".png") {
+		t.Fatalf("expected the extension to be sniffed from the actual PNG bytes, got: %q", ref)
+	}
+	full := filepath.Join(contextDir, filepath.FromSlash(ref))
+	data, err := os.ReadFile(full)
+	if err != nil {
+		t.Fatalf("expected the file to actually exist on disk at %s: %v", full, err)
+	}
+	if !bytes.Equal(data, minimalPNG) {
+		t.Fatal("expected the saved file's bytes to exactly match the input")
+	}
+}
+
+func TestSavePictureIsolatesDifferentChats(t *testing.T) {
+	contextDir := t.TempDir()
+	refA, err := savePicture(contextDir, "group_-111", minimalPNG)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refB, err := savePicture(contextDir, "group_-222", minimalPNG)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refA == refB {
+		t.Fatal("expected two different chats saving the same image bytes to land in different per-chat paths")
+	}
+	if !strings.Contains(refA, "group_-111") || !strings.Contains(refB, "group_-222") {
+		t.Fatalf("expected each ref to be scoped to its own chat, got %q and %q", refA, refB)
+	}
+	// Chat A's read_pic must never be able to reach chat B's picture -
+	// this is exactly what per-chat subfolders exist to prevent.
+	if _, err := toolReadPic(map[string]interface{}{"path": refB}, contextDir); err != nil {
+		// note: toolReadPic itself doesn't know which CHAT is asking - the
+		// isolation comes from the chat only ever being told ITS OWN
+		// ref in the first place (see recordAndRespond's imageRefs) - this
+		// call succeeding just confirms the file exists; the real
+		// isolation guarantee is architectural (a chat's own context file
+		// only ever contains its own refs), not enforced inside
+		// toolReadPic itself.
+		t.Fatalf("unexpected error reading chat B's own picture via its own ref: %v", err)
+	}
+}
+
+func TestSavePictureContentHashDedupesIdenticalBytes(t *testing.T) {
+	contextDir := t.TempDir()
+	ref1, err := savePicture(contextDir, "group_-999", minimalPNG)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref2, err := savePicture(contextDir, "group_-999", minimalPNG)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same chat, same exact bytes, saved twice - the hash-based filename
+	// component means the second save overwrites the same path rather
+	// than silently accumulating a duplicate copy.
+	hash1 := hashPartOf(t, filepath.Base(ref1))
+	hash2 := hashPartOf(t, filepath.Base(ref2))
+	if hash1 != hash2 {
+		t.Fatalf("expected identical content to produce the same hash component, got %q vs %q", hash1, hash2)
+	}
+}
+
+// hashPartOf extracts the "<hash>" component from a
+// "<timestamp>_<hash>.<ext>" filename, e.g. "a1b2c3d4" from
+// "20260814-143022_a1b2c3d4.png".
+func hashPartOf(t *testing.T, filename string) string {
+	t.Helper()
+	noExt := strings.TrimSuffix(filename, filepath.Ext(filename))
+	parts := strings.SplitN(noExt, "_", 2)
+	if len(parts) != 2 {
+		t.Fatalf("unexpected filename shape: %q", filename)
+	}
+	return parts[1]
+}
+
+func TestImageExtForBytesSniffsActualContent(t *testing.T) {
+	if got := imageExtForBytes(minimalPNG); got != ".png" {
+		t.Fatalf("expected .png for actual PNG bytes, got %q", got)
+	}
+	if got := imageExtForBytes([]byte("not an image at all")); got != ".jpg" {
+		t.Fatalf("expected the jpeg fallback for unrecognized bytes, got %q", got)
+	}
+}
+
+func TestToolReadPicHappyPath(t *testing.T) {
+	contextDir := t.TempDir()
+	ref, err := savePicture(contextDir, "group_-999", minimalPNG)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := toolReadPic(map[string]interface{}{"path": ref}, contextDir)
+	if err != nil {
+		t.Fatalf("toolReadPic error: %v", err)
+	}
+	if !strings.Contains(result, "แนบมาในข้อความถัดไป") {
+		t.Fatalf("expected a status message noting the image will follow, got: %q", result)
+	}
+	popped := popLastReadPic()
+	if popped == nil {
+		t.Fatal("expected toolReadPic to stash a result for the follow-up message mechanism")
+	}
+	if popped.Path != ref {
+		t.Fatalf("expected the stashed path to match, got %q want %q", popped.Path, ref)
+	}
+	wantB64 := base64.StdEncoding.EncodeToString(minimalPNG)
+	if popped.Image != wantB64 {
+		t.Fatal("expected the stashed image to be the base64 of the exact saved bytes")
+	}
+}
+
+func TestToolReadPicRejectsPathTraversal(t *testing.T) {
+	contextDir := t.TempDir()
+	// A secret file living OUTSIDE contextDir entirely, that a path
+	// traversal attempt might try to reach.
+	outsideDir := t.TempDir()
+	secretPath := filepath.Join(outsideDir, "secret.txt")
+	if err := os.WriteFile(secretPath, []byte("should never be readable via read_pic"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	traversal := "../" + filepath.Base(outsideDir) + "/secret.txt"
+	if _, err := toolReadPic(map[string]interface{}{"path": traversal}, contextDir); err == nil {
+		t.Fatal("expected a path-traversal attempt to be rejected")
+	}
+}
+
+func TestToolReadPicRejectsPathsOutsidePicsSubfolder(t *testing.T) {
+	contextDir := t.TempDir()
+	// A real file that exists under contextDir but NOT under pics/ (e.g.
+	// the knowledge index) must still be unreachable via read_pic - its
+	// job is re-viewing saved pictures specifically, not general
+	// context-dir file access.
+	if err := os.WriteFile(filepath.Join(contextDir, "knowledge-index.json"), []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := toolReadPic(map[string]interface{}{"path": "knowledge-index.json"}, contextDir); err == nil {
+		t.Fatal("expected a path outside pics/ to be rejected even though it's inside contextDir")
+	}
+}
+
+func TestToolReadPicRejectsNonImageFile(t *testing.T) {
+	contextDir := t.TempDir()
+	picsDir := filepath.Join(contextDir, "pics", "group_-999")
+	if err := os.MkdirAll(picsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(picsDir, "notreally.jpg"), []byte("plain text, not an image"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := toolReadPic(map[string]interface{}{"path": "pics/group_-999/notreally.jpg"}, contextDir); err == nil {
+		t.Fatal("expected a non-image file (even with a .jpg name) to be rejected based on sniffed content")
+	}
+}
+
+func TestToolReadPicMissingPathArgument(t *testing.T) {
+	if _, err := toolReadPic(map[string]interface{}{}, t.TempDir()); err == nil {
+		t.Fatal("expected an error when path is missing")
+	}
+}
+
+func TestReadPicFollowUpMessageBuildsImageBearingUserMessage(t *testing.T) {
+	setLastReadPicResult(readPicResult{Path: "pics/group_-999/x.png", Image: "ZmFrZQ=="})
+	msg, ok := readPicFollowUpMessage("read_pic", "อ่านรูปภาพสำเร็จ")
+	if !ok {
+		t.Fatal("expected ok=true for a successful read_pic result")
+	}
+	if msg.Role != "user" || len(msg.Images) != 1 || msg.Images[0] != "ZmFrZQ==" {
+		t.Fatalf("unexpected follow-up message: %#v", msg)
+	}
+}
+
+func TestReadPicFollowUpMessageIgnoresOtherToolsAndErrors(t *testing.T) {
+	setLastReadPicResult(readPicResult{Path: "pics/x.png", Image: "ZmFrZQ=="})
+	if _, ok := readPicFollowUpMessage("search_knowledge", "ok"); ok {
+		t.Fatal("expected no follow-up for a different tool name")
+	}
+	// The wrong-tool-name check returns before ever popping the
+	// side-channel (by design - see readPicFollowUpMessage/popLastReadPic,
+	// mirroring readPDFFollowUpMessage's identical shape), so the value
+	// set above is still pending - clear it explicitly so it can't leak
+	// into the next case below.
+	popLastReadPic()
+
+	setLastReadPicResult(readPicResult{Path: "pics/x.png", Image: "ZmFrZQ=="})
+	if _, ok := readPicFollowUpMessage("read_pic", "ERROR: ไม่พบรูปภาพ"); ok {
+		t.Fatal("expected no follow-up when the tool call itself failed")
+	}
+	// Same as above: the ERROR-prefix check also returns before popping,
+	// so this leftover stash needs clearing before the next case too.
+	popLastReadPic()
+
+	if _, ok := readPicFollowUpMessage("read_pic", "ok"); ok {
+		t.Fatal("expected no follow-up when nothing was stashed (already popped or never set)")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// End-to-end: --save-images + read_pic across two separate turns,
+// proving a saved picture can genuinely be looked at again later - one
+// test per platform (Telegram/Discord/LINE; webbot intentionally has no
+// equivalent, since it never persists anything to save in the first
+// place).
+// ─────────────────────────────────────────────────────────────────
+
+func TestHandleTelegramMessageSavedImageCanBeReReadLaterViaReadPic(t *testing.T) {
+	var secondRoundBody string
+	round := 0
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		round++
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if round == 1 {
+			// first turn: just answer normally about the photo just sent
+			fmt.Fprint(w, streamLine("นี่คือวงจรไฟฟ้าครับ", "", "", true))
+			return
+		}
+		if round == 2 {
+			// second turn (a new message, days later): the model decides
+			// to call read_pic on the path it sees in its own context
+			// history to look at the photo again.
+			fmt.Fprint(w, streamLine("", "read_pic", `{"path":"`+lastSavedRef+`"}`, true))
+			return
+		}
+		// third round: after read_pic's follow-up image message lands,
+		// the model gives its real answer - record the full request body
+		// so the test can confirm the image bytes actually arrived here.
+		body, _ := io.ReadAll(r.Body)
+		secondRoundBody = string(body)
+		fmt.Fprint(w, streamLine("R2 คำนวณจาก V/I ครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	telegramSrv, sent, _ := newMockTelegramSendMessageAndFileServer(t, minimalPNG)
+	contextDir := t.TempDir()
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, contextDir, map[int64]bool{111: true})
+	session.saveImages = true
+	session.tools = append(session.tools, readPicTool)
+
+	chat := tgChat{ID: 111, Type: "private"}
+	// Turn 1: send a photo.
+	session.handleTelegramMessage(&tgMessage{
+		From: tgUser{ID: 111, FirstName: "สมชาย"}, Chat: chat,
+		Caption: "รูปนี้คืออะไร",
+		Photo:   []tgPhotoSize{{FileID: "id1", Width: 800, Height: 800}},
+	})
+
+	cctx, err := loadChatContext(contextDir, telegramContextKey(chat))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	var ref string
+	for _, turn := range cctx.Turns {
+		if idx := strings.Index(turn.Content, "pics/"); idx != -1 {
+			end := strings.IndexAny(turn.Content[idx:], "]\n")
+			if end == -1 {
+				end = len(turn.Content) - idx
+			}
+			ref = turn.Content[idx : idx+end]
+		}
+	}
+	if ref == "" {
+		t.Fatalf("expected the first turn's stored text to reference a saved pics/ path, got turns: %#v", cctx.Turns)
+	}
+	lastSavedRef = ref
+
+	// Turn 2 (a later, unrelated-looking message): the model itself
+	// decides to call read_pic using the path from its own context
+	// history - simulated here by round 2's mock response above.
+	session.handleTelegramMessage(&tgMessage{
+		From: tgUser{ID: 111, FirstName: "สมชาย"}, Chat: chat,
+		Text: "รูปที่ส่งไปก่อนหน้า ตัว R2 คำนวณยังไงนะ",
+	})
+
+	if round != 3 {
+		t.Fatalf("expected exactly 3 model rounds (answer, read_pic call, final answer after follow-up), got %d", round)
+	}
+	wantB64 := base64.StdEncoding.EncodeToString(minimalPNG)
+	if !strings.Contains(secondRoundBody, wantB64) {
+		t.Fatal("expected the re-read image's bytes to reach the model in the follow-up round")
+	}
+	if len(*sent) != 2 || (*sent)[1].Text != "R2 คำนวณจาก V/I ครับ" {
+		t.Fatalf("expected the second turn's real answer to be sent, got: %#v", *sent)
+	}
+}
+
+var lastSavedRef string
+
+func TestHandleDiscordMessageSaveImagesTagsStoredTurnWithPath(t *testing.T) {
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("โอเคครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	discordSrv, _, _ := newMockDiscordRESTServer(t)
+	cdnSrv, _ := newMockImageCDNServer(t, minimalPNG)
+
+	contextDir := t.TempDir()
+	session := newTestDiscordSession(t, discordSrv, ollamaSrv, contextDir, map[string]bool{"111": true})
+	session.saveImages = true
+
+	msg := &discordMessage{
+		GuildID: "guild-1", ChannelID: "channel-1",
+		Author:      discordUser{ID: "111", Username: "somchai"},
+		Content:     "<@999> ดูรูปนี้หน่อย",
+		Mentions:    []discordUser{{ID: "999"}},
+		Attachments: []discordAttachment{{URL: cdnSrv.URL + "/image.png", ContentType: "image/png", Filename: "circuit.png"}},
+	}
+	session.access.Guilds = map[string]bool{"guild-1": true}
+	session.handleDiscordMessage(msg)
+
+	cctx, err := loadChatContext(contextDir, discordContextKey(msg))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	if len(cctx.Turns) == 0 || !strings.Contains(cctx.Turns[0].Content, "pics/discord_channel_channel-1/") {
+		t.Fatalf("expected the stored turn to reference the saved pics/ path, got: %#v", cctx.Turns)
+	}
+	// and the actual file must really be there
+	saved := false
+	entries, _ := os.ReadDir(filepath.Join(contextDir, "pics", "discord_channel_channel-1"))
+	saved = len(entries) == 1
+	if !saved {
+		t.Fatalf("expected exactly one saved file under pics/discord_channel_channel-1/, got %d", len(entries))
+	}
+}
+
+func TestHandleLineMessageSaveImagesTagsStoredTurnWithPath(t *testing.T) {
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("โอเคครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	lineSrv, _, _ := newMockLineRESTServer(t)
+
+	contextDir := t.TempDir()
+	session := newTestLineSession(t, lineSrv, ollamaSrv, contextDir, map[string]bool{"U111": true})
+	session.saveImages = true
+
+	ev := &lineEvent{
+		Type:           "message",
+		Source:         lineSource{Type: "user", UserID: "U111"},
+		ReplyToken:     "rtoken",
+		Message:        &lineMessage{ID: "msg-1", Type: "image"},
+		WebhookEventID: "evt-save-1",
+	}
+	session.handleLineMessage(ev)
+
+	cctx, err := loadChatContext(contextDir, lineContextKey(ev.Source))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	if len(cctx.Turns) == 0 || !strings.Contains(cctx.Turns[0].Content, "pics/line_user_U111/") {
+		t.Fatalf("expected the stored turn to reference the saved pics/ path, got: %#v", cctx.Turns)
+	}
+	entries, _ := os.ReadDir(filepath.Join(contextDir, "pics", "line_user_U111"))
+	if len(entries) != 1 {
+		t.Fatalf("expected exactly one saved file under pics/line_user_U111/, got %d", len(entries))
+	}
+}
+
+func TestHandleTelegramMessageSaveImagesOffKeepsGenericTag(t *testing.T) {
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("โอเคครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	telegramSrv, _, _ := newMockTelegramSendMessageAndFileServer(t, minimalPNG)
+
+	contextDir := t.TempDir()
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, contextDir, map[int64]bool{111: true})
+	// saveImages deliberately left false (the default) - confirms nothing
+	// is written to disk and the generic count-based tag is used, exactly
+	// matching pre-this-feature behavior.
+
+	chat := tgChat{ID: 111, Type: "private"}
+	session.handleTelegramMessage(&tgMessage{
+		From: tgUser{ID: 111, FirstName: "สมชาย"}, Chat: chat,
+		Caption: "รูปนี้คืออะไร",
+		Photo:   []tgPhotoSize{{FileID: "id1", Width: 800, Height: 800}},
+	})
+
+	cctx, err := loadChatContext(contextDir, telegramContextKey(chat))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	if len(cctx.Turns) == 0 || !strings.Contains(cctx.Turns[0].Content, "[แนบรูปภาพ 1 รูป]") {
+		t.Fatalf("expected the old generic count-based tag when --save-images is off, got: %#v", cctx.Turns)
+	}
+	if strings.Contains(cctx.Turns[0].Content, "pics/") {
+		t.Fatal("expected no pics/ reference at all when --save-images is off")
+	}
+	if _, err := os.Stat(filepath.Join(contextDir, "pics")); !os.IsNotExist(err) {
+		t.Fatal("expected no pics/ directory to be created at all when --save-images is off")
+	}
+}

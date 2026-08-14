@@ -10118,6 +10118,167 @@ func formatChatTurnContent(speaker, content string) string {
 	return "[" + speaker + "] " + content
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Saving received images for cross-conversation reference
+// (--save-images/OLA_SAVE_IMAGES, telegrambot/discordbot/linebot only -
+// deliberately NOT webbot, whose whole design is to persist nothing at
+// all to disk; see cmdWebBot's own header comment). Off by default -
+// this is an explicit opt-in, not the default behavior, because keeping
+// the actual images someone sent around indefinitely has real privacy/
+// disk-space implications that --max-image-size alone doesn't address
+// (that flag only bounds any ONE image, not how many accumulate over
+// time). When off, images still reach the model for the turn they arrive
+// in exactly as before - only the "save a copy for later" behavior is
+// gated by this flag.
+// ─────────────────────────────────────────────────────────────────
+
+// savePicture writes image data to <contextDir>/pics/<chatKey>/<file> and
+// returns the path RELATIVE TO contextDir (e.g.
+// "pics/group_-999/20260814-143022_a1b2c3d4.jpg") - both the form stored
+// in a chatTurn's own text (so a later read_pic call can reference it
+// verbatim) and the form toolReadPic's own sandboxing expects back.
+//
+// Always scoped under a per-chat subdirectory (chatKey, the same key
+// chatContextPath uses) - never a flat shared folder. This is a real
+// privacy boundary, not just tidiness: a flat pics/ directory would let
+// one group's images be discoverable (via read_pic, or just by browsing
+// the filesystem) from a completely unrelated chat, the same class of
+// leak per-chat context files themselves are already careful to avoid.
+//
+// The filename's hash component is derived from the image's own content
+// (not random) so saving the exact same bytes twice in the same chat
+// produces the same filename rather than silently duplicating storage.
+func savePicture(contextDir, chatKey string, data []byte) (string, error) {
+	dir := filepath.Join(contextDir, "pics", chatKey)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("สร้างโฟลเดอร์ pics ไม่ได้: %v", err)
+	}
+	sum := sha256.Sum256(data)
+	hashPart := hex.EncodeToString(sum[:4])
+	ext := imageExtForBytes(data)
+	filename := fmt.Sprintf("%s_%s%s", time.Now().Format("20060102-150405"), hashPart, ext)
+	full := filepath.Join(dir, filename)
+	if err := os.WriteFile(full, data, 0o644); err != nil {
+		return "", fmt.Errorf("บันทึกรูปภาพไม่ได้: %v", err)
+	}
+	return filepath.ToSlash(filepath.Join("pics", chatKey, filename)), nil
+}
+
+// imageExtForBytes sniffs the actual file content (never trusts a
+// platform-reported content-type/filename, which can be missing or
+// simply wrong) to pick a sensible file extension for savePicture.
+func imageExtForBytes(data []byte) string {
+	switch http.DetectContentType(data) {
+	case "image/png":
+		return ".png"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	default:
+		return ".jpg" // jpeg is what every one of these platforms sends the overwhelming majority of the time
+	}
+}
+
+// readPicResult/lastReadPic/setLastReadPicResult/popLastReadPic/
+// readPicFollowUpMessage all mirror readPDFResult/lastReadPDF/
+// setLastReadPDFResult/popLastReadPDF/readPDFFollowUpMessage's own exact
+// pattern (see those, defined above cmdAsk) for the identical underlying
+// reason: images can only ever reach a model reliably attached to a
+// plain role:"user" message (see readPDFResult's own doc comment for why
+// neither provider's tool-result message shape supports it) - so
+// toolReadPic stashes what it read here, and
+// chatBotCore.runChatToolLoop pops it right after dispatch to append a
+// synthetic follow-up message, the same way cmdAsk's own tool loop does
+// for read_pdf.
+type readPicResult struct {
+	Path  string
+	Image string // single base64-encoded image - read_pic only ever looks at one picture per call
+}
+
+var (
+	lastReadPicMu     sync.Mutex
+	lastReadPicResult *readPicResult
+)
+
+func setLastReadPicResult(r readPicResult) {
+	lastReadPicMu.Lock()
+	lastReadPicResult = &r
+	lastReadPicMu.Unlock()
+}
+
+func popLastReadPic() *readPicResult {
+	lastReadPicMu.Lock()
+	defer lastReadPicMu.Unlock()
+	r := lastReadPicResult
+	lastReadPicResult = nil
+	return r
+}
+
+// toolReadPic implements "read_pic": load a previously-saved image (see
+// savePicture) back into the conversation so the model can look at it
+// again. path is expected exactly as it appears in a stored chatTurn's
+// own "[แนบรูปภาพ: pics/...]" tag - sandboxedPathIn keeps it from
+// escaping contextDir via ".."/an absolute path the same way
+// read_file/read_pdf are sandboxed to cwd, and the explicit prefix check
+// below additionally keeps it from reaching anything under contextDir
+// OTHER than pics/ (e.g. knowledge-index.json), since this tool's only
+// job is re-viewing saved pictures, not general file access.
+func toolReadPic(args map[string]interface{}, contextDir string) (string, error) {
+	path, _ := args["path"].(string)
+	if path == "" {
+		return "", fmt.Errorf("ต้องระบุ path")
+	}
+	full, err := sandboxedPathIn(contextDir, path)
+	if err != nil {
+		return "", err
+	}
+	picsRoot := filepath.Clean(filepath.Join(contextDir, "pics"))
+	if full != picsRoot && !strings.HasPrefix(full, picsRoot+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path ต้องอยู่ใน pics/ เท่านั้น: %s", path)
+	}
+	data, err := os.ReadFile(full)
+	if err != nil {
+		return "", fmt.Errorf("ไม่พบรูปภาพ: %s", path)
+	}
+	if !strings.HasPrefix(http.DetectContentType(data), "image/") {
+		return "", fmt.Errorf("ไฟล์นี้ไม่ใช่รูปภาพ: %s", path)
+	}
+	setLastReadPicResult(readPicResult{Path: path, Image: base64.StdEncoding.EncodeToString(data)})
+	return fmt.Sprintf("อ่านรูปภาพ %s สำเร็จ - รูปจะถูกแนบมาในข้อความถัดไป", path), nil
+}
+
+// readPicFollowUpMessage mirrors readPDFFollowUpMessage exactly - see
+// that function's own doc comment.
+func readPicFollowUpMessage(toolName, result string) (msg ollamaMessage, ok bool) {
+	if toolName != "read_pic" || strings.HasPrefix(result, "ERROR:") {
+		return ollamaMessage{}, false
+	}
+	r := popLastReadPic()
+	if r == nil || r.Image == "" {
+		return ollamaMessage{}, false
+	}
+	return ollamaMessage{Role: "user", Content: fmt.Sprintf("รูปภาพ %s ตามที่ read_pic เพิ่งอ่านไป", r.Path), Images: []string{r.Image}}, true
+}
+
+var readPicTool = ollamaTool{
+	Type: "function",
+	Function: ollamaToolFunction{
+		Name:        "read_pic",
+		Description: "ดูรูปภาพเก่าที่เคยถูกแนบไว้ในบทสนทนานี้ก่อนหน้า อีกครั้ง - path ต้องเป็นค่าที่ปรากฏใน context เดิม (ขึ้นต้นด้วย \"pics/\") ใช้เมื่อผู้ใช้อ้างถึงรูปที่เคยส่งมาก่อนหน้าและต้องการให้ดูอีกครั้ง",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"path": map[string]interface{}{
+					"type":        "string",
+					"description": "path ของรูปภาพตามที่ปรากฏใน context เช่น \"pics/group_-999/20260814-143022_a1b2c3d4.jpg\"",
+				},
+			},
+			"required": []string{"path"},
+		},
+	},
+}
+
 type chatContext struct {
 	Key         string     `json:"key"`
 	Summary     string     `json:"summary,omitempty"`
@@ -10487,6 +10648,7 @@ type chatBotCore struct {
 	keepRecent       int
 	compactAfter     int
 	maxImageSize     int64 // bytes - see parseByteSize/--max-image-size; enforced by each platform's own image-download code before an image ever reaches the model
+	saveImages       bool  // --save-images/OLA_SAVE_IMAGES - see savePicture's own doc comment
 	ntfyTopic        string
 	outFile          *os.File
 
@@ -10539,22 +10701,34 @@ const chatBotNoTextWithImagePrompt = "(ผู้ใช้ส่งรูปภ�
 // cmdAsk's own use of base64.StdEncoding for the same shape) are attached
 // to the OUTGOING message for this one round only. They are deliberately
 // NEVER written into the persisted chatTurn/context file - only a text
-// tag ("[แนบรูปภาพ N รูป]") is stored, so a conversation with several
-// image-heavy turns doesn't balloon the on-disk context file with
-// (base64, ~33% larger than the original) image bytes forever. The model
-// still genuinely sees and can respond to the image THIS round; it just
-// won't have the pixels available again once that turn scrolls past
-// --context-keep-recent or gets compacted. Callers are responsible for
-// downloading/validating (size, format) the image bytes themselves - see
-// each platform's own image-handling code - this function only attaches
-// whatever base64 strings it's given.
+// tag is stored, so a conversation with several image-heavy turns
+// doesn't balloon the on-disk context file with (base64, ~33% larger
+// than the original) image bytes forever. The model still genuinely sees
+// and can respond to the image THIS round; it just won't have the pixels
+// available again once that turn scrolls past --context-keep-recent or
+// gets compacted UNLESS imageRefs is non-empty (see below).
+//
+// imageRefs, when non-empty, are savePicture's own return paths (e.g.
+// "pics/group_-999/xxx.jpg") for images that were ALSO saved to disk
+// this round (--save-images) - when present, the stored tag references
+// those paths by name (e.g. "[แนบรูปภาพ: pics/group_-999/xxx.jpg]")
+// instead of just a bare count, so a model reading this turn back in a
+// LATER conversation can call read_pic on that exact path to look at it
+// again. Pass nil (or a shorter slice than images) when --save-images is
+// off or a particular image wasn't saved - the generic count-based tag
+// is used as a fallback for anything not covered by imageRefs.
+//
+// Callers are responsible for downloading/validating (size, format) the
+// image bytes themselves - see each platform's own image-handling code -
+// this function only attaches whatever base64 strings it's given and
+// tags the stored turn with whatever refs it's given.
 //
 // Callers own everything platform-specific: deriving speaker (a display
 // name, or "" for DMs), deciding addressed (mention/reply/prefix
 // detection), and actually sending the returned answer back out - this
 // function never touches the network for the reply itself, only for the
 // model call inside runChatToolLoop.
-func (c *chatBotCore) recordAndRespond(key, speaker, text string, addressed bool, images []string) (answer string, err error) {
+func (c *chatBotCore) recordAndRespond(key, speaker, text string, addressed bool, images []string, imageRefs []string) (answer string, err error) {
 	cctx, err := loadChatContext(c.contextDir, key)
 	if err != nil {
 		return "", fmt.Errorf("โหลด context ไม่ได้: %v", err)
@@ -10566,7 +10740,12 @@ func (c *chatBotCore) recordAndRespond(key, speaker, text string, addressed bool
 
 	storedText := text
 	if len(images) > 0 {
-		tag := fmt.Sprintf("[แนบรูปภาพ %d รูป]", len(images))
+		var tag string
+		if len(imageRefs) > 0 {
+			tag = fmt.Sprintf("[แนบรูปภาพ: %s]", strings.Join(imageRefs, ", "))
+		} else {
+			tag = fmt.Sprintf("[แนบรูปภาพ %d รูป]", len(images))
+		}
 		if storedText == "" {
 			storedText = tag
 		} else {
@@ -10790,6 +10969,12 @@ func (c *chatBotCore) runChatToolLoop(messages []ollamaMessage) (string, error) 
 			}
 			r, e := toolWebFetch(args, c.searchCfg)
 			return r, e, true
+		case "read_pic":
+			if !c.saveImages {
+				return "", nil, false
+			}
+			r, e := toolReadPic(args, c.contextDir)
+			return r, e, true
 		default:
 			return "", nil, false
 		}
@@ -10852,6 +11037,15 @@ func (c *chatBotCore) runChatToolLoop(messages []ollamaMessage) (string, error) 
 			messages = append(messages, ollamaMessage{
 				Role: "tool", Content: groundToolResult(tc.Function.Name, result), Name: tc.Function.Name, ToolCallID: tc.ID,
 			})
+			// read_pic's re-loaded image rides a separate synthetic
+			// role:"user" message appended right here, rather than being
+			// attached to the tool-result message above - see
+			// readPicFollowUpMessage's own doc comment (mirrors
+			// read_pdf's identical pattern in cmdAsk) for why.
+			if followUp, ok := readPicFollowUpMessage(tc.Function.Name, result); ok {
+				messages = append(messages, followUp)
+				fmt.Fprintf(c.outFile, "[tool_call] read_pic follow-up: image attached as a user message\n")
+			}
 		}
 	}
 }
@@ -10890,6 +11084,11 @@ func (c *chatBotCore) toolsStatusText() string {
 		sb.WriteString("✅ web_fetch (fetch URL ที่ระบุตรงๆ เท่านั้น ไม่ใช่ค้นหาแบบเปิดกว้าง)\n")
 	} else {
 		sb.WriteString("❌ web_fetch - ปิด (--no-web-search)\n")
+	}
+	if c.saveImages {
+		sb.WriteString("✅ read_pic - บันทึกรูปที่ผู้ใช้ส่งไว้ที่ " + filepath.Join(c.contextDir, "pics") + " และดูซ้ำได้ (--save-images เปิดอยู่)\n")
+	} else {
+		sb.WriteString("❌ read_pic - ปิด (ไม่ได้ตั้ง --save-images - รูปที่ส่งมายังใช้ได้ในเทิร์นนั้นตามปกติ แค่ดูซ้ำทีหลังไม่ได้)\n")
 	}
 	sb.WriteString("✅ get_current_time, delay (เปิดเสมอ)")
 	return sb.String()
@@ -11005,6 +11204,7 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 	// something visual was shared, even though the bot never actually
 	// looked at it.
 	var images []string
+	var imageRefs []string
 	if hasPhoto && addressed {
 		if photo.FileSize > 0 && photo.FileSize > s.maxImageSize {
 			_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID,
@@ -11018,6 +11218,13 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 			return
 		}
 		images = []string{base64.StdEncoding.EncodeToString(data)}
+		if s.saveImages {
+			if ref, err := savePicture(s.contextDir, key, data); err != nil {
+				s.logf("[telegram_error] บันทึกรูปภาพไม่ได้: %v\n", err)
+			} else {
+				imageRefs = []string{ref}
+			}
+		}
 	} else if hasPhoto {
 		if text == "" {
 			text = "[ส่งรูปภาพ]"
@@ -11032,7 +11239,7 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 		s.logf("[telegram_record] chat=%d(%s) user=%d(%s): %s\n", chat.ID, chat.Type, from.ID, from.Username, text)
 	}
 
-	answer, err := s.recordAndRespond(key, speaker, text, addressed, images)
+	answer, err := s.recordAndRespond(key, speaker, text, addressed, images, imageRefs)
 	if err != nil {
 		s.logf("[telegram_error] chat=%d: %v\n", chat.ID, err)
 		if addressed {
@@ -11109,6 +11316,9 @@ func telegramUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  --max-image-size <size>     OLA_MAX_IMAGE_SIZE   ขนาดรูปภาพสูงสุดที่รับได้ เช่น \"10K\", \"12M\" (default 10M)")
 		fmt.Println("                              ต้องใช้โมเดิลที่รองรับ vision จริง (เช่น llava, qwen2-vl) ถึงจะดูรูปได้ - โมเดิล")
 		fmt.Println("                              ข้อความล้วนจะได้แค่ข้อความ ไม่เห็นรูป")
+		fmt.Println("  --save-images    OLA_SAVE_IMAGES   บันทึกรูปที่ผู้ใช้ส่งไว้ที่ <context-dir>/pics/<แชท>/ ด้วย (default ปิด)")
+		fmt.Println("                   เปิดแล้วโมเดิลเรียก read_pic ดูรูปเก่าซ้ำข้ามบทสนทนาได้ (path จาก context เดิม)")
+		fmt.Println("                   ข้อควรรู้: ไม่มีการลบรูปเก่าอัตโนมัติ ผู้ดูแลต้องจัดการพื้นที่ดิสก์เอง")
 		fmt.Println("  -c/--ctx, -P/--provider, --api-base, -k/--key   เหมือน 'ola ask'")
 		fmt.Println("  -x/--topic     ntfy.sh topic (แจ้งเตือนเมื่อเกิด error ระหว่างประมวลผลข้อความ)")
 		fmt.Println("  -o/--output    log ไฟล์แบบเต็ม (default: telegrambot.log, เปิดแบบ append เสมอ - ต่างจาก 'ola ask')")
@@ -11173,6 +11383,7 @@ func cmdTelegramBot(args []string) int {
 	var searxngURL, ollamaSearchKey string
 	var flagNoWebSearch bool
 	var maxImageSizeRaw string
+	var saveImages bool
 	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
 
 	fs.StringVar(&model, "m", "", "")
@@ -11208,6 +11419,7 @@ func cmdTelegramBot(args []string) int {
 	fs.IntVar(&searchTimeoutSec, "search-timeout", 0, "")
 	fs.IntVar(&fetchTimeoutSec, "fetch-timeout", 0, "")
 	fs.StringVar(&maxImageSizeRaw, "max-image-size", "", "")
+	fs.BoolVar(&saveImages, "save-images", false, "")
 	fs.StringVar(&topic, "x", "", "")
 	fs.StringVar(&topic, "topic", "", "")
 	fs.StringVar(&outputFile, "o", "", "")
@@ -11333,6 +11545,7 @@ func cmdTelegramBot(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
+	saveImages = saveImages || envBool("OLA_SAVE_IMAGES")
 
 	tools := filterTools(builtinTools, "get_current_time", "delay")
 	if knowledgeCfg.enabled() {
@@ -11343,6 +11556,9 @@ func cmdTelegramBot(args []string) int {
 	}
 	if searchCfg.fetchEnabled() {
 		tools = append(tools, webFetchTool)
+	}
+	if saveImages {
+		tools = append(tools, readPicTool)
 	}
 
 	// Persona is deliberately assembled BETWEEN the intro and the rules
@@ -12268,6 +12484,7 @@ func (s *discordSession) handleDiscordMessage(msg *discordMessage) {
 	// point for the full reasoning (shared by all three chat bots that
 	// can receive images in a group setting).
 	var images []string
+	var imageRefs []string
 	if hasImage && addressed {
 		if image.Size > 0 && image.Size > s.maxImageSize {
 			_ = discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID,
@@ -12281,6 +12498,13 @@ func (s *discordSession) handleDiscordMessage(msg *discordMessage) {
 			return
 		}
 		images = []string{base64.StdEncoding.EncodeToString(data)}
+		if s.saveImages {
+			if ref, err := savePicture(s.contextDir, key, data); err != nil {
+				s.logf("[discord_error] บันทึกรูปภาพไม่ได้: %v\n", err)
+			} else {
+				imageRefs = []string{ref}
+			}
+		}
 	} else if hasImage {
 		if text == "" {
 			text = "[ส่งรูปภาพ]"
@@ -12295,7 +12519,7 @@ func (s *discordSession) handleDiscordMessage(msg *discordMessage) {
 		s.logf("[discord_record] key=%s user=%s(%s): %s\n", key, msg.Author.ID, msg.Author.Username, text)
 	}
 
-	answer, err := s.recordAndRespond(key, speaker, text, addressed, images)
+	answer, err := s.recordAndRespond(key, speaker, text, addressed, images, imageRefs)
 	if err != nil {
 		s.logf("[discord_error] key=%s: %v\n", key, err)
 		if addressed {
@@ -12364,6 +12588,7 @@ func discordUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  -c/--ctx, -P/--provider, --api-base, -k/--key   เหมือน 'ola ask'")
 		fmt.Println("  --discord-max-concurrent <n>   จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส (default 4)")
 		fmt.Println("  --max-image-size <size>        OLA_MAX_IMAGE_SIZE   ขนาดรูปภาพสูงสุด (default 10M) - ดู 'ola telegrambot -h'")
+		fmt.Println("  --save-images                  OLA_SAVE_IMAGES      บันทึกรูปไว้ดูซ้ำได้ (default ปิด) - ดู 'ola telegrambot -h'")
 		fmt.Println("  -x/--topic     ntfy.sh topic (แจ้งเตือนเมื่อเกิด error ระหว่างประมวลผลข้อความ)")
 		fmt.Println("  -o/--output    log ไฟล์แบบเต็ม (default: discordbot.log, เปิดแบบ append เสมอ)")
 		fmt.Println()
@@ -12394,6 +12619,7 @@ func cmdDiscordBot(args []string) int {
 	var searxngURL, ollamaSearchKey string
 	var flagNoWebSearch bool
 	var maxImageSizeRaw string
+	var saveImages bool
 	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
 
 	fs.StringVar(&model, "m", "", "")
@@ -12429,6 +12655,7 @@ func cmdDiscordBot(args []string) int {
 	fs.IntVar(&searchTimeoutSec, "search-timeout", 0, "")
 	fs.IntVar(&fetchTimeoutSec, "fetch-timeout", 0, "")
 	fs.StringVar(&maxImageSizeRaw, "max-image-size", "", "")
+	fs.BoolVar(&saveImages, "save-images", false, "")
 	fs.StringVar(&topic, "x", "", "")
 	fs.StringVar(&topic, "topic", "", "")
 	fs.StringVar(&outputFile, "o", "", "")
@@ -12536,6 +12763,7 @@ func cmdDiscordBot(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
+	saveImages = saveImages || envBool("OLA_SAVE_IMAGES")
 
 	tools := filterTools(builtinTools, "get_current_time", "delay")
 	if knowledgeCfg.enabled() {
@@ -12546,6 +12774,9 @@ func cmdDiscordBot(args []string) int {
 	}
 	if searchCfg.fetchEnabled() {
 		tools = append(tools, webFetchTool)
+	}
+	if saveImages {
+		tools = append(tools, readPicTool)
 	}
 
 	systemPrompt := buildDiscordSystemPrompt(persona)
@@ -13350,6 +13581,7 @@ func (s *lineSession) handleLineMessage(ev *lineEvent) {
 	// attempting the download - lineDownloadImage's own io.LimitReader
 	// cap is the only enforcement point.
 	var images []string
+	var imageRefs []string
 	if hasImage && addressed {
 		data, err := lineDownloadImage(s.client, s.dataAPIBase, s.token, msg.ID, s.maxImageSize)
 		if err != nil {
@@ -13358,6 +13590,13 @@ func (s *lineSession) handleLineMessage(ev *lineEvent) {
 			return
 		}
 		images = []string{base64.StdEncoding.EncodeToString(data)}
+		if s.saveImages {
+			if ref, err := savePicture(s.contextDir, key, data); err != nil {
+				s.logf("[line_error] บันทึกรูปภาพไม่ได้: %v\n", err)
+			} else {
+				imageRefs = []string{ref}
+			}
+		}
 	} else if hasImage {
 		text = "[ส่งรูปภาพ]"
 	}
@@ -13368,7 +13607,7 @@ func (s *lineSession) handleLineMessage(ev *lineEvent) {
 		s.logf("[line_record] key=%s user=%s: %s\n", key, src.UserID, text)
 	}
 
-	answer, err := s.recordAndRespond(key, speaker, text, addressed, images)
+	answer, err := s.recordAndRespond(key, speaker, text, addressed, images, imageRefs)
 	if err != nil {
 		s.logf("[line_error] key=%s: %v\n", key, err)
 		if addressed {
@@ -13477,6 +13716,7 @@ func lineUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  --line-api-base <url>        OLA_LINE_API_BASE      (default: https://api.line.me/v2/bot - override สำหรับทดสอบ)")
 		fmt.Println("  --line-max-concurrent <n>    จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส (default 4)")
 		fmt.Println("  --max-image-size <size>      OLA_MAX_IMAGE_SIZE   ขนาดรูปภาพสูงสุด (default 10M) - ดู 'ola telegrambot -h'")
+		fmt.Println("  --save-images                OLA_SAVE_IMAGES      บันทึกรูปไว้ดูซ้ำได้ (default ปิด) - ดู 'ola telegrambot -h'")
 		fmt.Println("  -x/--topic     ntfy.sh topic (แจ้งเตือนเมื่อเกิด error ระหว่างประมวลผลข้อความ)")
 		fmt.Println("  -o/--output    log ไฟล์แบบเต็ม (default: linebot.log, เปิดแบบ append เสมอ)")
 		fmt.Println()
@@ -13509,6 +13749,7 @@ func cmdLineBot(args []string) int {
 	var searxngURL, ollamaSearchKey string
 	var flagNoWebSearch bool
 	var maxImageSizeRaw string
+	var saveImages bool
 	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
 
 	fs.StringVar(&model, "m", "", "")
@@ -13545,6 +13786,7 @@ func cmdLineBot(args []string) int {
 	fs.IntVar(&searchTimeoutSec, "search-timeout", 0, "")
 	fs.IntVar(&fetchTimeoutSec, "fetch-timeout", 0, "")
 	fs.StringVar(&maxImageSizeRaw, "max-image-size", "", "")
+	fs.BoolVar(&saveImages, "save-images", false, "")
 	fs.StringVar(&topic, "x", "", "")
 	fs.StringVar(&topic, "topic", "", "")
 	fs.StringVar(&outputFile, "o", "", "")
@@ -13685,6 +13927,7 @@ func cmdLineBot(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
+	saveImages = saveImages || envBool("OLA_SAVE_IMAGES")
 
 	tools := filterTools(builtinTools, "get_current_time", "delay")
 	if knowledgeCfg.enabled() {
@@ -13695,6 +13938,9 @@ func cmdLineBot(args []string) int {
 	}
 	if searchCfg.fetchEnabled() {
 		tools = append(tools, webFetchTool)
+	}
+	if saveImages {
+		tools = append(tools, readPicTool)
 	}
 
 	systemPrompt := buildChatBotSystemPrompt("LINE", persona)

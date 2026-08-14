@@ -517,7 +517,7 @@ ola telegrambot \
 
 - **ต้องใช้โมเดิลที่รองรับ vision จริง** (เช่น `llava`, `qwen2-vl`, `gemma3`/`gemma4` บางเวอร์ชัน หรือ GPT-4V-style ผ่าน OpenAI-compatible) โมเดิลข้อความล้วนจะเห็นแค่ข้อความ ไม่เห็นรูป — system prompt สั่งให้โมเดิลบอกตรงๆ ว่าดูรูปไม่ได้แทนที่จะแต่งคำอธิบายขึ้นเอง แต่ก็ยังขึ้นกับว่าโมเดิลจะทำตามจริงแค่ไหน
 - **`--max-image-size <size>`/`OLA_MAX_IMAGE_SIZE`** — ขนาดรูปภาพสูงสุดที่รับได้ เช่น `10K`, `12M`, `1G` (ไม่ใส่หน่วย = bytes) หน่วยเป็นแบบ binary (K=1024 ไม่ใช่ 1000) default **10M** — รูปเกินขนาดจะถูกปฏิเสธก่อนส่งให้โมเดิลเสมอ (Telegram/Discord ปฏิเสธได้ตั้งแต่ก่อนดาวน์โหลดด้วยซ้ำถ้าแพลตฟอร์มรายงานขนาดไฟล์มาให้ล่วงหน้า)
-- **รูปภาพไม่ถูกบันทึกลง context ถาวรเลย** (ทั้งที่เก็บลงดิสก์อย่าง telegrambot/discordbot/linebot และที่เก็บในหน่วยความจำอย่าง webbot) — โมเดิลเห็นรูปแค่ในเทิร์นที่ส่งมาเท่านั้น เทิร์นที่บันทึกไว้จะมีแค่ข้อความ + tag สั้นๆ เช่น `[แนบรูปภาพ 1 รูป]` แทน กันไม่ให้ context โตเร็วเกินไปจากไฟล์ base64
+- **โดยปกติรูปภาพไม่ถูกบันทึกลง context ถาวร** (ทั้งที่เก็บลงดิสก์อย่าง telegrambot/discordbot/linebot และที่เก็บในหน่วยความจำอย่าง webbot) — โมเดิลเห็นรูปแค่ในเทิร์นที่ส่งมาเท่านั้น เทิร์นที่บันทึกไว้จะมีแค่ข้อความ + tag สั้นๆ เช่น `[แนบรูปภาพ 1 รูป]` แทน กันไม่ให้ context โตเร็วเกินไปจากไฟล์ base64 — **ถ้าอยากให้ดูรูปเก่าซ้ำข้ามบทสนทนาได้ ดูหัวข้อ `--save-images` ด้านล่าง**
 - **ในกลุ่ม/channel: ดาวน์โหลดรูปเฉพาะข้อความที่ถูก mention เท่านั้น** (เหมือนหลักการ record-แต่ไม่ตอบ ของข้อความทั่วไป — ดูหัวข้อ [พฤติกรรมใน group chat](#พฤติกรรมใน-group-chat) ด้านล่าง) ข้อความที่มีรูปแต่ไม่ถูก mention จะถูกบันทึกเป็น `[ส่งรูปภาพ]` เฉยๆ ไม่ดาวน์โหลดจริง ประหยัด bandwidth
 
 **ความต่างเฉพาะแพลตฟอร์ม:**
@@ -526,7 +526,22 @@ ola telegrambot \
 - **LINE** — ดาวน์โหลดผ่าน endpoint คนละ host กับ REST API ปกติ (`api-data.line.me`) และ**ข้อความรูปภาพของ LINE ไม่มี mention object เลย** จึงไม่มีทางที่รูปในกลุ่มจะ "ถูก mention" ได้ตามกลไกเดียวกับข้อความตัวอักษร — รูปที่ส่งในกลุ่ม LINE จะถูกบันทึกเป็น `[ส่งรูปภาพ]` เสมอ ไม่ถูกวิเคราะห์เลย (ส่งรูปใน DM ยังทำงานปกติ เพราะ DM ถือว่า addressed เสมออยู่แล้ว)
 - **webbot** — มีปุ่มแนบรูป (📎) ข้าง input box พร้อม preview รูปก่อนส่งและปุ่มเอาออก
 
+### บันทึกรูปภาพไว้อ้างอิงข้ามบทสนทนา — `--save-images`/`OLA_SAVE_IMAGES`
 
+**เฉพาะ telegrambot/discordbot/linebot เท่านั้น — ไม่มีใน webbot โดยเจตนา** เพราะขัดกับดีไซน์ "ไม่ persist อะไรเลย" ของ webbot ที่ตั้งใจไว้ตั้งแต่แรก
+
+ปิดโดย default (`--save-images`/`OLA_SAVE_IMAGES=1`/`true`/`yes`/`on` เพื่อเปิด) — เป็น **opt-in ไม่ใช่พฤติกรรมเริ่มต้นใหม่** เพราะเก็บรูปจริงที่ผู้ใช้ส่งมาไว้ถาวรมีนัยเรื่อง privacy/พื้นที่ดิสก์ที่มากกว่าการเก็บแค่ text tag เดิม
+
+**เปิดแล้วเกิดอะไรขึ้น:**
+- รูปที่ดาวน์โหลดมา (เฉพาะข้อความที่ addressed แล้วเท่านั้น — ตามหลักการเดิมด้านบน) ถูกบันทึกไว้ที่ `<context-dir>/pics/<chat-key>/<timestamp>_<hash>.<นามสกุล>` — **แยกโฟลเดอร์ตามแชทเสมอ** ไม่ใช่โฟลเดอร์รวม กันรูปจากแชทหนึ่งถูกแชทอื่นมองเห็น/อ้างอิงถึงได้โดยไม่ตั้งใจ (เหมือนกับที่ context ไฟล์ของแต่ละแชทก็แยกกันอยู่แล้ว)
+- เทิร์นที่บันทึกไว้จะมี tag ระบุ path จริงแทนตัวเลขนับรูปเฉยๆ เช่น `[แนบรูปภาพ: pics/group_-999/20260814-143022_a1b2c3d4.jpg]`
+- โมเดิลมี tool ใหม่ **`read_pic`** ให้เรียกดูรูปเก่าอีกครั้งเมื่อผู้ใช้อ้างถึง (เช่น "รูปที่ส่งไปเมื่อวันก่อน...") — รับ path ตรงตามที่ปรากฏใน context เดิม แล้วแนบรูปกลับเข้า tool loop เป็นข้อความใหม่ (กลไกเดียวกับที่ `ask`/`coding`'s `read_pdf` ใช้แนบหน้า PDF ที่แปลงเป็นรูปกลับเข้าบทสนทนา) sandbox เฉพาะ `pics/` เท่านั้น เข้าไฟล์อื่นใน context-dir (เช่น `knowledge-index.json`) ไม่ได้
+
+**ข้อควรรู้ที่สำคัญ:**
+- ไม่มีการลบรูปเก่าอัตโนมัติเลย — `pics/` จะโตขึ้นเรื่อยๆ ตามจำนวนรูปที่ส่งเข้ามา **ผู้ดูแลต้องจัดการพื้นที่ดิสก์เอง** (เช่น cron job ลบไฟล์เก่ากว่า N วัน) เหมือนกับที่ `knowledge-index.json` ก็ไม่มีการ prune อัตโนมัติเช่นกัน
+- รูปที่ save ไว้ไม่ถูกส่งกลับเข้า context ทุกรอบอัตโนมัติ (ถ้าทำแบบนั้นจะแพงขึ้นเรื่อยๆ ตามจำนวนรูปสะสม) โมเดิลต้องเรียก `read_pic` เองเมื่อต้องการดูจริงๆ เท่านั้น
+
+### Persona — เติมต่อท้ายเท่านั้น ไม่ใช่ override
 
 หลักการ "system prompt คงที่ ไม่มี `-s/--system`" (ดู [ภาพรวมและปรัชญาการออกแบบ](#ภาพรวมและปรัชญาการออกแบบ)) ยังใช้กับ `telegrambot` เช่นกัน — `--persona`/`--persona-file` ถูกแทรกเข้าไป**ระหว่าง**ประโยคเปิดกับกติกาพื้นฐานของ system prompt ที่ตายตัว (ไม่ใช่ต่อท้ายทั้งหมด) เพื่อให้ชื่อ/บุคลิกที่กำหนดไว้มีน้ำหนักสูงสุดในสายตาโมเดิล — พบจากการทดสอบจริงว่าถ้า persona ถูกแปะไว้ท้ายสุด (หลังกติกายาวๆ) โมเดิลบางตัวมีแนวโน้มตอบชื่อแบบทั่วไป เช่น "ฉันชื่อบอท" แทนชื่อที่ตั้งไว้ กติกาความปลอดภัย/ขอบเขต tool ที่มีให้ ไม่สามารถถูกเปลี่ยนผ่าน persona ได้ไม่ว่าจะวางตำแหน่งไหน
 
@@ -611,6 +626,7 @@ ola telegrambot \
 | — | `--poll-timeout` | `600` | long-poll timeout วินาทีต่อ `getUpdates` (10 นาที — ดูหมายเหตุด้านล่างเรื่องขีดจำกัดฝั่ง Telegram) |
 | — | `--telegram-max-concurrent` | `4` | จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส |
 | `OLA_MAX_IMAGE_SIZE` | `--max-image-size` | `10M` | ขนาดรูปภาพสูงสุด เช่น `10K`/`12M`/`1G` — ดูหัวข้อ "รองรับรูปภาพ" ด้านล่าง |
+| `OLA_SAVE_IMAGES` | `--save-images` | ปิด | บันทึกรูปที่ผู้ใช้ส่งไว้ที่ `<context-dir>/pics/` เพื่อให้โมเดิลเรียก `read_pic` ดูซ้ำได้ — ดูหัวข้อ "บันทึกรูปภาพไว้อ้างอิงข้ามบทสนทนา" ด้านล่าง |
 | — | `-o, --output` | `telegrambot.log` | log ไฟล์แบบเต็ม เปิดแบบ **append เสมอ** (ต่างจาก `ask`/`coding` ที่ overwrite เป็น default — `telegrambot` เป็น process เดียวรันยาวข้าม restart) |
 
 ตัวแปรที่เหลือ (การเชื่อมต่อโมเดล `-m/-c/-P/--api-base/-k`, `-x/--topic`, และ web search/fetch ทั้งชุด `--searxng-url`/`--ollama-search-key`/`--no-web-search`/ฯลฯ) ใช้ร่วมกับ `ola ask` ทุกประการ — ดู [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด) และ [Web search / web fetch](#web-search--web-fetch) `web_search` เปิดอัตโนมัติเมื่อมีการตั้ง backend ไว้ (SearXNG หรือ Ollama search key) ส่วน `web_fetch` เปิดอัตโนมัติเสมอเหมือน `ask` จนกว่าจะสั่ง `--no-web-search`
@@ -678,6 +694,7 @@ Discord ซ้อนโครงสร้างลึกกว่า Telegram: S
 | `OLA_DISCORD_API_BASE` | `--discord-api-base` | `https://discord.com/api/v10` | override สำหรับทดสอบกับ mock server |
 | — | `--discord-max-concurrent` | `4` | จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส |
 | `OLA_MAX_IMAGE_SIZE` | `--max-image-size` | `10M` | ขนาดรูปภาพสูงสุด — เหมือน `ola telegrambot` ทุกประการ |
+| `OLA_SAVE_IMAGES` | `--save-images` | ปิด | บันทึกรูปไว้ดูซ้ำได้ — เหมือน `ola telegrambot` ทุกประการ |
 | — | `-o, --output` | `discordbot.log` | log ไฟล์แบบเต็ม เปิดแบบ append เสมอ |
 
 ตัวแปรที่เหลือทั้งหมด (`--persona`/`--persona-file`/`OLA_PERSONA`/`OLA_PERSONA_FILE`, `--knowledge-dir`/`OLA_KNOWLEDGE_DIR`, `--embed-model`/`OLA_EMBED_MODEL`/`--embed-top-k`/`--embed-min-score`/`--embed-refresh-interval`, `--context-dir`/`OLA_CONTEXT_DIR` (default ต่างกัน: `discord-context` ที่นี่ vs `telegram-context` ฝั่ง telegrambot ถ้าไม่ได้ตั้ง แต่**ตัวแปร env ตัวเดียวกัน** — ตั้ง `OLA_CONTEXT_DIR` แล้วสองบอทจะไปที่เดียวกันได้ถ้าต้องการ)/`--context-keep-recent`/`--context-compact-after`, การเชื่อมต่อโมเดล, web search/fetch ทั้งชุด) **ใช้ร่วมกับ `ola telegrambot` ทุก flag ทุกพฤติกรรมเป๊ะๆ** — ดู [`ola telegrambot`](#ola-telegrambot) และ [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด)
@@ -762,6 +779,7 @@ LINE อาจส่ง webhook event ซ้ำได้เอง (เช่น 
 | `OLA_LINE_WEBHOOK_PATH` | `--line-webhook-path` | `/line/webhook` | path ของ webhook (ต้องตรงกับที่ตั้งใน LINE Developers Console) |
 | — | `--line-max-concurrent` | `4` | จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส |
 | `OLA_MAX_IMAGE_SIZE` | `--max-image-size` | `10M` | ขนาดรูปภาพสูงสุด — เหมือน `ola telegrambot` ทุกประการ |
+| `OLA_SAVE_IMAGES` | `--save-images` | ปิด | บันทึกรูปไว้ดูซ้ำได้ — เหมือน `ola telegrambot` ทุกประการ |
 | — | `-o, --output` | `linebot.log` | log ไฟล์แบบเต็ม เปิดแบบ append เสมอ |
 
 ตัวแปรที่เหลือทั้งหมด (`--persona`/`--persona-file`, `--knowledge-dir`, `--embed-model`/`--embed-top-k`/`--embed-min-score`/`--embed-refresh-interval`, `--context-dir`/`OLA_CONTEXT_DIR` (default `line-context` ถ้าไม่ได้ตั้ง — ตัวแปรเดียวกับอีกสองบอท), `--context-keep-recent`/`--context-compact-after`, การเชื่อมต่อโมเดล, web search/fetch ทั้งชุด) **ใช้ร่วมกับ `ola telegrambot` ทุก flag ทุกพฤติกรรมเป๊ะๆ** — ดู [`ola telegrambot`](#ola-telegrambot) และ [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด)
