@@ -10264,6 +10264,22 @@ func toolReadPic(args map[string]interface{}, contextDir string) (string, error)
 
 // readPicFollowUpMessage mirrors readPDFFollowUpMessage exactly - see
 // that function's own doc comment.
+// readPicFollowUpMessage mirrors readPDFFollowUpMessage's own general
+// shape (see that function above cmdAsk), but with a more explicit,
+// instructive note than a bare "here's the image" - this is the exact
+// point in the conversation most at risk of the model losing track of
+// what it's actually supposed to do with the picture: several turns
+// (possibly a genuinely separate conversation, hours or days apart) sit
+// between the user's original question and this follow-up, with a
+// tool_call/tool_result pair also sitting in between THAT and the actual
+// image data. A model with weaker long-context grounding can lose the
+// thread across that gap and answer confidently but wrong, rather than
+// actually looking at what's now in front of it - reported directly:
+// describing a re-read picture incorrectly, in a way a same-turn direct
+// attachment didn't. The instruction here is deliberately more explicit
+// than a plain caption for exactly that reason, and echoes the
+// don't-fabricate rule from builtinChatBotSystemPromptRules again right
+// at the point where it matters most.
 func readPicFollowUpMessage(toolName, result string) (msg ollamaMessage, ok bool) {
 	if toolName != "read_pic" || strings.HasPrefix(result, "ERROR:") {
 		return ollamaMessage{}, false
@@ -10272,7 +10288,13 @@ func readPicFollowUpMessage(toolName, result string) (msg ollamaMessage, ok bool
 	if r == nil || r.Image == "" {
 		return ollamaMessage{}, false
 	}
-	return ollamaMessage{Role: "user", Content: fmt.Sprintf("รูปภาพ %s ตามที่ read_pic เพิ่งอ่านไป", r.Path), Images: []string{r.Image}}, true
+	note := fmt.Sprintf(
+		"นี่คือรูปภาพจริงจาก %s ที่คุณเพิ่งเรียก read_pic มาดูตามที่ผู้ใช้ถามถึง "+
+			"กรุณาดูรูปนี้อย่างละเอียดอีกครั้งแล้วตอบคำถามของผู้ใช้โดยอ้างอิงเฉพาะสิ่งที่เห็นจริงในรูปนี้เท่านั้น "+
+			"ห้ามเดาหรือแต่งรายละเอียดขึ้นเองเด็ดขาด แม้จะเคยเห็นหรือพูดถึงรูปนี้มาก่อนในบทสนทนาก็ตาม ให้ยึดตามรูปที่แนบมาจริงตอนนี้เป็นหลัก",
+		r.Path,
+	)
+	return ollamaMessage{Role: "user", Content: note, Images: []string{r.Image}}, true
 }
 
 var readPicTool = ollamaTool{
@@ -10433,7 +10455,7 @@ func compactChatContext(client *http.Client, pcfg providerConfig, ctxSize int, c
 		Options: ollamaOptions{NumCtx: ctxSize},
 		Stream:  true,
 		Messages: []ollamaMessage{
-			{Role: "system", Content: "คุณคือระบบสรุปบทสนทนา สรุปบทสนทนาต่อไปนี้ให้กระชับเป็นภาษาไทย เก็บข้อเท็จจริง ความชอบ ข้อตกลง คำถามค้างคา และบริบทสำคัญที่ user เคยพูดไว้ให้ครบ ห้ามเพิ่มเติมสิ่งที่ไม่มีอยู่จริง - ถ้าบทสนทนามีหลายคนพูด (มีชื่อคนกำกับแต่ละบรรทัดแทนคำว่า user) ให้ระบุไว้ในสรุปด้วยเสมอว่าใครพูดอะไร ห้ามรวมเป็นเสียงเดียวจนแยกไม่ออกว่าเป็นความเห็น/ข้อมูลของใคร ตอบเป็นเนื้อสรุปอย่างเดียว ไม่ต้องมีคำนำหรือคำลงท้าย"},
+			{Role: "system", Content: "คุณคือระบบสรุปบทสนทนา สรุปบทสนทนาต่อไปนี้ให้กระชับเป็นภาษาไทย เก็บข้อเท็จจริง ความชอบ ข้อตกลง คำถามค้างคา และบริบทสำคัญที่ user เคยพูดไว้ให้ครบ ห้ามเพิ่มเติมสิ่งที่ไม่มีอยู่จริง - ถ้ามีข้อความรูปแบบ [แนบรูปภาพ: pics/...] อยู่ในบทสนทนา ต้องคัดลอก path หลัง \"pics/\" ไปจนถึงนามสกุลไฟล์ไว้ในสรุปแบบคำต่อคำเป๊ะๆ ทุกตัวอักษร ห้ามสรุป ถอดความ หรือละไว้เด็ดขาด เพราะระบบต้องใช้ path นี้เรียกดูรูปเดิมซ้ำได้ในบทสนทนาถัดไป การพิมพ์ path ผิดแม้แต่ตัวเดียวจะทำให้เรียกดูรูปไม่ได้อีกเลย - ถ้าบทสนทนามีหลายคนพูด (มีชื่อคนกำกับแต่ละบรรทัดแทนคำว่า user) ให้ระบุไว้ในสรุปด้วยเสมอว่าใครพูดอะไร ห้ามรวมเป็นเสียงเดียวจนแยกไม่ออกว่าเป็นความเห็น/ข้อมูลของใคร ตอบเป็นเนื้อสรุปอย่างเดียว ไม่ต้องมีคำนำหรือคำลงท้าย"},
 			{Role: "user", Content: sb.String()},
 		},
 	}

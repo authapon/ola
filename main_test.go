@@ -11526,3 +11526,67 @@ func TestUnaddressedSavedImageCanLaterBeReReadViaReadPic(t *testing.T) {
 }
 
 var lastUnaddrSavedRef string
+
+// ─────────────────────────────────────────────────────────────────
+// Regression tests for a real reported bug: read_pic-delivered pictures
+// were being described incorrectly by the model, unlike a same-turn
+// direct attachment which worked correctly. Two independent, additive
+// fixes: (1) the follow-up message itself was a bare "here's the image"
+// caption with nothing telling the model to actually ground its answer
+// in what it's now looking at rather than whatever it might recall/guess
+// from earlier in the conversation; (2) compaction's own summarizer had
+// no instruction to preserve a "[แนบรูปภาพ: pics/...]" tag's exact path
+// verbatim, so a "concise" summary could easily paraphrase the machine-
+// readable path away entirely, leaving read_pic nothing valid to call -
+// or worse, leaving the door open for the model to guess/hallucinate a
+// plausible-looking path instead of honestly reporting it can't find one.
+// ─────────────────────────────────────────────────────────────────
+
+func TestReadPicFollowUpMessageInstructsGroundedAnswer(t *testing.T) {
+	setLastReadPicResult(readPicResult{Path: "pics/group_-999/x.png", Image: "ZmFrZQ=="})
+	msg, ok := readPicFollowUpMessage("read_pic", "อ่านรูปภาพสำเร็จ")
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if !strings.Contains(msg.Content, "ห้ามเดาหรือแต่งรายละเอียดขึ้นเอง") {
+		t.Fatalf("expected the follow-up message to explicitly warn against fabricating details, got: %q", msg.Content)
+	}
+	if !strings.Contains(msg.Content, "pics/group_-999/x.png") {
+		t.Fatalf("expected the follow-up message to reference the actual path being shown, got: %q", msg.Content)
+	}
+}
+
+func TestCompactChatContextInstructsPreservingPicsPathsVerbatim(t *testing.T) {
+	var sentSystemPrompt string
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		var req ollamaRequest
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &req)
+		for _, m := range req.Messages {
+			if m.Role == "system" {
+				sentSystemPrompt = m.Content
+			}
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("สรุป: มีการส่งรูป [แนบรูปภาพ: pics/group_-999/xxx.jpg]", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	cctx := &chatContext{Key: "group_-999"}
+	for i := 0; i < 25; i++ {
+		cctx.Turns = append(cctx.Turns, chatTurn{Role: "user", Content: fmt.Sprintf("ข้อความที่ %d", i)})
+	}
+	logFile, _ := os.CreateTemp(t.TempDir(), "log")
+	defer logFile.Close()
+
+	compactChatContext(ollamaSrv.Client(), providerConfig{Provider: providerOllama, Host: ollamaSrv.URL, Model: "mock"}, 4096, cctx, 5, logFile)
+
+	if !strings.Contains(sentSystemPrompt, "pics/") {
+		t.Fatalf("expected the summarizer's own system prompt to explicitly mention preserving pics/ paths, got: %s", sentSystemPrompt)
+	}
+	if !strings.Contains(sentSystemPrompt, "คำต่อคำ") {
+		t.Fatalf("expected an explicit verbatim-preservation instruction, got: %s", sentSystemPrompt)
+	}
+}
