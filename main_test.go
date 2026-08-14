@@ -11611,3 +11611,148 @@ func TestBuildChatBotSystemPromptInstructsProactiveReadPicUse(t *testing.T) {
 		t.Fatal("expected an explicit, unconditional instruction to call read_pic before answering when a question refers to a picture not attached to the current message")
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────
+// Automatic prior-picture attachment: a deterministic fallback for when
+// the model doesn't reliably call read_pic itself. This is the direct
+// regression test for a real reported production failure, reproduced
+// exactly from the bot's own log: a picture posted with no caption
+// (unaddressed, --save-images on), immediately followed by a short
+// addressed question ("รูปอะไรอ่ะ") - the model answered in a SINGLE
+// round with a completely fabricated, unrelated description, never
+// calling read_pic at all (no "[tool_call] read_pic" log line appeared).
+// The mock server below reproduces that exact behavior (answers directly,
+// no tool call) to prove the fix works even when the model never calls
+// the tool - the real image bytes must still reach the model's actual
+// request automatically.
+// ─────────────────────────────────────────────────────────────────
+
+func TestAutoAttachPriorPictureWhenModelNeverCallsReadPic(t *testing.T) {
+	var lastRequestBody string
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		lastRequestBody = string(body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		// Reproduces the exact observed failure mode: the model answers
+		// directly in a single round, never calling read_pic at all.
+		fmt.Fprint(w, streamLine("รูปนี้เป็นภาพวาดคู่รักในชุดอินเดียครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	discordSrv, sent, _ := newMockDiscordRESTServer(t)
+	cdnSrv, _ := newMockImageCDNServer(t, minimalPNG)
+
+	contextDir := t.TempDir()
+	session := newTestDiscordSession(t, discordSrv, ollamaSrv, contextDir, map[string]bool{"111": true})
+	session.access.Guilds = map[string]bool{"guild-1": true}
+	session.saveImages = true
+
+	// Step 1: a picture posted with no caption, no mention at all -
+	// unaddressed, gets downloaded and saved silently per the prior
+	// feature.
+	session.handleDiscordMessage(&discordMessage{
+		GuildID: "guild-1", ChannelID: "channel-1",
+		Author:      discordUser{ID: "111", Username: "authapon"},
+		Attachments: []discordAttachment{{URL: cdnSrv.URL + "/image.png", ContentType: "image/png", Filename: "art.png"}},
+	})
+
+	// Step 2: a short, separate, addressed question with NO image
+	// attached to this specific message - exactly the reported pattern.
+	session.handleDiscordMessage(&discordMessage{
+		GuildID: "guild-1", ChannelID: "channel-1",
+		Author:   discordUser{ID: "111", Username: "authapon"},
+		Content:  "<@999> รูปอะไรอ่ะ",
+		Mentions: []discordUser{{ID: "999"}},
+	})
+
+	wantB64 := base64.StdEncoding.EncodeToString(minimalPNG)
+	if !strings.Contains(lastRequestBody, wantB64) {
+		t.Fatal("expected the real image bytes to reach the model's actual request automatically, even though the model never called read_pic")
+	}
+	if !strings.Contains(lastRequestBody, "แนบรูปจากข้อความก่อนหน้านี้ในแชทให้อัตโนมัติ") {
+		t.Fatal("expected the auto-attach note instructing the model to ground its answer in the real picture")
+	}
+	if len(*sent) != 1 || (*sent)[0].Content != "รูปนี้เป็นภาพวาดคู่รักในชุดอินเดียครับ" {
+		t.Fatalf("expected exactly one reply (the real answer), got: %#v", *sent)
+	}
+}
+
+func TestAutoAttachPriorPictureDoesNotOverrideAnAlreadyAttachedImage(t *testing.T) {
+	var lastRequestBody string
+	round := 0
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		round++
+		body, _ := io.ReadAll(r.Body)
+		lastRequestBody = string(body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("โอเคครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	discordSrv, _, _ := newMockDiscordRESTServer(t)
+	cdnSrv1, _ := newMockImageCDNServer(t, minimalPNG)
+
+	// A second, DIFFERENT image for the second message - the one
+	// actually attached to the addressed message must win, not whatever
+	// the auto-attach mechanism would have pulled from the prior turn.
+	otherImage := append([]byte(nil), minimalPNG...)
+	otherImage[len(otherImage)-1] ^= 0xFF // still a garbage-but-different byte sequence, fine since this mock CDN just returns whatever bytes it's given verbatim
+	cdnSrv2, _ := newMockImageCDNServer(t, otherImage)
+
+	contextDir := t.TempDir()
+	session := newTestDiscordSession(t, discordSrv, ollamaSrv, contextDir, map[string]bool{"111": true})
+	session.access.Guilds = map[string]bool{"guild-1": true}
+	session.saveImages = true
+
+	session.handleDiscordMessage(&discordMessage{
+		GuildID: "guild-1", ChannelID: "channel-1",
+		Author:      discordUser{ID: "111", Username: "authapon"},
+		Attachments: []discordAttachment{{URL: cdnSrv1.URL + "/image.png", ContentType: "image/png", Filename: "first.png"}},
+	})
+	session.handleDiscordMessage(&discordMessage{
+		GuildID: "guild-1", ChannelID: "channel-1",
+		Author:      discordUser{ID: "111", Username: "authapon"},
+		Content:     "<@999> รูปนี้คืออะไร",
+		Mentions:    []discordUser{{ID: "999"}},
+		Attachments: []discordAttachment{{URL: cdnSrv2.URL + "/image.png", ContentType: "image/png", Filename: "second.png"}},
+	})
+
+	if round != 1 {
+		t.Fatalf("expected exactly 1 model round, got %d", round)
+	}
+	wantB64 := base64.StdEncoding.EncodeToString(otherImage)
+	if !strings.Contains(lastRequestBody, wantB64) {
+		t.Fatal("expected the image actually attached to the addressed message to be used")
+	}
+	if strings.Contains(lastRequestBody, "แนบรูปจากข้อความก่อนหน้านี้ในแชทให้อัตโนมัติ") {
+		t.Fatal("expected no auto-attach note when the message already carries its own image")
+	}
+}
+
+func TestPicRefsInTurnTextExtractsMultiplePaths(t *testing.T) {
+	got := picRefsInTurnText("[แนบรูปภาพ: pics/a/x.jpg, pics/a/y.png]")
+	if len(got) != 2 || got[0] != "pics/a/x.jpg" || got[1] != "pics/a/y.png" {
+		t.Fatalf("unexpected refs: %#v", got)
+	}
+	if got := picRefsInTurnText("ข้อความธรรมดาไม่มีรูป"); got != nil {
+		t.Fatalf("expected nil for text with no picture tag, got: %#v", got)
+	}
+}
+
+func TestAutoAttachPriorPictureSkipsWhenPrecedingTurnHasNoPicture(t *testing.T) {
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	logFile, _ := os.CreateTemp(t.TempDir(), "log")
+	defer logFile.Close()
+	c := &chatBotCore{contextDir: t.TempDir(), outFile: logFile}
+
+	got := c.autoAttachPriorPicture([]chatTurn{{Role: "user", Content: "สวัสดีครับ"}})
+	if got != nil {
+		t.Fatalf("expected nil when the preceding turn has no picture tag, got: %#v", got)
+	}
+	if got := c.autoAttachPriorPicture(nil); got != nil {
+		t.Fatalf("expected nil for an empty turn history, got: %#v", got)
+	}
+}

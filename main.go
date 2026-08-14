@@ -10742,6 +10742,77 @@ const chatBotNoTextWithImagePrompt = "(ผู้ใช้ส่งรูปภ�
 // doesn't balloon the on-disk context file with (base64, ~33% larger
 // than the original) image bytes forever. The model still genuinely sees
 // and can respond to the image THIS round; it just won't have the pixels
+// picRefTagPattern matches a "[แนบรูปภาพ: pics/a.jpg, pics/b.jpg]" tag
+// (see recordAndRespond's own tag-building below) so a turn's saved
+// picture path(s) can be recovered from its plain-text content later.
+var picRefTagPattern = regexp.MustCompile(`\[แนบรูปภาพ: ([^\]]+)\]`)
+
+// picRefsInTurnText extracts pics/... paths from a "[แนบรูปภาพ: ...]" tag
+// if the given turn text contains one, or nil if it doesn't.
+func picRefsInTurnText(content string) []string {
+	m := picRefTagPattern.FindStringSubmatch(content)
+	if m == nil {
+		return nil
+	}
+	var refs []string
+	for _, p := range strings.Split(m[1], ", ") {
+		p = strings.TrimSpace(p)
+		if strings.HasPrefix(p, "pics/") {
+			refs = append(refs, p)
+		}
+	}
+	return refs
+}
+
+// autoAttachPriorPicture loads whatever picture(s) the IMMEDIATELY
+// PRECEDING turn referenced (via its own "[แนบรูปภาพ: ...]" tag, if any)
+// as base64, so they can be attached to the current round's outgoing
+// message automatically when this round carries no image of its own.
+//
+// This exists specifically because relying on the model to decide "I
+// should call read_pic here" turned out to be unreliable in real use for
+// exactly the most common case it matters for: a picture posted with no
+// caption, immediately followed by a short addressed question like
+// "รูปอะไรอ่ะ" ("what's this?"). Live testing (confirmed via the bot's own
+// log - no read_pic tool_call line at all, just a single-round answer)
+// showed a model can skip the tool entirely and answer with a fully
+// fabricated, unrelated description despite an explicit system-prompt
+// rule telling it to call read_pic first. Making this one specific,
+// narrow case deterministic - code decides, not model judgment - removes
+// that failure mode where it matters most, while read_pic itself stays
+// available (and still instructed) for anything further back in history
+// that this narrower heuristic doesn't reach.
+//
+// Deliberately scoped to ONLY the single immediately-preceding turn, not
+// a broader scan - matches the exact reported real-world pattern without
+// risking pulling in an unrelated older picture reference. If the
+// preceding turn is the bot's own reply (no picture tag, since only user
+// turns ever get one) or has no picture tag for any other reason, this
+// simply returns nothing and normal read_pic-based behavior still
+// applies.
+func (c *chatBotCore) autoAttachPriorPicture(turns []chatTurn) []string {
+	if len(turns) == 0 {
+		return nil
+	}
+	refs := picRefsInTurnText(turns[len(turns)-1].Content)
+	if len(refs) == 0 {
+		return nil
+	}
+	var images []string
+	for _, ref := range refs {
+		full, err := sandboxedPathIn(c.contextDir, ref)
+		if err != nil {
+			continue
+		}
+		data, err := os.ReadFile(full)
+		if err != nil {
+			continue
+		}
+		images = append(images, base64.StdEncoding.EncodeToString(data))
+	}
+	return images
+}
+
 // available again once that turn scrolls past --context-keep-recent or
 // gets compacted UNLESS imageRefs is non-empty (see below).
 //
@@ -10810,9 +10881,25 @@ func (c *chatBotCore) recordAndRespond(key, speaker, text string, addressed bool
 	}
 
 	messages := cctx.buildMessages(c.systemPrompt)
+	autoAttachNote := ""
+	if len(images) == 0 {
+		// No image attached to THIS round - check whether the turn right
+		// before it was a bare (or captioned) picture that never got
+		// analyzed (see autoAttachPriorPicture's own doc comment on why
+		// this exists as a deterministic fallback rather than relying on
+		// the model to call read_pic itself).
+		if autoImages := c.autoAttachPriorPicture(cctx.Turns); len(autoImages) > 0 {
+			images = autoImages
+			autoAttachNote = "(ระบบ: แนบรูปจากข้อความก่อนหน้านี้ในแชทให้อัตโนมัติ เนื่องจากคำถามนี้อาจเกี่ยวกับรูปนั้น กรุณาดูรูปนี้อย่างละเอียดแล้วตอบตามสิ่งที่เห็นจริงในรูปนี้เท่านั้น ห้ามเดาหรือแต่งคำตอบขึ้นเอง)"
+			c.logf("[chatbot_auto_pic] แนบรูปจากเทิร์นก่อนหน้าอัตโนมัติ (%d รูป) ให้กับคำถามนี้\n", len(images))
+		}
+	}
 	outgoingText := text
 	if len(images) > 0 && text == "" {
 		outgoingText = chatBotNoTextWithImagePrompt
+	}
+	if autoAttachNote != "" {
+		outgoingText = appendChatBotTag(outgoingText, autoAttachNote)
 	}
 	messages = append(messages, ollamaMessage{Role: "user", Content: formatChatTurnContent(speaker, outgoingText), Images: images})
 
