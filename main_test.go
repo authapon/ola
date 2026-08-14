@@ -11215,3 +11215,67 @@ func TestHandleTelegramMessageSaveImagesOffKeepsGenericTag(t *testing.T) {
 		t.Fatal("expected no pics/ directory to be created at all when --save-images is off")
 	}
 }
+
+// TestCmdBotFunctionsWireSaveImagesIntoChatBotCore is a regression test
+// for a real bug found in production: --save-images/OLA_SAVE_IMAGES was
+// correctly resolved (flag+env, via envBool) and correctly used to build
+// the tool list (readPicTool got added when true) in all three of
+// cmdTelegramBot/cmdDiscordBot/cmdLineBot - but the resolved value was
+// never actually copied into the chatBotCore{...} struct literal each
+// function constructs, so the RUNNING session's own c.saveImages field
+// stayed permanently false regardless of the setting. That field is what
+// both toolsStatusText and the read_pic dispatch gate check - the tool
+// appeared in the model's tool list (since that check used the correct
+// local variable) but silently refused to actually run, and no image was
+// ever saved to disk either.
+//
+// This wasn't caught by the handler-level tests (TestHandleDiscordMessage
+// SaveImagesTagsStoredTurnWithPath and friends) because those construct
+// a session struct directly and set session.saveImages themselves -
+// exercising the HANDLER logic correctly, but never exercising the
+// actual flag/env-resolution-to-struct-construction code inside
+// cmdTelegramBot/cmdDiscordBot/cmdLineBot where the real bug lived.
+// Fully invoking those functions end-to-end would require mocking each
+// platform's entire connection handshake (Discord's Gateway WebSocket
+// especially), so this instead directly inspects the source text for the
+// one thing that actually matters here: every chatBotCore{...} literal
+// inside those three functions must assign saveImages explicitly (the
+// same way it must assign maxImageSize, contextDir, etc.) - the bug
+// class this guards against is a field silently missing from a struct
+// literal, which is exactly a source-level property, not a behavioral
+// one, so checking the source directly is the correct fit for this test
+// rather than an unnecessarily heavy encoding of it as a runtime test.
+func TestCmdBotFunctionsWireSaveImagesIntoChatBotCore(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	text := string(src)
+
+	funcs := []string{"cmdTelegramBot", "cmdDiscordBot", "cmdLineBot"}
+	for _, fn := range funcs {
+		start := strings.Index(text, "\nfunc "+fn+"(")
+		if start == -1 {
+			t.Fatalf("could not locate func %s in main.go", fn)
+		}
+		// Find the next top-level "func " after this one to bound the search.
+		rest := text[start+1:]
+		end := strings.Index(rest, "\nfunc ")
+		if end == -1 {
+			end = len(rest)
+		}
+		body := rest[:end]
+
+		if !strings.Contains(body, "chatBotCore{") {
+			t.Fatalf("%s: expected a chatBotCore{...} literal", fn)
+		}
+		if !strings.Contains(body, "saveImages:") {
+			t.Fatalf("%s: chatBotCore{...} literal is missing a saveImages: assignment - "+
+				"the resolved --save-images/OLA_SAVE_IMAGES value never reaches the running session "+
+				"(this is exactly the bug this test exists to catch)", fn)
+		}
+		if !strings.Contains(body, "maxImageSize:") {
+			t.Fatalf("%s: chatBotCore{...} literal is missing a maxImageSize: assignment", fn)
+		}
+	}
+}
