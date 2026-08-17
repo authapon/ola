@@ -10179,6 +10179,49 @@ func formatChatTurnContent(speaker string, t time.Time, content string) string {
 	return prefix + " " + content
 }
 
+// echoedTimestampBracketPattern matches formatThaiTimestamp's own exact
+// output shape (see that function) at the very start of a string,
+// optionally followed by one more "[...]" bracket (a speaker name, if
+// the model imitated that part too) - see stripEchoedTimestampBracket's
+// own doc comment for why this exists. Deliberately narrow/specific
+// (exact Thai weekday names, exact abbreviated month list, digit counts
+// pinned to what formatThaiTimestamp always produces) rather than a
+// loose "starts with any [...]" match, so this can only ever strip text
+// that is genuinely this bracket format - never a legitimately
+// bracket-prefixed sentence the model wrote on its own for some other
+// reason.
+var echoedTimestampBracketPattern = regexp.MustCompile(
+	`^\[วัน(?:อาทิตย์|จันทร์|อังคาร|พุธ|พฤหัสบดี|ศุกร์|เสาร์) \d{1,2} (?:ม\.ค\.|ก\.พ\.|มี\.ค\.|เม\.ย\.|พ\.ค\.|มิ\.ย\.|ก\.ค\.|ส\.ค\.|ก\.ย\.|ต\.ค\.|พ\.ย\.|ธ\.ค\.) \d{4} เวลา \d{2}:\d{2} น\.\]\s*(?:\[[^\]]+\]\s*)?`,
+)
+
+// stripEchoedTimestampBracket removes a leading timestamp (and, if
+// present, speaker) bracket from the model's OWN generated answer,
+// before that answer is ever sent to the user or stored back into
+// context.
+//
+// This exists because the system-prompt rule telling the model never to
+// produce this bracket itself (see builtinChatBotSystemPromptRules)
+// turned out not to be reliable enough on its own - confirmed directly
+// from a real production log: the model started echoing the exact
+// "[วันจันทร์ ... เวลา ... น.]" bracket at the start of its own replies,
+// and the pattern got WORSE over the conversation rather than better.
+// The mechanism: once the model echoes the bracket once, that literal
+// text becomes part of its own stored chatTurn.Content: on every
+// subsequent turn, buildMessages/formatChatTurnContent wraps ANOTHER
+// fresh timestamp bracket around that already-bracketed text when
+// replaying it, so the model's own visible history shows its past
+// replies consistently (doubly) bracket-prefixed - reinforcing exactly
+// the pattern the rule was trying to prevent, even on totally unrelated
+// follow-up messages ("เก่งจัง" got the bracket too, in the log that
+// surfaced this). A prompt rule can't out-argue what the model
+// literally sees repeated in its own conversation history, so this
+// strips it deterministically instead - the same lesson already learned
+// from auto-attach (chatBotCore.autoAttachPriorMedia) not depending on
+// the model reliably calling read_pic/read_saved_pdf on its own.
+func stripEchoedTimestampBracket(answer string) string {
+	return echoedTimestampBracketPattern.ReplaceAllString(answer, "")
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Saving received images for cross-conversation reference
 // (--save-images/OLA_SAVE_IMAGES, telegrambot/discordbot/linebot only -
@@ -11468,7 +11511,7 @@ func (c *chatBotCore) runChatToolLoop(messages []ollamaMessage) (string, error) 
 				)
 				continue
 			}
-			return outcome.Content, nil
+			return stripEchoedTimestampBracket(outcome.Content), nil
 		}
 		messages = append(messages, ollamaMessage{
 			Role: "assistant", Content: outcome.Content, Thinking: outcome.Thinking, ToolCalls: outcome.ToolCalls,

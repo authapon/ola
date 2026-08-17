@@ -13080,3 +13080,117 @@ func TestHandleDiscordMessageReplySentToUserNeverContainsTimestampBracket(t *tes
 		t.Fatalf("expected the reply to be exactly the model's own answer, unmodified, got: %q", reply)
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────
+// stripEchoedTimestampBracket - direct regression test for a real
+// production bug confirmed via an actual bot log: despite an explicit
+// system-prompt rule forbidding it, the model started echoing the
+// "[วันจันทร์ ... เวลา ... น.]" bracket at the start of its own replies,
+// a pattern that got progressively worse turn over turn (a totally
+// unrelated "เก่งจัง" reply still got the bracket) because the model's
+// own past replies, once bracketed, reinforced the pattern when replayed
+// back to it as history.
+// ─────────────────────────────────────────────────────────────────
+
+func TestStripEchoedTimestampBracketMatchesRealLoggedExample(t *testing.T) {
+	// Lifted directly from the reported log.
+	in := "[วันจันทร์ 17 ส.ค. 2569 เวลา 10:00 น.] จากวันที่ 15 พฤษภาคม 2520 จนถึงวันนี้ (17 สิงหาคม 2569) \n\nคำนวณได้เป็น **49 ปี 3 เดือน และ 2 วัน** ค่ะ 😊"
+	want := "จากวันที่ 15 พฤษภาคม 2520 จนถึงวันนี้ (17 สิงหาคม 2569) \n\nคำนวณได้เป็น **49 ปี 3 เดือน และ 2 วัน** ค่ะ 😊"
+	if got := stripEchoedTimestampBracket(in); got != want {
+		t.Fatalf("stripEchoedTimestampBracket(%q) = %q, want %q", in, got, want)
+	}
+}
+
+func TestStripEchoedTimestampBracketAlsoStripsTrailingSpeakerBracket(t *testing.T) {
+	in := "[วันจันทร์ 17 ส.ค. 2569 เวลา 10:00 น.] [สมชาย] สวัสดีครับ"
+	want := "สวัสดีครับ"
+	if got := stripEchoedTimestampBracket(in); got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestStripEchoedTimestampBracketLeavesOrdinaryTextAlone(t *testing.T) {
+	cases := []string{
+		"สวัสดีครับ ไม่มีวงเล็บอะไรเลย",
+		"[Note: this is important] แต่ไม่ใช่รูปแบบวันเวลาที่ระบบสร้าง",
+		"ประโยคที่มี [วันจันทร์] อยู่ตรงกลาง ไม่ใช่ต้นข้อความ",
+		"", // empty answer must never panic
+	}
+	for _, c := range cases {
+		if got := stripEchoedTimestampBracket(c); got != c {
+			t.Fatalf("expected %q to pass through unchanged, got %q", c, got)
+		}
+	}
+}
+
+func TestStripEchoedTimestampBracketRequiresExactShape(t *testing.T) {
+	// Close to the real shape but subtly wrong in each case - none of
+	// these should match, proving the pattern is genuinely specific
+	// rather than a loose "starts with brackets" heuristic.
+	cases := []string{
+		"[วันจันทร์ 17 สค 2569 เวลา 10:00 น.] missing dots after ส.ค.",
+		"[วันจันทร์ 17 ส.ค. 2569 10:00 น.] missing เวลา keyword",
+		"[จันทร์ 17 ส.ค. 2569 เวลา 10:00 น.] missing วัน prefix on the weekday",
+	}
+	for _, c := range cases {
+		if got := stripEchoedTimestampBracket(c); got != c {
+			t.Fatalf("expected %q to NOT match (shape differs from the real format), but it was stripped to %q", c, got)
+		}
+	}
+}
+
+// TestHandleDiscordMessageStripsModelEchoedTimestampFromReplyAndStorage
+// is the full end-to-end reproduction of the reported bug: the mock
+// model deliberately echoes the bracket (exactly as the real model did
+// in production), and this confirms the fix stops it from reaching
+// either the user OR the persisted context - the latter matters most,
+// since an un-stripped stored reply is exactly what fed the
+// self-reinforcing loop in the first place (see
+// stripEchoedTimestampBracket's own doc comment).
+func TestHandleDiscordMessageStripsModelEchoedTimestampFromReplyAndStorage(t *testing.T) {
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		// Reproduces the model's actual observed behavior from the log:
+		// echoing the timestamp bracket at the start of its own answer.
+		fmt.Fprint(w, streamLine("[วันจันทร์ 17 ส.ค. 2569 เวลา 10:00 น.] คำนวณได้ 49 ปี 3 เดือน 2 วันค่ะ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	discordSrv, sent, _ := newMockDiscordRESTServer(t)
+	contextDir := t.TempDir()
+	session := newTestDiscordSession(t, discordSrv, ollamaSrv, contextDir, map[string]bool{"111": true})
+
+	msg := &discordMessage{
+		ChannelID: "channel-1",
+		Author:    discordUser{ID: "111", Username: "somchai"},
+		Content:   "จากวันที่ 15 พค 2520 จนถึงวันนี้ กี่ปีแล้วครับ",
+	}
+	session.handleDiscordMessage(msg)
+
+	if len(*sent) != 1 {
+		t.Fatalf("expected exactly one reply, got: %#v", *sent)
+	}
+	reply := (*sent)[0].Content
+	if strings.HasPrefix(reply, "[วัน") {
+		t.Fatalf("expected the echoed bracket to be stripped from the reply actually sent to the user, got: %q", reply)
+	}
+	if reply != "คำนวณได้ 49 ปี 3 เดือน 2 วันค่ะ" {
+		t.Fatalf("expected exactly the bracket-stripped answer, got: %q", reply)
+	}
+
+	// Confirm it's ALSO stripped in what gets persisted - this is the
+	// part that actually breaks the self-reinforcing feedback loop. If
+	// the stored turn still had the bracket, the next buildMessages
+	// replay would wrap ANOTHER bracket around it, and the model would
+	// keep seeing "my own past replies look like this."
+	cctx, err := loadChatContext(contextDir, discordContextKey(msg))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	for _, turn := range cctx.Turns {
+		if turn.Role == "assistant" && strings.HasPrefix(turn.Content, "[วัน") {
+			t.Fatalf("expected the persisted assistant turn to also have the bracket stripped, got: %q", turn.Content)
+		}
+	}
+}
