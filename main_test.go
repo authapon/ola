@@ -12976,3 +12976,107 @@ func TestBuildChatBotSystemPromptExplainsTimestampsSoModelStopsCallingGetCurrent
 		t.Fatal("expected the rules to explicitly tell the model it can read the timestamp instead of calling get_current_time")
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────
+// Timestamps in the log file too (chatBotCore.logf, shared by all four
+// chat bots) - added directly in response to a follow-up question: the
+// reply actually sent back to the user was already guaranteed clean
+// (see TestHandleDiscordMessageReplySentToUserNeverContainsTimestampBracket
+// below - the model's raw answer text is sent as-is, never routed
+// through formatChatTurnContent), but per-message LOG lines had no
+// timestamp at all before this - only the one-time startup banner did.
+// ─────────────────────────────────────────────────────────────────
+
+func TestLogfPrependsTimestamp(t *testing.T) {
+	logFile, err := os.CreateTemp(t.TempDir(), "logf-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logFile.Close()
+	c := &chatBotCore{outFile: logFile}
+
+	before := time.Now()
+	c.logf("[test_event] สวัสดี %s\n", "ครับ")
+	after := time.Now()
+
+	data, err := os.ReadFile(logFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := string(data)
+	if !strings.Contains(line, "[test_event] สวัสดี ครับ") {
+		t.Fatalf("expected the original formatted content to still be present, got: %q", line)
+	}
+	// Extract the leading "[YYYY-MM-DD HH:MM:SS] " and confirm it parses
+	// to a real time within this test's own execution window - proves
+	// it's a genuine, current timestamp, not just timestamp-shaped text.
+	end := strings.Index(line, "] ")
+	if end == -1 || !strings.HasPrefix(line, "[") {
+		t.Fatalf("expected a leading [timestamp] bracket, got: %q", line)
+	}
+	stamp := line[1:end]
+	got, err := time.ParseInLocation("2006-01-02 15:04:05", stamp, time.Local)
+	if err != nil {
+		t.Fatalf("leading bracket %q did not parse as a timestamp: %v", stamp, err)
+	}
+	if got.Before(before.Add(-2*time.Second)) || got.After(after.Add(2*time.Second)) {
+		t.Fatalf("logged timestamp %v is not within this test's execution window (%v - %v)", got, before, after)
+	}
+}
+
+func TestLogfDoesNotDoubleStampTheStartupBanner(t *testing.T) {
+	// The startup banner is written via a direct fmt.Fprintf(outFile, ...)
+	// call in each cmd*Bot function, never through logf - confirm that
+	// contract holds by checking logf's own output has exactly one
+	// bracket-timestamp prefix, not two, for an ordinary call.
+	logFile, err := os.CreateTemp(t.TempDir(), "logf-test2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logFile.Close()
+	c := &chatBotCore{outFile: logFile}
+	c.logf("[discord_record] key=x user=y: z\n")
+
+	data, err := os.ReadFile(logFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(data), "[20") != 1 { // exactly one "[20xx-..." style bracket
+		t.Fatalf("expected exactly one timestamp bracket, got: %q", string(data))
+	}
+}
+
+// TestHandleDiscordMessageReplySentToUserNeverContainsTimestampBracket
+// confirms the architecture directly: the reply sent back to the user is
+// always the model's own raw answer text, never routed through
+// formatChatTurnContent - the timestamp bracket only ever appears in
+// what's sent TO the model as input (and, since this task's own logf
+// change, in the log file), never in what's sent back to the user.
+func TestHandleDiscordMessageReplySentToUserNeverContainsTimestampBracket(t *testing.T) {
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("วันนี้เป็นวันจันทร์ครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	discordSrv, sent, _ := newMockDiscordRESTServer(t)
+	session := newTestDiscordSession(t, discordSrv, ollamaSrv, t.TempDir(), map[string]bool{"111": true})
+
+	session.handleDiscordMessage(&discordMessage{
+		ChannelID: "channel-1",
+		Author:    discordUser{ID: "111", Username: "somchai"},
+		Content:   "วันนี้วันอะไร",
+	})
+
+	if len(*sent) != 1 {
+		t.Fatalf("expected exactly one reply, got: %#v", *sent)
+	}
+	reply := (*sent)[0].Content
+	if strings.HasPrefix(reply, "[วัน") || strings.Contains(reply, "เวลา") && strings.Contains(reply, "น.]") {
+		t.Fatalf("expected the reply sent to the user to never contain the timestamp bracket format, got: %q", reply)
+	}
+	if reply != "วันนี้เป็นวันจันทร์ครับ" {
+		t.Fatalf("expected the reply to be exactly the model's own answer, unmodified, got: %q", reply)
+	}
+}
