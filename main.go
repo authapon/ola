@@ -8859,13 +8859,32 @@ type tgPhotoSize struct {
 	FileSize int64  `json:"file_size,omitempty"`
 }
 
+type tgDocument struct {
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name,omitempty"`
+	MimeType string `json:"mime_type,omitempty"`
+	FileSize int64  `json:"file_size,omitempty"`
+}
+
+// isPDF reports whether Telegram tagged this document as a PDF - checks
+// the reported MIME type first (what Telegram itself determined from the
+// upload), falling back to the filename's extension for the rare case a
+// client didn't set one.
+func (d tgDocument) isPDF() bool {
+	if d.MimeType == "application/pdf" {
+		return true
+	}
+	return strings.EqualFold(filepath.Ext(d.FileName), ".pdf")
+}
+
 type tgMessage struct {
 	MessageID      int64         `json:"message_id"`
 	From           tgUser        `json:"from"`
 	Chat           tgChat        `json:"chat"`
 	Text           string        `json:"text"`
-	Caption        string        `json:"caption,omitempty"` // Telegram puts a photo message's accompanying text here, not in Text
-	Photo          []tgPhotoSize `json:"photo,omitempty"`   // multiple resolutions of the same photo, smallest to largest - see largestPhoto
+	Caption        string        `json:"caption,omitempty"`  // Telegram puts a photo/document message's accompanying text here, not in Text
+	Photo          []tgPhotoSize `json:"photo,omitempty"`    // multiple resolutions of the same photo, smallest to largest - see largestPhoto
+	Document       *tgDocument   `json:"document,omitempty"` // any file attachment that isn't a photo/video/etc - PDFs arrive here, not in Photo
 	Date           int64         `json:"date"`
 	ReplyToMessage *tgMessage    `json:"reply_to_message,omitempty"`
 }
@@ -8962,12 +8981,16 @@ func tgGetFile(client *http.Client, apiBase, token, fileID string) (string, erro
 	return out.Result.FilePath, nil
 }
 
-// tgDownloadImage resolves fileID to a download URL then downloads it,
+// tgDownloadFile resolves fileID to a download URL then downloads it,
 // enforcing maxSize via io.LimitReader - reads at most maxSize+1 bytes so
 // a misreported or maliciously large file can't make this buffer an
 // unbounded amount of memory; hitting that extra byte is treated as "too
 // big" without ever having read the whole thing into memory first.
-func tgDownloadImage(client *http.Client, apiBase, token, fileID string, maxSize int64) ([]byte, error) {
+// Genuinely content-agnostic despite the name's history (originally
+// written for photos specifically) - used for both images and PDF
+// documents, since Telegram's own file-download mechanism doesn't
+// distinguish between them either.
+func tgDownloadFile(client *http.Client, apiBase, token, fileID string, maxSize int64) ([]byte, error) {
 	filePath, err := tgGetFile(client, apiBase, token, fileID)
 	if err != nil {
 		return nil, fmt.Errorf("หา path ไฟล์ไม่ได้: %v", err)
@@ -8978,14 +9001,14 @@ func tgDownloadImage(client *http.Client, apiBase, token, fileID string, maxSize
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("ดาวน์โหลดรูปภาพสถานะ %d", resp.StatusCode)
+		return nil, fmt.Errorf("ดาวน์โหลดไฟล์สถานะ %d", resp.StatusCode)
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxSize+1))
 	if err != nil {
-		return nil, fmt.Errorf("ดาวน์โหลดรูปภาพไม่สำเร็จ: %v", err)
+		return nil, fmt.Errorf("ดาวน์โหลดไฟล์ไม่สำเร็จ: %v", err)
 	}
 	if int64(len(data)) > maxSize {
-		return nil, fmt.Errorf("รูปภาพมีขนาดเกิน %s", formatByteSize(maxSize))
+		return nil, fmt.Errorf("ไฟล์มีขนาดเกิน %s", formatByteSize(maxSize))
 	}
 	return data, nil
 }
@@ -10036,9 +10059,11 @@ const builtinChatBotSystemPromptRules = `กติกาพื้นฐานท
 - ตอบเป็นข้อความแชทธรรมดา กระชับ อ่านง่ายบนมือถือ - ไม่ใช่รายงานยาวเป็นหน้าๆ เว้นแต่ผู้ใช้ขอรายละเอียดเจาะจง
 - ทุกคำตอบสุดท้ายต้องมีเนื้อความเสมอ ห้ามตอบข้อความว่างเปล่าเด็ดขาด ถ้าไม่แน่ใจว่าจะตอบอะไร ให้ถามกลับหรือบอกตรงๆ ว่าไม่มีข้อมูลพอ ดีกว่าปล่อยว่าง
 - คุณไม่มีเครื่องมือแก้ไฟล์ รันคำสั่ง หรือเข้าถึงระบบปฏิบัติการใดๆ ทั้งสิ้น เครื่องมือที่อาจมีให้ (ถ้าตั้งค่าไว้ - เช็คได้จาก tool list ที่แนบมากับ request นี้) มีแค่: search_knowledge/read_knowledge (ฐานความรู้ที่ผู้ดูแลกำหนดไว้ล่วงหน้า, read-only), web_search/web_fetch (ค้นอินเทอร์เน็ต, ถ้าเปิดใช้), get_current_time, delay
+- **ทุกข้อความในบทสนทนานี้ (ทั้งของผู้ใช้และของคุณเอง) จะขึ้นต้นด้วยวันเวลาจริงกำกับไว้เสมอ** เช่น "[วันอังคาร 16 ส.ค. 2569 เวลา 14:32 น.]" - ใช้ข้อมูลนี้ตอบคำถามเกี่ยวกับวันที่/เวลาปัจจุบันได้ทันทีโดยไม่ต้องเรียก get_current_time เลย (เอาจากข้อความล่าสุดที่ผู้ใช้เพิ่งส่งมา ไม่ใช่ข้อความเก่าในประวัติ) ยังคงเรียก get_current_time ได้ถ้าต้องการความละเอียดระดับวินาทีหรือเขตเวลาอื่น
 - ห้ามอ้างว่าคุณทำสิ่งที่ไม่มีเครื่องมือให้ทำจริง (เช่น "แก้ไฟล์ให้แล้ว", "รันคำสั่งให้แล้ว", "บันทึกลงระบบแล้ว") และห้ามอ้างว่า "ค้นแล้วไม่เจอ" ถ้าไม่ได้เรียก tool จริงๆ
 - บางครั้งผู้ใช้อาจส่งรูปภาพมาพร้อมข้อความ (หรือส่งแค่รูปภาพเฉยๆ) - ถ้าโมเดิลที่กำลังใช้งานอยู่รองรับการดูรูปภาพจริง (vision-capable) ให้ดูรูปนั้นแล้วตอบคำถาม/อธิบายตามที่เห็นจริงในรูปตามปกติ **แต่ถ้าไม่แน่ใจหรือดูรูปไม่ได้จริง (โมเดิลไม่รองรับ vision) ห้ามแต่งคำอธิบายรูปภาพขึ้นเองเด็ดขาด** ให้บอกตรงๆ ว่าไม่สามารถดูรูปภาพนี้ได้ ดีกว่าเดาหรือสมมติว่ารูปนั้นมีอะไรอยู่
 - ถ้ามี read_pic อยู่ใน tool list: บทสนทนาอาจมีข้อความเก่าที่ต่อท้ายด้วย tag แบบ "[แนบรูปภาพ: pics/...]" (รูปที่เคยถูกส่งมาก่อนหน้าและถูกบันทึกไว้ ไม่ว่าจะในเทิร์นนี้หรือหลายเทิร์น/หลายวันก่อนหน้าก็ตาม) **ถ้าคำถามปัจจุบันพูดถึงรูปภาพในลักษณะใดก็ตาม** (เช่น "รูปนี้", "รูปที่ส่งไป", "รูปก่อนหน้า", "ที่แนบมา" หรือถามเกี่ยวกับสิ่งที่อยู่ในรูปโดยไม่มีรูปแนบมาในข้อความปัจจุบันเอง) **ต้องเรียก read_pic ด้วย path จาก tag นั้นก่อนเสมอ แล้วค่อยตอบตามรูปที่เห็นจริงในผลลัพธ์ที่ได้กลับมา** ห้ามตอบจากความจำ/การเดา/รูปที่เคยเห็นในเทิร์นอื่นโดยไม่เรียก read_pic ก่อนเด็ดขาด แม้จะรู้สึกว่าจำรูปนั้นได้ก็ตาม - ถ้าหาไม่เจอ tag รูปภาพที่เกี่ยวข้องในบทสนทนาเลย ให้ถามกลับผู้ใช้ว่ารูปไหน ดีกว่าเดาว่าเป็นรูปอะไร
+- ถ้ามี read_saved_pdf อยู่ใน tool list: กติกาเดียวกับ read_pic ข้างต้นทุกประการ แต่สำหรับไฟล์ PDF - บทสนทนาอาจมี tag แบบ "[แนบไฟล์ PDF: pdfs/...]" ถ้าคำถามปัจจุบันพูดถึงไฟล์ PDF/เอกสารที่เคยส่งมาในลักษณะใดก็ตามแต่ไม่มีไฟล์แนบมาในข้อความปัจจุบันเอง **ต้องเรียก read_saved_pdf ด้วย path จาก tag นั้นก่อนเสมอ** ห้ามตอบจากความจำ/การเดาโดยไม่เรียก tool นี้ก่อนเด็ดขาดเช่นกัน
 - ถ้ามี search_knowledge อยู่ใน tool list: **ทุกคำถามที่ผู้ใช้ถาม** (ไม่ใช่แค่คำถามเกี่ยวกับชื่อคน/สถานที่/เหตุการณ์เฉพาะเจาะจงเหมือนก่อนหน้านี้) ให้เรียก search_knowledge ก่อนเสมอเพื่อดูว่าฐานความรู้มีคำตอบ/ข้อมูลที่เกี่ยวข้องอยู่หรือไม่ ก่อนจะตอบจากความรู้ทั่วไปของตัวเอง แม้จะเป็นคำถามที่ดูเหมือนความรู้ทั่วไปที่ตอบได้อยู่แล้วก็ตาม (ฐานความรู้อาจมีคำนิยาม/คำตอบเฉพาะที่ผู้ดูแลตั้งใจให้ใช้แทนความรู้ทั่วไป) ยกเว้นเฉพาะข้อความที่ไม่ใช่คำถามจริงๆ เช่น คำทักทาย/พูดคุยเล่นๆ ล้วนๆ ("สวัสดี", "ขอบคุณ", "555") ที่ไม่ต้องค้นก็ได้ (ลอง pattern "*" ถ้าไม่แน่ใจว่าไฟล์ชื่ออะไร) ห้ามตอบว่า "ไม่รู้จัก"/"ไม่มีข้อมูล" ทันทีโดยไม่ลองค้นก่อน - ถ้า query ที่ใช้ค้นไม่มีบรรทัดตรงกับคำนั้นเป๊ะๆ (คำในเอกสารมักเขียนต่างจากคำถามของผู้ใช้) แต่ระบบแนบเนื้อหาไฟล์ที่เกี่ยวข้องมาให้ ให้อ่านเนื้อหานั้นหาคำตอบเองก่อนเสมอ อย่าเพิ่งสรุปว่าไม่มีข้อมูลแค่เพราะบรรทัดไม่ตรงคำเป๊ะๆ - และให้ลอง search_knowledge ใหม่ทุกครั้งที่มีคำถามใหม่ แม้คำถามก่อนหน้าในแชทนี้จะค้นไม่เจอมาก่อนก็ตาม เพราะแต่ละคำถามอาจเชื่อมโยงกับข้อมูลคนละส่วนของฐานความรู้
 - ถ้าไม่มี web_search อยู่ใน tool list (ยังไม่ได้ตั้งค่า backend) และคำถามต้องการข้อมูลปัจจุบัน/เรียลไทม์ (เช่น ราคาสินค้า ข่าว สภาพอากาศ) ให้บอกตรงๆ ว่าคุณไม่มีเครื่องมือค้นอินเทอร์เน็ตในตอนนี้ อย่าแต่งคำตอบขึ้นเอง
 - ข้อความที่ขึ้นต้นด้วย "[สรุปบทสนทนาก่อนหน้านี้]" คือสรุปที่ระบบสร้างขึ้นเองจากบทสนทนาเก่าของแชทนี้ ใช้เป็นบริบทได้ตามปกติ แต่ไม่ใช่คำพูดที่ผู้ใช้เพิ่งพิมพ์
@@ -10105,18 +10130,53 @@ type chatTurn struct {
 	Time    time.Time `json:"time"`
 }
 
+// thaiWeekdayNames/thaiMonthAbbrev back formatThaiTimestamp - Go's
+// standard library has no Thai locale support built in, so these are
+// spelled out directly rather than reached for via a locale package.
+var thaiWeekdayNames = [...]string{"อาทิตย์", "จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์"}                                   // index matches time.Weekday (Sunday=0)
+var thaiMonthAbbrev = [...]string{"", "ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."} // index matches time.Month (Jan=1) - index 0 unused, keeps the numbering direct instead of off-by-one
+
+// formatThaiTimestamp renders a timestamp the way a Thai reader expects -
+// วันอังคาร (day name) + วันที่/เดือนย่อ/ปี พ.ศ. (Buddhist Era = Gregorian
+// + 543) + เวลา 24 ชม. Deliberately spelled out in full Thai rather than
+// a compact ISO-style stamp - chosen specifically because every reader of
+// this text (both the end users in chat and the model itself) is Thai
+// and the surrounding conversation is entirely in Thai; a foreign-format
+// timestamp would read as an odd, jarring insert against that.
+func formatThaiTimestamp(t time.Time) string {
+	beYear := t.Year() + 543
+	return fmt.Sprintf("วัน%s %d %s %d เวลา %02d:%02d น.",
+		thaiWeekdayNames[t.Weekday()], t.Day(), thaiMonthAbbrev[t.Month()], beYear, t.Hour(), t.Minute())
+}
+
 // formatChatTurnContent is the one place that decides how a turn's
-// speaker attribution (if any) gets woven into the text the model
-// actually sees, so buildMessages (replaying history) and
-// chatBotCore.recordAndRespond (the newly-arriving turn) never drift out
-// of sync on the format. A DM turn (speaker == "") passes through
-// unchanged - there's only ever one human in a DM, so a name adds
-// nothing and would just be noise.
-func formatChatTurnContent(speaker, content string) string {
-	if speaker == "" {
-		return content
+// timestamp and speaker attribution (if any) get woven into the text the
+// model actually sees, so buildMessages (replaying history) and
+// chatBotCore.recordAndRespond/webBotSession.chatHandler (the
+// newly-arriving turn) never drift out of sync on the format.
+//
+// The timestamp is unconditional - present on every turn, DM or group,
+// user or assistant - specifically so the model always knows "when" a
+// message was sent without ever needing to call get_current_time for
+// that alone (get_current_time still exists and is still useful for
+// anything needing second-level precision or a different timezone; this
+// solves the much more common "what's today's date/what time is it"
+// case a model can otherwise only guess at or refuse to answer,
+// confirmed directly by real reports of the model not reliably calling
+// that tool on its own). Computed fresh from each turn's own stored Time
+// field at message-build time, not baked into chatTurn.Content itself -
+// the persisted JSON stays clean, and a turn replayed weeks later still
+// shows the timestamp it actually happened at, not today's.
+//
+// A DM turn (speaker == "") skips the speaker bracket only - there's
+// only ever one human in a DM, so a name adds nothing there, but the
+// timestamp still matters just as much as it does in a group.
+func formatChatTurnContent(speaker string, t time.Time, content string) string {
+	prefix := "[" + formatThaiTimestamp(t) + "]"
+	if speaker != "" {
+		prefix += " [" + speaker + "]"
 	}
-	return "[" + speaker + "] " + content
+	return prefix + " " + content
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -10163,6 +10223,56 @@ func savePicture(contextDir, chatKey string, data []byte) (string, error) {
 		return "", fmt.Errorf("บันทึกรูปภาพไม่ได้: %v", err)
 	}
 	return filepath.ToSlash(filepath.Join("pics", chatKey, filename)), nil
+}
+
+// savePDFFile mirrors savePicture exactly (per-chat isolated subfolder,
+// content-hashed filename so re-saving identical bytes doesn't
+// accumulate duplicates) but writes the ORIGINAL PDF itself under
+// pdfs/<chatKey>/, not the rasterized page images convertPDFToImages
+// produces from it. Storing the source PDF once and re-converting fresh
+// on each read_saved_pdf call (see that function) is deliberately
+// cheaper on disk than keeping every page's rendered image around
+// forever for a document that might never be looked at again.
+func savePDFFile(contextDir, chatKey string, data []byte) (string, error) {
+	dir := filepath.Join(contextDir, "pdfs", chatKey)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("สร้างโฟลเดอร์ pdfs ไม่ได้: %v", err)
+	}
+	sum := sha256.Sum256(data)
+	hashPart := hex.EncodeToString(sum[:4])
+	filename := fmt.Sprintf("%s_%s.pdf", time.Now().Format("20060102-150405"), hashPart)
+	full := filepath.Join(dir, filename)
+	if err := os.WriteFile(full, data, 0o644); err != nil {
+		return "", fmt.Errorf("บันทึกไฟล์ PDF ไม่ได้: %v", err)
+	}
+	return filepath.ToSlash(filepath.Join("pdfs", chatKey, filename)), nil
+}
+
+// convertDownloadedPDFBytes writes freshly-downloaded PDF bytes to a
+// scratch temp file, converts it to page images via convertPDFToImages
+// (which needs a real file path on disk, not raw bytes - the same
+// requirement ask/coding's own [files...] upfront-attachment path and
+// read_pdf both already work around this same way), and always cleans
+// the temp file up before returning. Used when a PDF arrives over the
+// network and needs converting for IMMEDIATE analysis without having
+// been saved anywhere durable - when --save-images is on, callers prefer
+// converting directly from the already-saved pdfs/ path instead (no
+// separate temp file needed at all in that case).
+func convertDownloadedPDFBytes(data []byte, maxPages, dpi int) (pages []string, truncated bool, err error) {
+	tmpFile, err := os.CreateTemp("", "ola-chatbot-pdf-*.pdf")
+	if err != nil {
+		return nil, false, fmt.Errorf("สร้างไฟล์ PDF ชั่วคราวไม่ได้: %v", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		return nil, false, fmt.Errorf("เขียนไฟล์ PDF ชั่วคราวไม่ได้: %v", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return nil, false, fmt.Errorf("ปิดไฟล์ PDF ชั่วคราวไม่ได้: %v", err)
+	}
+	return convertPDFToImages(tmpPath, maxPages, dpi)
 }
 
 // appendChatBotTag appends a bracketed note (e.g. "[ส่งรูปภาพ]" or the
@@ -10316,6 +10426,111 @@ var readPicTool = ollamaTool{
 	},
 }
 
+// readSavedPDFResult/lastReadSavedPDF/setLastReadSavedPDFResult/
+// popLastReadSavedPDF/readSavedPDFFollowUpMessage mirror readPicResult's
+// own exact pattern (see that section's own doc comment for the full
+// "why" - identical reasoning applies: images/PDF pages can only reach a
+// model reliably attached to a plain role:"user" message, never a
+// tool-result message itself). The one real difference is plural: a
+// saved PDF re-converts to potentially many page images per call, not
+// the single image read_pic always deals with.
+type readSavedPDFResult struct {
+	Path   string
+	Images []string // one base64 PNG per rendered page, in page order
+}
+
+var (
+	lastReadSavedPDFMu     sync.Mutex
+	lastReadSavedPDFResult *readSavedPDFResult
+)
+
+func setLastReadSavedPDFResult(r readSavedPDFResult) {
+	lastReadSavedPDFMu.Lock()
+	lastReadSavedPDFResult = &r
+	lastReadSavedPDFMu.Unlock()
+}
+
+func popLastReadSavedPDF() *readSavedPDFResult {
+	lastReadSavedPDFMu.Lock()
+	defer lastReadSavedPDFMu.Unlock()
+	r := lastReadSavedPDFResult
+	lastReadSavedPDFResult = nil
+	return r
+}
+
+// toolReadSavedPDF implements "read_saved_pdf": load a previously-saved
+// PDF (see savePDFFile) back into the conversation by re-converting it to
+// page images fresh (via convertPDFToImages, the same conversion
+// ask/coding's own read_pdf and the [files...] upfront-attachment path
+// both already use) rather than keeping rendered pages around from when
+// it was first saved - see savePDFFile's own doc comment on why that
+// tradeoff was chosen. Sandboxed to pdfs/ specifically, mirroring
+// toolReadPic's own sandboxedPathIn + explicit-prefix-check pattern (see
+// that function's doc comment) so this can't be used to reach anything
+// else under contextDir.
+func toolReadSavedPDF(args map[string]interface{}, contextDir string, maxPages, dpi int) (string, error) {
+	path, _ := args["path"].(string)
+	if path == "" {
+		return "", fmt.Errorf("ต้องระบุ path")
+	}
+	full, err := sandboxedPathIn(contextDir, path)
+	if err != nil {
+		return "", err
+	}
+	pdfsRoot := filepath.Clean(filepath.Join(contextDir, "pdfs"))
+	if full != pdfsRoot && !strings.HasPrefix(full, pdfsRoot+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path ต้องอยู่ใน pdfs/ เท่านั้น: %s", path)
+	}
+	pages, truncated, err := convertPDFToImages(full, maxPages, dpi)
+	if err != nil {
+		return "", fmt.Errorf("แปลง PDF ไม่สำเร็จ: %v", err)
+	}
+	setLastReadSavedPDFResult(readSavedPDFResult{Path: path, Images: pages})
+	msg := fmt.Sprintf("อ่านไฟล์ PDF %s สำเร็จ (%d หน้า) - หน้าเหล่านี้จะถูกแนบมาในข้อความถัดไป", path, len(pages))
+	if truncated {
+		msg += fmt.Sprintf(" (แปลงเฉพาะ %d หน้าแรก จำกัดด้วย --pdf-max-pages - เอกสารอาจมีหน้าเพิ่มเติมที่ไม่ได้แนบ)", maxPages)
+	}
+	return msg, nil
+}
+
+// readSavedPDFFollowUpMessage mirrors readPicFollowUpMessage's own exact
+// shape and reasoning (see that function's doc comment), attaching
+// however many page images the PDF converted to in one message.
+func readSavedPDFFollowUpMessage(toolName, result string) (msg ollamaMessage, ok bool) {
+	if toolName != "read_saved_pdf" || strings.HasPrefix(result, "ERROR:") {
+		return ollamaMessage{}, false
+	}
+	r := popLastReadSavedPDF()
+	if r == nil || len(r.Images) == 0 {
+		return ollamaMessage{}, false
+	}
+	note := fmt.Sprintf(
+		"นี่คือหน้าจริงจากไฟล์ PDF %s ที่คุณเพิ่งเรียก read_saved_pdf มาดูตามที่ผู้ใช้ถามถึง "+
+			"กรุณาดูเนื้อหาในหน้าเหล่านี้อย่างละเอียดอีกครั้งแล้วตอบคำถามของผู้ใช้โดยอ้างอิงเฉพาะสิ่งที่เห็นจริงในหน้าที่แนบมานี้เท่านั้น "+
+			"ห้ามเดาหรือแต่งรายละเอียดขึ้นเองเด็ดขาด แม้จะเคยเห็นหรือพูดถึงไฟล์นี้มาก่อนในบทสนทนาก็ตาม ให้ยึดตามหน้าที่แนบมาจริงตอนนี้เป็นหลัก",
+		r.Path,
+	)
+	return ollamaMessage{Role: "user", Content: note, Images: r.Images}, true
+}
+
+var readSavedPDFTool = ollamaTool{
+	Type: "function",
+	Function: ollamaToolFunction{
+		Name:        "read_saved_pdf",
+		Description: "ดูไฟล์ PDF เก่าที่เคยถูกแนบไว้ในบทสนทนานี้ก่อนหน้า อีกครั้ง (แปลงแต่ละหน้าเป็นภาพใหม่ให้ดู) - path ต้องเป็นค่าที่ปรากฏใน context เดิม (ขึ้นต้นด้วย \"pdfs/\") ต้องเรียกก่อนเสมอเมื่อคำถามพูดถึงไฟล์ PDF ที่ไม่ได้แนบมาในข้อความปัจจุบัน ห้ามตอบจากความจำ/การเดาโดยไม่เรียก tool นี้ก่อน",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"path": map[string]interface{}{
+					"type":        "string",
+					"description": "path ของไฟล์ PDF ตามที่ปรากฏใน context เช่น \"pdfs/group_-999/20260814-143022_a1b2c3d4.pdf\"",
+				},
+			},
+			"required": []string{"path"},
+		},
+	},
+}
+
 type chatContext struct {
 	Key         string     `json:"key"`
 	Summary     string     `json:"summary,omitempty"`
@@ -10404,7 +10619,7 @@ func (c *chatContext) buildMessages(systemPrompt string) []ollamaMessage {
 		msgs = append(msgs, ollamaMessage{Role: "system", Content: "[สรุปบทสนทนาก่อนหน้านี้]\n" + c.Summary})
 	}
 	for _, t := range c.Turns {
-		msgs = append(msgs, ollamaMessage{Role: t.Role, Content: formatChatTurnContent(t.Speaker, t.Content)})
+		msgs = append(msgs, ollamaMessage{Role: t.Role, Content: formatChatTurnContent(t.Speaker, t.Time, t.Content)})
 	}
 	return msgs
 }
@@ -10653,6 +10868,33 @@ func resolveMaxImageSize(flagVal string) (int64, error) {
 	return size, nil
 }
 
+// defaultMaxPDFSize is deliberately much larger than defaultMaxImageSize -
+// a multi-page PDF (especially scanned pages, which is exactly the case
+// convertPDFToImages exists to handle) routinely runs several times
+// bigger than a single photo, so reusing the same limit for both would
+// mean either photos get an unreasonably generous cap or PDFs get
+// rejected far too eagerly. Kept as its own flag/constant rather than
+// scaling off maxImageSize so each can be tuned independently.
+const defaultMaxPDFSize = 20 * 1024 * 1024 // 20 MiB
+
+func resolveMaxPDFSize(flagVal string) (int64, error) {
+	raw := flagVal
+	if raw == "" {
+		raw = os.Getenv("OLA_MAX_PDF_SIZE")
+	}
+	if raw == "" {
+		return defaultMaxPDFSize, nil
+	}
+	size, err := parseByteSize(raw)
+	if err != nil {
+		return 0, fmt.Errorf("--max-pdf-size/OLA_MAX_PDF_SIZE ไม่ถูกต้อง: %v", err)
+	}
+	if size <= 0 {
+		return 0, fmt.Errorf("--max-pdf-size/OLA_MAX_PDF_SIZE ต้องมากกว่า 0 (got: %s)", flagVal)
+	}
+	return size, nil
+}
+
 // formatByteSize renders a byte count back the other direction, for
 // error messages shown to whoever sent an oversized image - picks
 // whichever unit keeps the number readable rather than always using the
@@ -10685,7 +10927,10 @@ type chatBotCore struct {
 	keepRecent       int
 	compactAfter     int
 	maxImageSize     int64 // bytes - see parseByteSize/--max-image-size; enforced by each platform's own image-download code before an image ever reaches the model
-	saveImages       bool  // --save-images/OLA_SAVE_IMAGES - see savePicture's own doc comment
+	saveImages       bool  // --save-images/OLA_SAVE_IMAGES - see savePicture's own doc comment (also gates saving PDFs to pdfs/ - see savePDFFile)
+	maxPDFSize       int64 // bytes - see parseByteSize/--max-pdf-size; separate limit from maxImageSize since PDFs run much bigger
+	pdfMaxPages      int   // --pdf-max-pages/OLA_PDF_MAX_PAGES - same flag/env ask/coding's own read_pdf already uses
+	pdfDPI           int   // --pdf-dpi/OLA_PDF_DPI - ditto
 	ntfyTopic        string
 	outFile          *os.File
 
@@ -10747,59 +10992,81 @@ const chatBotNoTextWithImagePrompt = "(ผู้ใช้ส่งรูปภ�
 // picture path(s) can be recovered from its plain-text content later.
 var picRefTagPattern = regexp.MustCompile(`\[แนบรูปภาพ: ([^\]]+)\]`)
 
-// picRefsInTurnText extracts pics/... paths from a "[แนบรูปภาพ: ...]" tag
-// if the given turn text contains one, or nil if it doesn't.
-func picRefsInTurnText(content string) []string {
-	m := picRefTagPattern.FindStringSubmatch(content)
+// pdfRefTagPattern is picRefTagPattern's own counterpart for
+// "[แนบไฟล์ PDF: pdfs/a.pdf]" tags.
+var pdfRefTagPattern = regexp.MustCompile(`\[แนบไฟล์ PDF: ([^\]]+)\]`)
+
+// extractRefsWithPrefix pulls the comma-separated path list out of
+// whichever tag pattern matches content, keeping only entries that
+// actually start with the expected prefix (pics/ or pdfs/) - shared by
+// picRefsInTurnText/pdfRefsInTurnText below.
+func extractRefsWithPrefix(pattern *regexp.Regexp, content, prefix string) []string {
+	m := pattern.FindStringSubmatch(content)
 	if m == nil {
 		return nil
 	}
 	var refs []string
 	for _, p := range strings.Split(m[1], ", ") {
 		p = strings.TrimSpace(p)
-		if strings.HasPrefix(p, "pics/") {
+		if strings.HasPrefix(p, prefix) {
 			refs = append(refs, p)
 		}
 	}
 	return refs
 }
 
-// autoAttachPriorPicture loads whatever picture(s) the IMMEDIATELY
-// PRECEDING turn referenced (via its own "[แนบรูปภาพ: ...]" tag, if any)
-// as base64, so they can be attached to the current round's outgoing
-// message automatically when this round carries no image of its own.
+// picRefsInTurnText extracts pics/... paths from a "[แนบรูปภาพ: ...]" tag
+// if the given turn text contains one, or nil if it doesn't.
+func picRefsInTurnText(content string) []string {
+	return extractRefsWithPrefix(picRefTagPattern, content, "pics/")
+}
+
+// pdfRefsInTurnText extracts pdfs/... paths from a "[แนบไฟล์ PDF: ...]"
+// tag if the given turn text contains one, or nil if it doesn't.
+func pdfRefsInTurnText(content string) []string {
+	return extractRefsWithPrefix(pdfRefTagPattern, content, "pdfs/")
+}
+
+// autoAttachPriorMedia loads whatever picture(s) and/or PDF page(s) the
+// IMMEDIATELY PRECEDING turn referenced (via its own "[แนบรูปภาพ: ...]"
+// and/or "[แนบไฟล์ PDF: ...]" tags, if any) as base64 images, so they can
+// be attached to the current round's outgoing message automatically when
+// this round carries no image/PDF of its own. PDFs are re-converted to
+// page images fresh via convertPDFToImages (same conversion
+// read_saved_pdf itself uses), not read as raw bytes.
 //
 // This exists specifically because relying on the model to decide "I
-// should call read_pic here" turned out to be unreliable in real use for
-// exactly the most common case it matters for: a picture posted with no
-// caption, immediately followed by a short addressed question like
-// "รูปอะไรอ่ะ" ("what's this?"). Live testing (confirmed via the bot's own
-// log - no read_pic tool_call line at all, just a single-round answer)
-// showed a model can skip the tool entirely and answer with a fully
-// fabricated, unrelated description despite an explicit system-prompt
-// rule telling it to call read_pic first. Making this one specific,
-// narrow case deterministic - code decides, not model judgment - removes
-// that failure mode where it matters most, while read_pic itself stays
-// available (and still instructed) for anything further back in history
-// that this narrower heuristic doesn't reach.
+// should call read_pic/read_saved_pdf here" turned out to be unreliable
+// in real use for exactly the most common case it matters for: a picture
+// posted with no caption, immediately followed by a short addressed
+// question like "รูปอะไรอ่ะ" ("what's this?"). Live testing (confirmed via
+// the bot's own log - no read_pic tool_call line at all, just a
+// single-round answer) showed a model can skip the tool entirely and
+// answer with a fully fabricated, unrelated description despite an
+// explicit system-prompt rule telling it to call the tool first. Making
+// this one specific, narrow case deterministic - code decides, not model
+// judgment - removes that failure mode where it matters most, while
+// read_pic/read_saved_pdf themselves stay available (and still
+// instructed) for anything further back in history that this narrower
+// heuristic doesn't reach.
 //
 // Deliberately scoped to ONLY the single immediately-preceding turn, not
 // a broader scan - matches the exact reported real-world pattern without
-// risking pulling in an unrelated older picture reference. If the
-// preceding turn is the bot's own reply (no picture tag, since only user
-// turns ever get one) or has no picture tag for any other reason, this
-// simply returns nothing and normal read_pic-based behavior still
-// applies.
-func (c *chatBotCore) autoAttachPriorPicture(turns []chatTurn) []string {
+// risking pulling in an unrelated older reference. If the preceding turn
+// is the bot's own reply (no tag, since only user turns ever get one) or
+// has no picture/PDF tag for any other reason, this simply returns
+// nothing and normal read_pic/read_saved_pdf-based behavior still
+// applies. A PDF conversion failure (e.g. the saved file went missing)
+// is silently skipped here too, same as a missing/unreadable picture -
+// this is a best-effort convenience, not something that should ever
+// itself cause the round to fail.
+func (c *chatBotCore) autoAttachPriorMedia(turns []chatTurn) []string {
 	if len(turns) == 0 {
 		return nil
 	}
-	refs := picRefsInTurnText(turns[len(turns)-1].Content)
-	if len(refs) == 0 {
-		return nil
-	}
+	content := turns[len(turns)-1].Content
 	var images []string
-	for _, ref := range refs {
+	for _, ref := range picRefsInTurnText(content) {
 		full, err := sandboxedPathIn(c.contextDir, ref)
 		if err != nil {
 			continue
@@ -10809,6 +11076,17 @@ func (c *chatBotCore) autoAttachPriorPicture(turns []chatTurn) []string {
 			continue
 		}
 		images = append(images, base64.StdEncoding.EncodeToString(data))
+	}
+	for _, ref := range pdfRefsInTurnText(content) {
+		full, err := sandboxedPathIn(c.contextDir, ref)
+		if err != nil {
+			continue
+		}
+		pages, _, err := convertPDFToImages(full, c.pdfMaxPages, c.pdfDPI)
+		if err != nil {
+			continue
+		}
+		images = append(images, pages...)
 	}
 	return images
 }
@@ -10826,17 +11104,28 @@ func (c *chatBotCore) autoAttachPriorPicture(turns []chatTurn) []string {
 // off or a particular image wasn't saved - the generic count-based tag
 // is used as a fallback for anything not covered by imageRefs.
 //
+// pdfRefs works the same way as imageRefs but for savePDFFile's own
+// return paths (e.g. "pdfs/group_-999/xxx.pdf") - stored as its own
+// separate "[แนบไฟล์ PDF: ...]" tag line (a message can in principle carry
+// both a picture and a PDF at once, e.g. a Discord message with two
+// different attachments, so the two tag kinds are independent rather
+// than one replacing the other). A PDF's own rendered PAGE images
+// (produced by convertPDFToImages before this function is ever called)
+// belong in the images parameter alongside anything else attached this
+// round - pdfRefs only carries the path back to the ORIGINAL PDF file for
+// later read_saved_pdf calls, never page image data itself.
+//
 // Callers are responsible for downloading/validating (size, format) the
-// image bytes themselves - see each platform's own image-handling code -
-// this function only attaches whatever base64 strings it's given and
-// tags the stored turn with whatever refs it's given.
+// image/PDF bytes themselves - see each platform's own attachment-
+// handling code - this function only attaches whatever base64 strings
+// it's given and tags the stored turn with whatever refs it's given.
 //
 // Callers own everything platform-specific: deriving speaker (a display
 // name, or "" for DMs), deciding addressed (mention/reply/prefix
 // detection), and actually sending the returned answer back out - this
 // function never touches the network for the reply itself, only for the
 // model call inside runChatToolLoop.
-func (c *chatBotCore) recordAndRespond(key, speaker, text string, addressed bool, images []string, imageRefs []string) (answer string, err error) {
+func (c *chatBotCore) recordAndRespond(key, speaker, text string, addressed bool, images []string, imageRefs []string, pdfRefs []string) (answer string, err error) {
 	cctx, err := loadChatContext(c.contextDir, key)
 	if err != nil {
 		return "", fmt.Errorf("โหลด context ไม่ได้: %v", err)
@@ -10855,7 +11144,9 @@ func (c *chatBotCore) recordAndRespond(key, speaker, text string, addressed bool
 	// stays empty in that case while imageRefs alone carries the saved
 	// path. Both paths need the same "[แนบรูปภาพ: ...]" tag in the stored
 	// turn so a LATER, addressed turn can see the path in its own context
-	// history and call read_pic on it.
+	// history and call read_pic on it. pdfRefs gets its own separate tag
+	// line for the same reason, independent of whether an image tag is
+	// also present (see this function's own doc comment above).
 	if len(images) > 0 || len(imageRefs) > 0 {
 		var tag string
 		if len(imageRefs) > 0 {
@@ -10863,11 +11154,10 @@ func (c *chatBotCore) recordAndRespond(key, speaker, text string, addressed bool
 		} else {
 			tag = fmt.Sprintf("[แนบรูปภาพ %d รูป]", len(images))
 		}
-		if storedText == "" {
-			storedText = tag
-		} else {
-			storedText = storedText + "\n" + tag
-		}
+		storedText = appendChatBotTag(storedText, tag)
+	}
+	if len(pdfRefs) > 0 {
+		storedText = appendChatBotTag(storedText, fmt.Sprintf("[แนบไฟล์ PDF: %s]", strings.Join(pdfRefs, ", ")))
 	}
 	userTurn := chatTurn{Role: "user", Speaker: speaker, Content: storedText, Time: time.Now()}
 
@@ -10883,15 +11173,15 @@ func (c *chatBotCore) recordAndRespond(key, speaker, text string, addressed bool
 	messages := cctx.buildMessages(c.systemPrompt)
 	autoAttachNote := ""
 	if len(images) == 0 {
-		// No image attached to THIS round - check whether the turn right
-		// before it was a bare (or captioned) picture that never got
-		// analyzed (see autoAttachPriorPicture's own doc comment on why
-		// this exists as a deterministic fallback rather than relying on
-		// the model to call read_pic itself).
-		if autoImages := c.autoAttachPriorPicture(cctx.Turns); len(autoImages) > 0 {
+		// No image/PDF attached to THIS round - check whether the turn
+		// right before it was a bare (or captioned) picture/PDF that
+		// never got analyzed (see autoAttachPriorMedia's own doc comment
+		// on why this exists as a deterministic fallback rather than
+		// relying on the model to call read_pic/read_saved_pdf itself).
+		if autoImages := c.autoAttachPriorMedia(cctx.Turns); len(autoImages) > 0 {
 			images = autoImages
-			autoAttachNote = "(ระบบ: แนบรูปจากข้อความก่อนหน้านี้ในแชทให้อัตโนมัติ เนื่องจากคำถามนี้อาจเกี่ยวกับรูปนั้น กรุณาดูรูปนี้อย่างละเอียดแล้วตอบตามสิ่งที่เห็นจริงในรูปนี้เท่านั้น ห้ามเดาหรือแต่งคำตอบขึ้นเอง)"
-			c.logf("[chatbot_auto_pic] แนบรูปจากเทิร์นก่อนหน้าอัตโนมัติ (%d รูป) ให้กับคำถามนี้\n", len(images))
+			autoAttachNote = "(ระบบ: แนบรูป/ไฟล์จากข้อความก่อนหน้านี้ในแชทให้อัตโนมัติ เนื่องจากคำถามนี้อาจเกี่ยวข้อง กรุณาดูเนื้อหาที่แนบมานี้อย่างละเอียดแล้วตอบตามสิ่งที่เห็นจริงเท่านั้น ห้ามเดาหรือแต่งคำตอบขึ้นเอง)"
+			c.logf("[chatbot_auto_media] แนบรูป/หน้า PDF จากเทิร์นก่อนหน้าอัตโนมัติ (%d รูป) ให้กับคำถามนี้\n", len(images))
 		}
 	}
 	outgoingText := text
@@ -10901,7 +11191,7 @@ func (c *chatBotCore) recordAndRespond(key, speaker, text string, addressed bool
 	if autoAttachNote != "" {
 		outgoingText = appendChatBotTag(outgoingText, autoAttachNote)
 	}
-	messages = append(messages, ollamaMessage{Role: "user", Content: formatChatTurnContent(speaker, outgoingText), Images: images})
+	messages = append(messages, ollamaMessage{Role: "user", Content: formatChatTurnContent(speaker, userTurn.Time, outgoingText), Images: images})
 
 	answer, err = c.runChatToolLoop(messages)
 	if err != nil {
@@ -11108,6 +11398,12 @@ func (c *chatBotCore) runChatToolLoop(messages []ollamaMessage) (string, error) 
 			}
 			r, e := toolReadPic(args, c.contextDir)
 			return r, e, true
+		case "read_saved_pdf":
+			if !c.saveImages {
+				return "", nil, false
+			}
+			r, e := toolReadSavedPDF(args, c.contextDir, c.pdfMaxPages, c.pdfDPI)
+			return r, e, true
 		default:
 			return "", nil, false
 		}
@@ -11178,6 +11474,10 @@ func (c *chatBotCore) runChatToolLoop(messages []ollamaMessage) (string, error) 
 			if followUp, ok := readPicFollowUpMessage(tc.Function.Name, result); ok {
 				messages = append(messages, followUp)
 				fmt.Fprintf(c.outFile, "[tool_call] read_pic follow-up: image attached as a user message\n")
+			}
+			if followUp, ok := readSavedPDFFollowUpMessage(tc.Function.Name, result); ok {
+				messages = append(messages, followUp)
+				fmt.Fprintf(c.outFile, "[tool_call] read_saved_pdf follow-up: %d page image(s) attached as a user message\n", len(followUp.Images))
 			}
 		}
 	}
@@ -11252,12 +11552,13 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 	chat := msg.Chat
 	from := msg.From
 	photo, hasPhoto := largestPhoto(msg.Photo)
+	hasDocument := msg.Document != nil && msg.Document.isPDF()
 	rawText := strings.TrimSpace(msg.Text)
-	if hasPhoto {
-		rawText = strings.TrimSpace(msg.Caption) // a photo message carries its accompanying text in Caption, not Text
+	if hasPhoto || hasDocument {
+		rawText = strings.TrimSpace(msg.Caption) // a photo/document message carries its accompanying text in Caption, not Text
 	}
-	if rawText == "" && !hasPhoto {
-		return // no tool here can act on stickers/voice/etc. with no text and no photo - nothing to record or act on
+	if rawText == "" && !hasPhoto && !hasDocument {
+		return // no tool here can act on stickers/voice/non-PDF documents/etc. with no text either - nothing to record or act on
 	}
 
 	isGroup := chat.Type != "private"
@@ -11267,7 +11568,7 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 		addressed = telegramMessageAddressesBot(msg, s.botUsername)
 		if addressed {
 			text = stripBotMention(rawText, s.botUsername)
-			if text == "" && !hasPhoto {
+			if text == "" && !hasPhoto && !hasDocument {
 				return // e.g. a message that's *just* the mention with nothing else - nothing to say or record
 			}
 		}
@@ -11342,6 +11643,7 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 	// undownloaded as before, just noted with a bare placeholder.
 	var images []string
 	var imageRefs []string
+	var pdfRefs []string
 	switch {
 	case hasPhoto && addressed:
 		if photo.FileSize > 0 && photo.FileSize > s.maxImageSize {
@@ -11349,10 +11651,10 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 				fmt.Sprintf("รูปภาพมีขนาด %s เกินขีดจำกัด %s (--max-image-size)", formatByteSize(photo.FileSize), formatByteSize(s.maxImageSize)))
 			return
 		}
-		data, err := tgDownloadImage(s.client, s.apiBase, s.token, photo.FileID, s.maxImageSize)
+		data, err := tgDownloadFile(s.client, s.apiBase, s.token, photo.FileID, s.maxImageSize)
 		if err != nil {
 			s.logf("[telegram_error] ดาวน์โหลดรูปภาพไม่ได้: %v\n", err)
-			_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID, fmt.Sprintf("ขออภัย ดาวน์โหลดรูปภาพไม่สำเร็จ: %v", err))
+			_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID, fmt.Sprintf("ขออภัย ดาวน์โหลดไฟล์ไม่สำเร็จ: %v", err))
 			return
 		}
 		images = []string{base64.StdEncoding.EncodeToString(data)}
@@ -11371,7 +11673,7 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 			text = appendChatBotTag(text, "[ส่งรูปภาพ - ขนาดเกินจำกัด ไม่ได้บันทึก]")
 			break
 		}
-		data, err := tgDownloadImage(s.client, s.apiBase, s.token, photo.FileID, s.maxImageSize)
+		data, err := tgDownloadFile(s.client, s.apiBase, s.token, photo.FileID, s.maxImageSize)
 		if err != nil {
 			s.logf("[telegram_error] ดาวน์โหลดรูปภาพ (unaddressed) ไม่ได้: %v\n", err)
 			text = appendChatBotTag(text, "[ส่งรูปภาพ]")
@@ -11388,13 +11690,79 @@ func (s *telegramSession) handleTelegramMessage(msg *tgMessage) {
 		text = appendChatBotTag(text, "[ส่งรูปภาพ]")
 	}
 
+	// PDF handling mirrors the photo handling above exactly (same
+	// addressed/unaddressed-but-saved/neither three-way split, same
+	// size-limit-before-download pre-flight using Telegram's own reported
+	// FileSize) - the only real difference is converting to page images
+	// via convertDownloadedPDFBytes/convertPDFToImages instead of
+	// attaching the raw bytes directly, since a PDF isn't already an
+	// image the way a photo is.
+	switch {
+	case hasDocument && addressed:
+		doc := *msg.Document
+		if doc.FileSize > 0 && doc.FileSize > s.maxPDFSize {
+			_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID,
+				fmt.Sprintf("ไฟล์ PDF มีขนาด %s เกินขีดจำกัด %s (--max-pdf-size)", formatByteSize(doc.FileSize), formatByteSize(s.maxPDFSize)))
+			return
+		}
+		data, err := tgDownloadFile(s.client, s.apiBase, s.token, doc.FileID, s.maxPDFSize)
+		if err != nil {
+			s.logf("[telegram_error] ดาวน์โหลดไฟล์ PDF ไม่ได้: %v\n", err)
+			_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID, fmt.Sprintf("ขออภัย ดาวน์โหลดไฟล์ PDF ไม่สำเร็จ: %v", err))
+			return
+		}
+		var savedPath string
+		if s.saveImages {
+			if ref, err := savePDFFile(s.contextDir, key, data); err != nil {
+				s.logf("[telegram_error] บันทึกไฟล์ PDF ไม่ได้: %v\n", err)
+			} else {
+				pdfRefs = []string{ref}
+				savedPath = filepath.Join(s.contextDir, filepath.FromSlash(ref))
+			}
+		}
+		var pages []string
+		var convErr error
+		if savedPath != "" {
+			pages, _, convErr = convertPDFToImages(savedPath, s.pdfMaxPages, s.pdfDPI)
+		} else {
+			pages, _, convErr = convertDownloadedPDFBytes(data, s.pdfMaxPages, s.pdfDPI)
+		}
+		if convErr != nil {
+			s.logf("[telegram_error] แปลง PDF ไม่สำเร็จ: %v\n", convErr)
+			_ = tgSendMessage(s.telegramClient, s.apiBase, s.token, chat.ID, fmt.Sprintf("ขออภัย แปลงไฟล์ PDF ไม่สำเร็จ: %v", convErr))
+			return
+		}
+		images = append(images, pages...)
+	case hasDocument && s.saveImages:
+		doc := *msg.Document
+		if doc.FileSize > 0 && doc.FileSize > s.maxPDFSize {
+			text = appendChatBotTag(text, "[ส่งไฟล์ PDF - ขนาดเกินจำกัด ไม่ได้บันทึก]")
+			break
+		}
+		data, err := tgDownloadFile(s.client, s.apiBase, s.token, doc.FileID, s.maxPDFSize)
+		if err != nil {
+			s.logf("[telegram_error] ดาวน์โหลดไฟล์ PDF (unaddressed) ไม่ได้: %v\n", err)
+			text = appendChatBotTag(text, "[ส่งไฟล์ PDF]")
+			break
+		}
+		ref, err := savePDFFile(s.contextDir, key, data)
+		if err != nil {
+			s.logf("[telegram_error] บันทึกไฟล์ PDF ไม่ได้: %v\n", err)
+			text = appendChatBotTag(text, "[ส่งไฟล์ PDF]")
+			break
+		}
+		pdfRefs = []string{ref} // recordAndRespond builds the path-bearing tag from this
+	case hasDocument:
+		text = appendChatBotTag(text, "[ส่งไฟล์ PDF]")
+	}
+
 	if addressed {
 		s.logf("\n=== chat=%d(%s) user=%d(%s) ===\n[user] %s\n", chat.ID, chat.Type, from.ID, from.Username, text)
 	} else {
 		s.logf("[telegram_record] chat=%d(%s) user=%d(%s): %s\n", chat.ID, chat.Type, from.ID, from.Username, text)
 	}
 
-	answer, err := s.recordAndRespond(key, speaker, text, addressed, images, imageRefs)
+	answer, err := s.recordAndRespond(key, speaker, text, addressed, images, imageRefs, pdfRefs)
 	if err != nil {
 		s.logf("[telegram_error] chat=%d: %v\n", chat.ID, err)
 		if addressed {
@@ -11474,6 +11842,13 @@ func telegramUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  --save-images    OLA_SAVE_IMAGES   บันทึกรูปที่ผู้ใช้ส่งไว้ที่ <context-dir>/pics/<แชท>/ ด้วย (default ปิด)")
 		fmt.Println("                   เปิดแล้วโมเดิลเรียก read_pic ดูรูปเก่าซ้ำข้ามบทสนทนาได้ (path จาก context เดิม)")
 		fmt.Println("                   ข้อควรรู้: ไม่มีการลบรูปเก่าอัตโนมัติ ผู้ดูแลต้องจัดการพื้นที่ดิสก์เอง")
+		fmt.Println("  --max-pdf-size <size>    OLA_MAX_PDF_SIZE    ขนาดไฟล์ PDF สูงสุดที่รับได้ (default 20M - ใหญ่กว่ารูปเพราะ")
+		fmt.Println("                           เอกสารหลายหน้ามักมีขนาดใหญ่กว่ารูปเดี่ยวมาก) แปลงเป็นภาพก่อนส่งให้โมเดิลดู")
+		fmt.Println("                           (เหมือน read_pdf ของ 'ola ask'/'ola coding') --save-images เปิดอยู่จะบันทึก")
+		fmt.Println("                           ไฟล์ PDF ตัวจริงไว้ที่ <context-dir>/pdfs/<แชท>/ ด้วย และโมเดิลเรียก")
+		fmt.Println("                           read_saved_pdf ดูซ้ำข้ามบทสนทนาได้เช่นเดียวกับ read_pic")
+		fmt.Println("  --pdf-max-pages <n>      OLA_PDF_MAX_PAGES   จำนวนหน้าแรกสูงสุดที่แปลงต่อไฟล์ PDF (default 20)")
+		fmt.Println("  --pdf-dpi <n>            OLA_PDF_DPI         ความละเอียดตอนแปลงหน้า PDF เป็นภาพ (default 150)")
 		fmt.Println("  -c/--ctx, -P/--provider, --api-base, -k/--key   เหมือน 'ola ask'")
 		fmt.Println("  -x/--topic     ntfy.sh topic (แจ้งเตือนเมื่อเกิด error ระหว่างประมวลผลข้อความ)")
 		fmt.Println("  -o/--output    log ไฟล์แบบเต็ม (default: telegrambot.log, เปิดแบบ append เสมอ - ต่างจาก 'ola ask')")
@@ -11538,6 +11913,8 @@ func cmdTelegramBot(args []string) int {
 	var searxngURL, ollamaSearchKey string
 	var flagNoWebSearch bool
 	var maxImageSizeRaw string
+	var maxPDFSizeRaw string
+	var pdfMaxPages, pdfDPI int
 	var saveImages bool
 	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
 
@@ -11574,6 +11951,9 @@ func cmdTelegramBot(args []string) int {
 	fs.IntVar(&searchTimeoutSec, "search-timeout", 0, "")
 	fs.IntVar(&fetchTimeoutSec, "fetch-timeout", 0, "")
 	fs.StringVar(&maxImageSizeRaw, "max-image-size", "", "")
+	fs.StringVar(&maxPDFSizeRaw, "max-pdf-size", "", "")
+	fs.IntVar(&pdfMaxPages, "pdf-max-pages", 0, "")
+	fs.IntVar(&pdfDPI, "pdf-dpi", 0, "")
 	fs.BoolVar(&saveImages, "save-images", false, "")
 	fs.StringVar(&topic, "x", "", "")
 	fs.StringVar(&topic, "topic", "", "")
@@ -11700,6 +12080,17 @@ func cmdTelegramBot(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
+	maxPDFSize, err := resolveMaxPDFSize(maxPDFSizeRaw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	if pdfMaxPages <= 0 {
+		pdfMaxPages = envInt("OLA_PDF_MAX_PAGES", defaultPDFMaxPages)
+	}
+	if pdfDPI <= 0 {
+		pdfDPI = envInt("OLA_PDF_DPI", defaultPDFDPI)
+	}
 	saveImages = saveImages || envBool("OLA_SAVE_IMAGES")
 
 	tools := filterTools(builtinTools, "get_current_time", "delay")
@@ -11713,7 +12104,7 @@ func cmdTelegramBot(args []string) int {
 		tools = append(tools, webFetchTool)
 	}
 	if saveImages {
-		tools = append(tools, readPicTool)
+		tools = append(tools, readPicTool, readSavedPDFTool)
 	}
 
 	// Persona is deliberately assembled BETWEEN the intro and the rules
@@ -11769,6 +12160,9 @@ func cmdTelegramBot(args []string) int {
 			compactAfter:     compactAfter,
 			ntfyTopic:        ntfyTopic,
 			maxImageSize:     maxImageSize,
+			maxPDFSize:       maxPDFSize,
+			pdfMaxPages:      pdfMaxPages,
+			pdfDPI:           pdfDPI,
 			saveImages:       saveImages,
 			outFile:          outFile,
 			locks:            map[string]*sync.Mutex{},
@@ -12011,6 +12405,15 @@ func (a discordAttachment) isImage() bool {
 	return imageExts[strings.ToLower(filepath.Ext(a.Filename))]
 }
 
+// isPDF mirrors isImage's own reasoning exactly - trust content_type
+// when Discord populated it, fall back to the file extension otherwise.
+func (a discordAttachment) isPDF() bool {
+	if a.ContentType == "application/pdf" {
+		return true
+	}
+	return strings.EqualFold(filepath.Ext(a.Filename), ".pdf")
+}
+
 type discordMessage struct {
 	ID               string                   `json:"id"`
 	ChannelID        string                   `json:"channel_id"`
@@ -12031,6 +12434,19 @@ func (m *discordMessage) isDM() bool { return m.GuildID == "" }
 func firstImageAttachment(atts []discordAttachment) (discordAttachment, bool) {
 	for _, a := range atts {
 		if a.isImage() {
+			return a, true
+		}
+	}
+	return discordAttachment{}, false
+}
+
+// firstPDFAttachment mirrors firstImageAttachment - a message could in
+// principle carry both an image and a PDF attachment at once (Discord
+// allows several attachments per message), so this is checked
+// independently rather than as an else-branch of the image check.
+func firstPDFAttachment(atts []discordAttachment) (discordAttachment, bool) {
+	for _, a := range atts {
+		if a.isPDF() {
 			return a, true
 		}
 	}
@@ -12192,27 +12608,27 @@ func discordSendMessage(client *http.Client, apiBase, token, channelID, text str
 	return nil
 }
 
-// discordDownloadImage fetches an attachment's URL directly (already
+// discordDownloadFile fetches an attachment's URL directly (already
 // fully resolved by Discord - no getFile-style extra lookup the way
 // Telegram/LINE both need) and enforces maxSize the same way
-// tgDownloadImage/lineDownloadImage do: read at most maxSize+1 bytes via
+// tgDownloadFile/lineDownloadFile do: read at most maxSize+1 bytes via
 // io.LimitReader so an attachment whose reported Size lied (or wasn't
 // reported at all) can't make this buffer an unbounded amount of memory.
-func discordDownloadImage(client *http.Client, url string, maxSize int64) ([]byte, error) {
+func discordDownloadFile(client *http.Client, url string, maxSize int64) ([]byte, error) {
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("ดาวน์โหลดรูปภาพสถานะ %d", resp.StatusCode)
+		return nil, fmt.Errorf("ดาวน์โหลดไฟล์สถานะ %d", resp.StatusCode)
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxSize+1))
 	if err != nil {
-		return nil, fmt.Errorf("ดาวน์โหลดรูปภาพไม่สำเร็จ: %v", err)
+		return nil, fmt.Errorf("ดาวน์โหลดไฟล์ไม่สำเร็จ: %v", err)
 	}
 	if int64(len(data)) > maxSize {
-		return nil, fmt.Errorf("รูปภาพมีขนาดเกิน %s", formatByteSize(maxSize))
+		return nil, fmt.Errorf("ไฟล์มีขนาดเกิน %s", formatByteSize(maxSize))
 	}
 	return data, nil
 }
@@ -12576,8 +12992,9 @@ func (s *discordSession) handleDiscordMessage(msg *discordMessage) {
 		return // never respond to bots (including itself) - avoids echo loops with other bots in the same server
 	}
 	image, hasImage := firstImageAttachment(msg.Attachments)
+	pdf, hasPDF := firstPDFAttachment(msg.Attachments)
 	rawText := strings.TrimSpace(msg.Content)
-	if rawText == "" && !hasImage {
+	if rawText == "" && !hasImage && !hasPDF {
 		return
 	}
 
@@ -12588,7 +13005,7 @@ func (s *discordSession) handleDiscordMessage(msg *discordMessage) {
 		addressed = discordMessageAddressesBot(msg, s.botUserID)
 		if addressed {
 			text = stripDiscordMention(rawText, s.botUserID)
-			if text == "" && !hasImage {
+			if text == "" && !hasImage && !hasPDF {
 				return // e.g. a message that's *just* the mention with nothing else - nothing to say or record
 			}
 		}
@@ -12643,6 +13060,7 @@ func (s *discordSession) handleDiscordMessage(msg *discordMessage) {
 	// when --save-images is on.
 	var images []string
 	var imageRefs []string
+	var pdfRefs []string
 	switch {
 	case hasImage && addressed:
 		if image.Size > 0 && image.Size > s.maxImageSize {
@@ -12650,10 +13068,10 @@ func (s *discordSession) handleDiscordMessage(msg *discordMessage) {
 				fmt.Sprintf("รูปภาพมีขนาด %s เกินขีดจำกัด %s (--max-image-size)", formatByteSize(image.Size), formatByteSize(s.maxImageSize)))
 			return
 		}
-		data, err := discordDownloadImage(s.client, image.URL, s.maxImageSize)
+		data, err := discordDownloadFile(s.client, image.URL, s.maxImageSize)
 		if err != nil {
 			s.logf("[discord_error] ดาวน์โหลดรูปภาพไม่ได้: %v\n", err)
-			_ = discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID, fmt.Sprintf("ขออภัย ดาวน์โหลดรูปภาพไม่สำเร็จ: %v", err))
+			_ = discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID, fmt.Sprintf("ขออภัย ดาวน์โหลดไฟล์ไม่สำเร็จ: %v", err))
 			return
 		}
 		images = []string{base64.StdEncoding.EncodeToString(data)}
@@ -12672,7 +13090,7 @@ func (s *discordSession) handleDiscordMessage(msg *discordMessage) {
 			text = appendChatBotTag(text, "[ส่งรูปภาพ - ขนาดเกินจำกัด ไม่ได้บันทึก]")
 			break
 		}
-		data, err := discordDownloadImage(s.client, image.URL, s.maxImageSize)
+		data, err := discordDownloadFile(s.client, image.URL, s.maxImageSize)
 		if err != nil {
 			s.logf("[discord_error] ดาวน์โหลดรูปภาพ (unaddressed) ไม่ได้: %v\n", err)
 			text = appendChatBotTag(text, "[ส่งรูปภาพ]")
@@ -12689,13 +13107,75 @@ func (s *discordSession) handleDiscordMessage(msg *discordMessage) {
 		text = appendChatBotTag(text, "[ส่งรูปภาพ]")
 	}
 
+	// PDF handling mirrors the image handling above exactly - see
+	// telegramSession.handleTelegramMessage's own comment on its own PDF
+	// switch for the full reasoning (identical here, just via Discord's
+	// directly-resolved attachment URL instead of Telegram's getFile
+	// lookup).
+	switch {
+	case hasPDF && addressed:
+		if pdf.Size > 0 && pdf.Size > s.maxPDFSize {
+			_ = discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID,
+				fmt.Sprintf("ไฟล์ PDF มีขนาด %s เกินขีดจำกัด %s (--max-pdf-size)", formatByteSize(pdf.Size), formatByteSize(s.maxPDFSize)))
+			return
+		}
+		data, err := discordDownloadFile(s.client, pdf.URL, s.maxPDFSize)
+		if err != nil {
+			s.logf("[discord_error] ดาวน์โหลดไฟล์ PDF ไม่ได้: %v\n", err)
+			_ = discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID, fmt.Sprintf("ขออภัย ดาวน์โหลดไฟล์ PDF ไม่สำเร็จ: %v", err))
+			return
+		}
+		var savedPath string
+		if s.saveImages {
+			if ref, err := savePDFFile(s.contextDir, key, data); err != nil {
+				s.logf("[discord_error] บันทึกไฟล์ PDF ไม่ได้: %v\n", err)
+			} else {
+				pdfRefs = []string{ref}
+				savedPath = filepath.Join(s.contextDir, filepath.FromSlash(ref))
+			}
+		}
+		var pages []string
+		var convErr error
+		if savedPath != "" {
+			pages, _, convErr = convertPDFToImages(savedPath, s.pdfMaxPages, s.pdfDPI)
+		} else {
+			pages, _, convErr = convertDownloadedPDFBytes(data, s.pdfMaxPages, s.pdfDPI)
+		}
+		if convErr != nil {
+			s.logf("[discord_error] แปลง PDF ไม่สำเร็จ: %v\n", convErr)
+			_ = discordSendMessage(s.restClient, s.apiBase, s.token, msg.ChannelID, fmt.Sprintf("ขออภัย แปลงไฟล์ PDF ไม่สำเร็จ: %v", convErr))
+			return
+		}
+		images = append(images, pages...)
+	case hasPDF && s.saveImages:
+		if pdf.Size > 0 && pdf.Size > s.maxPDFSize {
+			text = appendChatBotTag(text, "[ส่งไฟล์ PDF - ขนาดเกินจำกัด ไม่ได้บันทึก]")
+			break
+		}
+		data, err := discordDownloadFile(s.client, pdf.URL, s.maxPDFSize)
+		if err != nil {
+			s.logf("[discord_error] ดาวน์โหลดไฟล์ PDF (unaddressed) ไม่ได้: %v\n", err)
+			text = appendChatBotTag(text, "[ส่งไฟล์ PDF]")
+			break
+		}
+		ref, err := savePDFFile(s.contextDir, key, data)
+		if err != nil {
+			s.logf("[discord_error] บันทึกไฟล์ PDF ไม่ได้: %v\n", err)
+			text = appendChatBotTag(text, "[ส่งไฟล์ PDF]")
+			break
+		}
+		pdfRefs = []string{ref}
+	case hasPDF:
+		text = appendChatBotTag(text, "[ส่งไฟล์ PDF]")
+	}
+
 	if addressed {
 		s.logf("\n=== discord key=%s user=%s(%s) ===\n[user] %s\n", key, msg.Author.ID, msg.Author.Username, text)
 	} else {
 		s.logf("[discord_record] key=%s user=%s(%s): %s\n", key, msg.Author.ID, msg.Author.Username, text)
 	}
 
-	answer, err := s.recordAndRespond(key, speaker, text, addressed, images, imageRefs)
+	answer, err := s.recordAndRespond(key, speaker, text, addressed, images, imageRefs, pdfRefs)
 	if err != nil {
 		s.logf("[discord_error] key=%s: %v\n", key, err)
 		if addressed {
@@ -12765,6 +13245,7 @@ func discordUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  --discord-max-concurrent <n>   จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส (default 4)")
 		fmt.Println("  --max-image-size <size>        OLA_MAX_IMAGE_SIZE   ขนาดรูปภาพสูงสุด (default 10M) - ดู 'ola telegrambot -h'")
 		fmt.Println("  --save-images                  OLA_SAVE_IMAGES      บันทึกรูปไว้ดูซ้ำได้ (default ปิด) - ดู 'ola telegrambot -h'")
+		fmt.Println("  --max-pdf-size, --pdf-max-pages, --pdf-dpi          รองรับไฟล์ PDF เหมือนกัน - ดู 'ola telegrambot -h'")
 		fmt.Println("  -x/--topic     ntfy.sh topic (แจ้งเตือนเมื่อเกิด error ระหว่างประมวลผลข้อความ)")
 		fmt.Println("  -o/--output    log ไฟล์แบบเต็ม (default: discordbot.log, เปิดแบบ append เสมอ)")
 		fmt.Println()
@@ -12795,6 +13276,8 @@ func cmdDiscordBot(args []string) int {
 	var searxngURL, ollamaSearchKey string
 	var flagNoWebSearch bool
 	var maxImageSizeRaw string
+	var maxPDFSizeRaw string
+	var pdfMaxPages, pdfDPI int
 	var saveImages bool
 	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
 
@@ -12831,6 +13314,9 @@ func cmdDiscordBot(args []string) int {
 	fs.IntVar(&searchTimeoutSec, "search-timeout", 0, "")
 	fs.IntVar(&fetchTimeoutSec, "fetch-timeout", 0, "")
 	fs.StringVar(&maxImageSizeRaw, "max-image-size", "", "")
+	fs.StringVar(&maxPDFSizeRaw, "max-pdf-size", "", "")
+	fs.IntVar(&pdfMaxPages, "pdf-max-pages", 0, "")
+	fs.IntVar(&pdfDPI, "pdf-dpi", 0, "")
 	fs.BoolVar(&saveImages, "save-images", false, "")
 	fs.StringVar(&topic, "x", "", "")
 	fs.StringVar(&topic, "topic", "", "")
@@ -12939,6 +13425,17 @@ func cmdDiscordBot(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
+	maxPDFSize, err := resolveMaxPDFSize(maxPDFSizeRaw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	if pdfMaxPages <= 0 {
+		pdfMaxPages = envInt("OLA_PDF_MAX_PAGES", defaultPDFMaxPages)
+	}
+	if pdfDPI <= 0 {
+		pdfDPI = envInt("OLA_PDF_DPI", defaultPDFDPI)
+	}
 	saveImages = saveImages || envBool("OLA_SAVE_IMAGES")
 
 	tools := filterTools(builtinTools, "get_current_time", "delay")
@@ -12952,7 +13449,7 @@ func cmdDiscordBot(args []string) int {
 		tools = append(tools, webFetchTool)
 	}
 	if saveImages {
-		tools = append(tools, readPicTool)
+		tools = append(tools, readPicTool, readSavedPDFTool)
 	}
 
 	systemPrompt := buildDiscordSystemPrompt(persona)
@@ -13008,6 +13505,9 @@ func cmdDiscordBot(args []string) int {
 			compactAfter:     compactAfter,
 			ntfyTopic:        ntfyTopic,
 			maxImageSize:     maxImageSize,
+			maxPDFSize:       maxPDFSize,
+			pdfMaxPages:      pdfMaxPages,
+			pdfDPI:           pdfDPI,
 			saveImages:       saveImages,
 			outFile:          outFile,
 			locks:            map[string]*sync.Mutex{},
@@ -13108,7 +13608,7 @@ const defaultLineAPIBase = "https://api.line.me/v2/bot"
 // what a user actually sent (images/video/audio) - confirmed against
 // LINE's own API reference, not assumed: unlike every other Messaging
 // API call, content retrieval lives on a genuinely DIFFERENT host
-// (api-data.line.me, not api.line.me). See lineDownloadImage.
+// (api-data.line.me, not api.line.me). See lineDownloadFile.
 const defaultLineDataAPIBase = "https://api-data.line.me/v2/bot"
 const defaultLineListenAddr = ":8080"
 const defaultLineWebhookPath = "/line/webhook"
@@ -13144,10 +13644,21 @@ type lineMention struct {
 }
 
 type lineMessage struct {
-	ID      string       `json:"id"`
-	Type    string       `json:"type"` // only "text" is handled; other types are ignored
-	Text    string       `json:"text"`
-	Mention *lineMention `json:"mention,omitempty"`
+	ID       string       `json:"id"`
+	Type     string       `json:"type"` // "text", "image", or "file" are handled; other types are ignored
+	Text     string       `json:"text"`
+	Mention  *lineMention `json:"mention,omitempty"`
+	FileName string       `json:"fileName,omitempty"` // only present on type:"file" messages - used to detect a PDF via its extension
+	FileSize int64        `json:"fileSize,omitempty"` // ditto
+}
+
+// isPDF reports whether a type:"file" message's own filename looks like
+// a PDF - LINE's file message event doesn't include a MIME type at all,
+// only the original filename, so the extension is the only signal
+// available (same fallback tgDocument.isPDF/discordAttachment.isPDF both
+// also use when their own platform's MIME type is missing/unreliable).
+func (m *lineMessage) isPDF() bool {
+	return m.Type == "file" && strings.EqualFold(filepath.Ext(m.FileName), ".pdf")
 }
 
 type lineEvent struct {
@@ -13354,7 +13865,7 @@ func linePushMessage(client *http.Client, apiBase, token, to, text string) error
 	return nil
 }
 
-// lineDownloadImage fetches an image message's raw bytes via LINE's
+// lineDownloadFile fetches an image message's raw bytes via LINE's
 // content-retrieval endpoint, which lives on dataAPIBase (see
 // defaultLineDataAPIBase's own doc comment for why this is a different
 // host from every other LINE call, and cmdLineBot for how dataAPIBase
@@ -13362,13 +13873,13 @@ func linePushMessage(client *http.Client, apiBase, token, to, text string) error
 // e.g. for tests, since a mock server serves both from one place).
 // Doesn't reuse lineRESTRequest (built around JSON request/response) -
 // this needs a plain unbuffered-size GET. Enforces maxSize via
-// io.LimitReader the same way tgDownloadImage/discordDownloadImage do -
+// io.LimitReader the same way tgDownloadFile/discordDownloadFile do -
 // LINE's webhook event gives no advance size information the way
 // Telegram's PhotoSize or Discord's attachment object do, so the only way
 // to learn the size here is to read the response; this caps how much it
 // will ever read rather than fully buffering an arbitrarily large file
 // first.
-func lineDownloadImage(client *http.Client, dataAPIBase, token, messageID string, maxSize int64) ([]byte, error) {
+func lineDownloadFile(client *http.Client, dataAPIBase, token, messageID string, maxSize int64) ([]byte, error) {
 	httpReq, err := http.NewRequest(http.MethodGet, dataAPIBase+"/message/"+messageID+"/content", nil)
 	if err != nil {
 		return nil, err
@@ -13380,14 +13891,14 @@ func lineDownloadImage(client *http.Client, dataAPIBase, token, messageID string
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("ดาวน์โหลดรูปภาพสถานะ %d", resp.StatusCode)
+		return nil, fmt.Errorf("ดาวน์โหลดไฟล์สถานะ %d", resp.StatusCode)
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxSize+1))
 	if err != nil {
-		return nil, fmt.Errorf("ดาวน์โหลดรูปภาพไม่สำเร็จ: %v", err)
+		return nil, fmt.Errorf("ดาวน์โหลดไฟล์ไม่สำเร็จ: %v", err)
 	}
 	if int64(len(data)) > maxSize {
-		return nil, fmt.Errorf("รูปภาพมีขนาดเกิน %s", formatByteSize(maxSize))
+		return nil, fmt.Errorf("ไฟล์มีขนาดเกิน %s", formatByteSize(maxSize))
 	}
 	return data, nil
 }
@@ -13676,12 +14187,13 @@ func (s *lineSession) handleLineMessage(ev *lineEvent) {
 		return
 	}
 	msg := ev.Message
-	if msg == nil || (msg.Type != "text" && msg.Type != "image") {
-		return // sticker/location/video/audio/etc - nothing this bot can act on
+	if msg == nil || (msg.Type != "text" && msg.Type != "image" && !msg.isPDF()) {
+		return // sticker/location/video/audio/non-PDF file/etc - nothing this bot can act on
 	}
 	hasImage := msg.Type == "image"
-	rawText := strings.TrimSpace(msg.Text) // always "" for an image message - LINE has no caption field on those, unlike Telegram/Discord
-	if rawText == "" && !hasImage {
+	hasPDF := msg.isPDF()
+	rawText := strings.TrimSpace(msg.Text) // always "" for an image/file message - LINE has no caption field on those, unlike Telegram/Discord
+	if rawText == "" && !hasImage && !hasPDF {
 		return
 	}
 
@@ -13690,16 +14202,16 @@ func (s *lineSession) handleLineMessage(ev *lineEvent) {
 	addressed := true
 	text := rawText
 	if isGroup {
-		if hasImage {
+		if hasImage || hasPDF {
 			// LINE's mention object only ever appears on a text message
-			// (see lineMention) - an image message has no text and so
+			// (see lineMention) - an image/file message has no text and so
 			// literally cannot carry an @mention, meaning there is no way
-			// for a group image to address the bot at all under the same
-			// mention/prefix scheme every other message uses. Treat it the
-			// same as any other unaddressed group message (recorded with a
-			// placeholder note below, never downloaded/analyzed) rather
-			// than inventing a different addressing rule just for this
-			// one message type.
+			// for a group image/PDF to address the bot at all under the
+			// same mention/prefix scheme every other message uses. Treat
+			// it the same as any other unaddressed group message (recorded
+			// with a placeholder note below, never downloaded/analyzed)
+			// rather than inventing a different addressing rule just for
+			// these message types.
 			addressed = false
 		} else {
 			addressed = lineMessageAddressesBot(msg, s.botUserID)
@@ -13761,16 +14273,17 @@ func (s *lineSession) handleLineMessage(ev *lineEvent) {
 	// could never be saved or referenced later no matter what. LINE gives
 	// no advance file-size information the way Telegram's PhotoSize/
 	// Discord's attachment object do, so there's no pre-flight size check
-	// possible here before attempting the download - lineDownloadImage's
+	// possible here before attempting the download - lineDownloadFile's
 	// own io.LimitReader cap is the only enforcement point either way.
 	var images []string
 	var imageRefs []string
+	var pdfRefs []string
 	switch {
 	case hasImage && addressed:
-		data, err := lineDownloadImage(s.client, s.dataAPIBase, s.token, msg.ID, s.maxImageSize)
+		data, err := lineDownloadFile(s.client, s.dataAPIBase, s.token, msg.ID, s.maxImageSize)
 		if err != nil {
 			s.logf("[line_error] ดาวน์โหลดรูปภาพไม่ได้: %v\n", err)
-			_ = s.sendReply(ev.ReplyToken, to, fmt.Sprintf("ขออภัย ดาวน์โหลดรูปภาพไม่สำเร็จ: %v", err))
+			_ = s.sendReply(ev.ReplyToken, to, fmt.Sprintf("ขออภัย ดาวน์โหลดไฟล์ไม่สำเร็จ: %v", err))
 			return
 		}
 		images = []string{base64.StdEncoding.EncodeToString(data)}
@@ -13785,7 +14298,7 @@ func (s *lineSession) handleLineMessage(ev *lineEvent) {
 		// Not addressed (or, for LINE, un-addressable at all), but
 		// save-images is on - download+save silently (no reply either
 		// way, matching how any other unaddressed message is handled).
-		data, err := lineDownloadImage(s.client, s.dataAPIBase, s.token, msg.ID, s.maxImageSize)
+		data, err := lineDownloadFile(s.client, s.dataAPIBase, s.token, msg.ID, s.maxImageSize)
 		if err != nil {
 			s.logf("[line_error] ดาวน์โหลดรูปภาพ (unaddressed) ไม่ได้: %v\n", err)
 			text = appendChatBotTag(text, "[ส่งรูปภาพ]")
@@ -13802,13 +14315,66 @@ func (s *lineSession) handleLineMessage(ev *lineEvent) {
 		text = appendChatBotTag(text, "[ส่งรูปภาพ]")
 	}
 
+	// PDF handling mirrors the image handling above exactly (LINE's own
+	// content-download endpoint is content-type-agnostic, keyed only by
+	// message ID, so the same lineDownloadFile call works unchanged for
+	// PDFs too) - see telegramSession.handleTelegramMessage's own comment
+	// on its own PDF switch for the general reasoning.
+	switch {
+	case hasPDF && addressed:
+		data, err := lineDownloadFile(s.client, s.dataAPIBase, s.token, msg.ID, s.maxPDFSize)
+		if err != nil {
+			s.logf("[line_error] ดาวน์โหลดไฟล์ PDF ไม่ได้: %v\n", err)
+			_ = s.sendReply(ev.ReplyToken, to, fmt.Sprintf("ขออภัย ดาวน์โหลดไฟล์ PDF ไม่สำเร็จ: %v", err))
+			return
+		}
+		var savedPath string
+		if s.saveImages {
+			if ref, err := savePDFFile(s.contextDir, key, data); err != nil {
+				s.logf("[line_error] บันทึกไฟล์ PDF ไม่ได้: %v\n", err)
+			} else {
+				pdfRefs = []string{ref}
+				savedPath = filepath.Join(s.contextDir, filepath.FromSlash(ref))
+			}
+		}
+		var pages []string
+		var convErr error
+		if savedPath != "" {
+			pages, _, convErr = convertPDFToImages(savedPath, s.pdfMaxPages, s.pdfDPI)
+		} else {
+			pages, _, convErr = convertDownloadedPDFBytes(data, s.pdfMaxPages, s.pdfDPI)
+		}
+		if convErr != nil {
+			s.logf("[line_error] แปลง PDF ไม่สำเร็จ: %v\n", convErr)
+			_ = s.sendReply(ev.ReplyToken, to, fmt.Sprintf("ขออภัย แปลงไฟล์ PDF ไม่สำเร็จ: %v", convErr))
+			return
+		}
+		images = append(images, pages...)
+	case hasPDF && s.saveImages:
+		data, err := lineDownloadFile(s.client, s.dataAPIBase, s.token, msg.ID, s.maxPDFSize)
+		if err != nil {
+			s.logf("[line_error] ดาวน์โหลดไฟล์ PDF (unaddressed) ไม่ได้: %v\n", err)
+			text = appendChatBotTag(text, "[ส่งไฟล์ PDF]")
+			break
+		}
+		ref, err := savePDFFile(s.contextDir, key, data)
+		if err != nil {
+			s.logf("[line_error] บันทึกไฟล์ PDF ไม่ได้: %v\n", err)
+			text = appendChatBotTag(text, "[ส่งไฟล์ PDF]")
+			break
+		}
+		pdfRefs = []string{ref}
+	case hasPDF:
+		text = appendChatBotTag(text, "[ส่งไฟล์ PDF]")
+	}
+
 	if addressed {
 		s.logf("\n=== line key=%s user=%s ===\n[user] %s\n", key, src.UserID, text)
 	} else {
 		s.logf("[line_record] key=%s user=%s: %s\n", key, src.UserID, text)
 	}
 
-	answer, err := s.recordAndRespond(key, speaker, text, addressed, images, imageRefs)
+	answer, err := s.recordAndRespond(key, speaker, text, addressed, images, imageRefs, pdfRefs)
 	if err != nil {
 		s.logf("[line_error] key=%s: %v\n", key, err)
 		if addressed {
@@ -13918,6 +14484,7 @@ func lineUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  --line-max-concurrent <n>    จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส (default 4)")
 		fmt.Println("  --max-image-size <size>      OLA_MAX_IMAGE_SIZE   ขนาดรูปภาพสูงสุด (default 10M) - ดู 'ola telegrambot -h'")
 		fmt.Println("  --save-images                OLA_SAVE_IMAGES      บันทึกรูปไว้ดูซ้ำได้ (default ปิด) - ดู 'ola telegrambot -h'")
+		fmt.Println("  --max-pdf-size, --pdf-max-pages, --pdf-dpi        รองรับไฟล์ PDF เหมือนกัน - ดู 'ola telegrambot -h'")
 		fmt.Println("  -x/--topic     ntfy.sh topic (แจ้งเตือนเมื่อเกิด error ระหว่างประมวลผลข้อความ)")
 		fmt.Println("  -o/--output    log ไฟล์แบบเต็ม (default: linebot.log, เปิดแบบ append เสมอ)")
 		fmt.Println()
@@ -13950,6 +14517,8 @@ func cmdLineBot(args []string) int {
 	var searxngURL, ollamaSearchKey string
 	var flagNoWebSearch bool
 	var maxImageSizeRaw string
+	var maxPDFSizeRaw string
+	var pdfMaxPages, pdfDPI int
 	var saveImages bool
 	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
 
@@ -13987,6 +14556,9 @@ func cmdLineBot(args []string) int {
 	fs.IntVar(&searchTimeoutSec, "search-timeout", 0, "")
 	fs.IntVar(&fetchTimeoutSec, "fetch-timeout", 0, "")
 	fs.StringVar(&maxImageSizeRaw, "max-image-size", "", "")
+	fs.StringVar(&maxPDFSizeRaw, "max-pdf-size", "", "")
+	fs.IntVar(&pdfMaxPages, "pdf-max-pages", 0, "")
+	fs.IntVar(&pdfDPI, "pdf-dpi", 0, "")
 	fs.BoolVar(&saveImages, "save-images", false, "")
 	fs.StringVar(&topic, "x", "", "")
 	fs.StringVar(&topic, "topic", "", "")
@@ -14128,6 +14700,17 @@ func cmdLineBot(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
+	maxPDFSize, err := resolveMaxPDFSize(maxPDFSizeRaw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	if pdfMaxPages <= 0 {
+		pdfMaxPages = envInt("OLA_PDF_MAX_PAGES", defaultPDFMaxPages)
+	}
+	if pdfDPI <= 0 {
+		pdfDPI = envInt("OLA_PDF_DPI", defaultPDFDPI)
+	}
 	saveImages = saveImages || envBool("OLA_SAVE_IMAGES")
 
 	tools := filterTools(builtinTools, "get_current_time", "delay")
@@ -14141,7 +14724,7 @@ func cmdLineBot(args []string) int {
 		tools = append(tools, webFetchTool)
 	}
 	if saveImages {
-		tools = append(tools, readPicTool)
+		tools = append(tools, readPicTool, readSavedPDFTool)
 	}
 
 	systemPrompt := buildChatBotSystemPrompt("LINE", persona)
@@ -14189,6 +14772,9 @@ func cmdLineBot(args []string) int {
 			compactAfter:     compactAfter,
 			ntfyTopic:        ntfyTopic,
 			maxImageSize:     maxImageSize,
+			maxPDFSize:       maxPDFSize,
+			pdfMaxPages:      pdfMaxPages,
+			pdfDPI:           pdfDPI,
 			saveImages:       saveImages,
 			outFile:          outFile,
 			locks:            map[string]*sync.Mutex{},
@@ -14555,6 +15141,14 @@ type webBotChatRequest struct {
 	// simplicity, matching telegrambot/discordbot/linebot's own "look at
 	// the first/only image attached to this message" behavior.
 	Image string `json:"image,omitempty"`
+	// PDF is base64-encoded the same way Image is (data: prefix optional,
+	// stripped the same way) - converted to page images via
+	// convertDownloadedPDFBytes and attached alongside/instead of Image.
+	// Never saved anywhere (webbot persists nothing at all, by design -
+	// see this section's own header comment) - converted fresh every time
+	// straight from the upload, same as an image never being written to
+	// disk here either.
+	PDF string `json:"pdf,omitempty"`
 }
 
 // stripDataURLPrefix removes a leading "data:<mime>;base64," prefix if
@@ -14610,15 +15204,19 @@ func (s *webBotSession) chatHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	// The body can legitimately contain a base64-encoded image (~33%
-	// larger than the original file) alongside the JSON structure and
-	// message text - size the read limit off the configured image-size
-	// ceiling rather than a fixed constant that would silently reject a
-	// deliberately-raised --max-image-size.
-	bodyLimit := int64(base64.StdEncoding.EncodedLen(int(s.maxImageSize))) + 65536
+	// The body can legitimately contain a base64-encoded image and/or PDF
+	// (~33% larger than the original file either way) alongside the JSON
+	// structure and message text - size the read limit off whichever
+	// configured ceiling is larger rather than a fixed constant that would
+	// silently reject a deliberately-raised --max-image-size/--max-pdf-size.
+	maxAttachSize := s.maxImageSize
+	if s.maxPDFSize > maxAttachSize {
+		maxAttachSize = s.maxPDFSize
+	}
+	bodyLimit := int64(base64.StdEncoding.EncodedLen(int(maxAttachSize))) + 65536
 	var req webBotChatRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, bodyLimit)).Decode(&req); err != nil {
-		s.writeChatError(w, http.StatusBadRequest, "รูปแบบคำขอไม่ถูกต้อง (หรือรูปภาพใหญ่เกินไป)")
+		s.writeChatError(w, http.StatusBadRequest, "รูปแบบคำขอไม่ถูกต้อง (หรือไฟล์แนบใหญ่เกินไป)")
 		return
 	}
 	text := strings.TrimSpace(req.Message)
@@ -14636,6 +15234,26 @@ func (s *webBotSession) chatHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		images = []string{stripDataURLPrefix(req.Image)}
+	}
+	pdfPageCount := 0
+	if req.PDF != "" {
+		raw, err := base64.StdEncoding.DecodeString(stripDataURLPrefix(req.PDF))
+		if err != nil {
+			s.writeChatError(w, http.StatusBadRequest, "ไฟล์ PDF ไม่ถูกต้อง (decode base64 ไม่ได้)")
+			return
+		}
+		if int64(len(raw)) > s.maxPDFSize {
+			s.writeChatError(w, http.StatusBadRequest,
+				fmt.Sprintf("ไฟล์ PDF มีขนาด %s เกินขีดจำกัด %s (--max-pdf-size)", formatByteSize(int64(len(raw))), formatByteSize(s.maxPDFSize)))
+			return
+		}
+		pages, _, err := convertDownloadedPDFBytes(raw, s.pdfMaxPages, s.pdfDPI)
+		if err != nil {
+			s.writeChatError(w, http.StatusBadRequest, fmt.Sprintf("แปลงไฟล์ PDF ไม่สำเร็จ: %v", err))
+			return
+		}
+		images = append(images, pages...)
+		pdfPageCount = len(pages)
 	}
 	if text == "" && len(images) == 0 {
 		s.writeChatError(w, http.StatusBadRequest, "ข้อความว่างเปล่า")
@@ -14657,21 +15275,25 @@ func (s *webBotSession) chatHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	storedText := text
-	if len(images) > 0 {
-		tag := fmt.Sprintf("[แนบรูปภาพ %d รูป]", len(images))
-		if storedText == "" {
-			storedText = tag
-		} else {
-			storedText = storedText + "\n" + tag
-		}
+	if pdfPageCount > 0 {
+		storedText = appendChatBotTag(storedText, fmt.Sprintf("[แนบไฟล์ PDF %d หน้า]", pdfPageCount))
 	}
+	if imgCount := len(images) - pdfPageCount; imgCount > 0 {
+		storedText = appendChatBotTag(storedText, fmt.Sprintf("[แนบรูปภาพ %d รูป]", imgCount))
+	}
+
+	// Captured once and reused for both the outgoing message's visible
+	// timestamp and the turns appended below, rather than calling
+	// time.Now() again at each point - keeps what the model is shown in
+	// this round consistent with what actually gets stored for it.
+	now := time.Now()
 
 	messages := ctx.buildMessages(s.systemPrompt)
 	outgoingText := text
 	if len(images) > 0 && text == "" {
 		outgoingText = chatBotNoTextWithImagePrompt
 	}
-	messages = append(messages, ollamaMessage{Role: "user", Content: outgoingText, Images: images})
+	messages = append(messages, ollamaMessage{Role: "user", Content: formatChatTurnContent("", now, outgoingText), Images: images})
 
 	s.logf("\n=== web session=%s ===\n[user] %s\n", req.SessionID, storedText)
 	answer, err := s.runChatToolLoop(messages)
@@ -14686,7 +15308,7 @@ func (s *webBotSession) chatHandler(w http.ResponseWriter, r *http.Request) {
 	s.logf("[assistant] %s\n", answer)
 
 	ctx.Turns = append(ctx.Turns,
-		chatTurn{Role: "user", Content: storedText, Time: time.Now()},
+		chatTurn{Role: "user", Content: storedText, Time: now},
 		chatTurn{Role: "assistant", Content: answer, Time: time.Now()},
 	)
 	ctx.LastActive = time.Now()
@@ -14890,6 +15512,13 @@ const webBotChatHTMLTemplate = `<!DOCTYPE html>
     max-width: 220px; max-height: 220px; border-radius: 10px;
     display: block; margin-top: 6px; border: 1px solid var(--bg3);
   }
+  .msg .msg-pdf-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    margin-top: 6px; padding: 6px 10px;
+    background: var(--bg2); border-radius: 8px;
+    border: 1px solid var(--bg3); font-size: 0.9rem;
+  }
+  #imagePreview .pdf-icon { font-size: 1.3rem; }
   #chat::-webkit-scrollbar { width: 10px; }
   #chat::-webkit-scrollbar-track { background: var(--bg0); }
   #chat::-webkit-scrollbar-thumb { background: var(--bg2); border-radius: 6px; }
@@ -14920,8 +15549,8 @@ const webBotChatHTMLTemplate = `<!DOCTYPE html>
     <button id="imageRemoveBtn" type="button">✕</button>
   </div>
   <div id="inputbar">
-    <input type="file" id="imageInput" accept="image/*" style="display:none">
-    <button id="attachBtn" type="button" title="แนบรูปภาพ" disabled>📎</button>
+    <input type="file" id="imageInput" accept="image/*,application/pdf" style="display:none">
+    <button id="attachBtn" type="button" title="แนบรูปภาพหรือไฟล์ PDF" disabled>📎</button>
     <textarea id="input" placeholder="พิมพ์ข้อความ..." disabled rows="1"></textarea>
     <button id="send" disabled>ส่ง</button>
   </div>
@@ -14943,8 +15572,10 @@ var OLA_AVATAR = "{{.Avatar}}";
   var imageRemoveBtn = document.getElementById('imageRemoveBtn');
   var sessionID = null;
   var pendingImageDataURL = null;
+  var pendingIsPDF = false;
+  var pendingFileName = '';
 
-  function addMessage(role, text, imageDataURL) {
+  function addMessage(role, text, imageDataURL, pdfName) {
     var div = document.createElement('div');
     div.className = 'msg ' + role;
     if (role === 'assistant' && OLA_AVATAR) {
@@ -14967,6 +15598,12 @@ var OLA_AVATAR = "{{.Avatar}}";
       thumb.src = imageDataURL;
       thumb.alt = '';
       div.appendChild(thumb);
+    }
+    if (pdfName) {
+      var badge = document.createElement('div');
+      badge.className = 'msg-pdf-badge';
+      badge.textContent = '📄 ' + pdfName;
+      div.appendChild(badge);
     }
     chatEl.appendChild(div);
     chatEl.scrollTop = chatEl.scrollHeight;
@@ -15008,6 +15645,8 @@ var OLA_AVATAR = "{{.Avatar}}";
 
   function clearPendingImage() {
     pendingImageDataURL = null;
+    pendingIsPDF = false;
+    pendingFileName = '';
     imageInput.value = '';
     imagePreview.style.display = 'none';
   }
@@ -15017,11 +15656,19 @@ var OLA_AVATAR = "{{.Avatar}}";
   imageInput.addEventListener('change', function() {
     var file = imageInput.files[0];
     if (!file) { return; }
+    pendingIsPDF = (file.type === 'application/pdf') || /\.pdf$/i.test(file.name);
+    pendingFileName = file.name;
     var reader = new FileReader();
     reader.onload = function() {
       pendingImageDataURL = reader.result;
-      imagePreviewThumb.src = pendingImageDataURL;
-      imagePreviewName.textContent = file.name;
+      if (pendingIsPDF) {
+        imagePreviewThumb.style.display = 'none';
+        imagePreviewName.textContent = '📄 ' + file.name;
+      } else {
+        imagePreviewThumb.style.display = '';
+        imagePreviewThumb.src = pendingImageDataURL;
+        imagePreviewName.textContent = file.name;
+      }
       imagePreview.style.display = 'flex';
     };
     reader.readAsDataURL(file);
@@ -15033,15 +15680,22 @@ var OLA_AVATAR = "{{.Avatar}}";
     var text = inputEl.value.trim();
     if (!text && !pendingImageDataURL) { return; }
     if (!sessionID) { return; }
-    addMessage('user', text, pendingImageDataURL);
-    var imageToSend = pendingImageDataURL;
+    if (pendingIsPDF) {
+      addMessage('user', text, null, pendingFileName);
+    } else {
+      addMessage('user', text, pendingImageDataURL);
+    }
+    var attachToSend = pendingImageDataURL;
+    var attachIsPDF = pendingIsPDF;
     inputEl.value = '';
     autoResize();
     clearPendingImage();
     setBusy(true);
     var thinkingEl = addMessage('thinking', 'กำลังพิมพ์...');
     var body = { session_id: sessionID, message: text };
-    if (imageToSend) { body.image = imageToSend; }
+    if (attachToSend) {
+      if (attachIsPDF) { body.pdf = attachToSend; } else { body.image = attachToSend; }
+    }
     fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -15122,6 +15776,11 @@ func webBotUsage(fs *flag.FlagSet) func() {
 		fmt.Println("  --webbot-listen-addr <addr>   OLA_WEBBOT_LISTEN_ADDR   ที่อยู่ที่ HTTP server ฟัง (default 127.0.0.1:8090)")
 		fmt.Println("  --webbot-session-ttl <sec>    อายุ session สูงสุดก่อนถูกเก็บกวาดทิ้งถ้าไม่มีการใช้งาน (default 7200 = 2 ชม.)")
 		fmt.Println("  --max-image-size <size>       OLA_MAX_IMAGE_SIZE   ขนาดรูปภาพสูงสุด (default 10M) - ดู 'ola telegrambot -h'")
+		fmt.Println("  --max-pdf-size <size>         OLA_MAX_PDF_SIZE     ขนาดไฟล์ PDF สูงสุด (default 20M) - แปลงเป็นภาพแล้วแนบให้")
+		fmt.Println("                                โมเดิลดูทันที (เหมือน read_pdf ของ 'ola ask'/'ola coding') ไม่มีการบันทึกไฟล์ไว้")
+		fmt.Println("                                เลย (webbot ไม่ persist อะไรทั้งสิ้น - ไม่มี --save-images/read_saved_pdf แบบสามบอทแรก)")
+		fmt.Println("  --pdf-max-pages <n>           OLA_PDF_MAX_PAGES    จำนวนหน้าแรกสูงสุดที่แปลงต่อไฟล์ PDF (default 20)")
+		fmt.Println("  --pdf-dpi <n>                 OLA_PDF_DPI          ความละเอียดตอนแปลงหน้า PDF เป็นภาพ (default 150)")
 		fmt.Println("  -x/--topic     ntfy.sh topic (แจ้งเตือนเมื่อเกิด error ระหว่างประมวลผลข้อความ)")
 		fmt.Println("  -o/--output    log ไฟล์แบบเต็ม (default: webbot.log, เปิดแบบ append เสมอ)")
 		fmt.Println()
@@ -15152,6 +15811,8 @@ func cmdWebBot(args []string) int {
 	var searxngURL, ollamaSearchKey string
 	var flagNoWebSearch bool
 	var maxImageSizeRaw string
+	var maxPDFSizeRaw string
+	var pdfMaxPages, pdfDPI int
 	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
 
 	fs.StringVar(&model, "m", "", "")
@@ -15186,6 +15847,9 @@ func cmdWebBot(args []string) int {
 	fs.IntVar(&searchTimeoutSec, "search-timeout", 0, "")
 	fs.IntVar(&fetchTimeoutSec, "fetch-timeout", 0, "")
 	fs.StringVar(&maxImageSizeRaw, "max-image-size", "", "")
+	fs.StringVar(&maxPDFSizeRaw, "max-pdf-size", "", "")
+	fs.IntVar(&pdfMaxPages, "pdf-max-pages", 0, "")
+	fs.IntVar(&pdfDPI, "pdf-dpi", 0, "")
 	fs.StringVar(&topic, "x", "", "")
 	fs.StringVar(&topic, "topic", "", "")
 	fs.StringVar(&outputFile, "o", "", "")
@@ -15304,6 +15968,17 @@ func cmdWebBot(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
+	maxPDFSize, err := resolveMaxPDFSize(maxPDFSizeRaw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	if pdfMaxPages <= 0 {
+		pdfMaxPages = envInt("OLA_PDF_MAX_PAGES", defaultPDFMaxPages)
+	}
+	if pdfDPI <= 0 {
+		pdfDPI = envInt("OLA_PDF_DPI", defaultPDFDPI)
+	}
 
 	tools := filterTools(builtinTools, "get_current_time", "delay")
 	if knowledgeCfg.enabled() {
@@ -15355,6 +16030,9 @@ func cmdWebBot(args []string) int {
 			compactAfter:     compactAfter,
 			ntfyTopic:        ntfyTopic,
 			maxImageSize:     maxImageSize,
+			maxPDFSize:       maxPDFSize,
+			pdfMaxPages:      pdfMaxPages,
+			pdfDPI:           pdfDPI,
 			outFile:          outFile,
 			locks:            map[string]*sync.Mutex{},
 		},

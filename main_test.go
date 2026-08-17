@@ -8938,14 +8938,38 @@ func TestHandleDiscordMessageRecordsUnaddressedGuildMessageWithoutReplying(t *te
 }
 
 // TestFormatChatTurnContentDMHasNoSpeakerPrefix confirms a DM turn
-// (speaker == "") is never prefixed - only group/channel turns with more
-// than one possible human speaker need attribution.
+// (speaker == "") never gets a speaker bracket - only group/channel
+// turns with more than one possible human speaker need attribution - but
+// the timestamp bracket is unconditional either way (see
+// formatChatTurnContent's own doc comment for why).
 func TestFormatChatTurnContentDMHasNoSpeakerPrefix(t *testing.T) {
-	if got := formatChatTurnContent("", "สวัสดี"); got != "สวัสดี" {
-		t.Fatalf("expected no prefix for an empty speaker, got: %q", got)
+	ts := time.Date(2026, 8, 16, 14, 32, 0, 0, time.UTC)
+	if got := formatChatTurnContent("", ts, "สวัสดี"); got != "[วันอาทิตย์ 16 ส.ค. 2569 เวลา 14:32 น.] สวัสดี" {
+		t.Fatalf("expected a timestamp-only prefix for an empty speaker, got: %q", got)
 	}
-	if got := formatChatTurnContent("สมชาย", "สวัสดี"); got != "[สมชาย] สวัสดี" {
-		t.Fatalf("expected speaker prefix, got: %q", got)
+	if got := formatChatTurnContent("สมชาย", ts, "สวัสดี"); got != "[วันอาทิตย์ 16 ส.ค. 2569 เวลา 14:32 น.] [สมชาย] สวัสดี" {
+		t.Fatalf("expected timestamp + speaker prefix, got: %q", got)
+	}
+}
+
+// TestFormatThaiTimestamp pins the exact Thai-localized format (Buddhist
+// Era year, Thai weekday/month names, 24h time) chosen after discussion:
+// natural Thai phrasing was picked deliberately over a compact ISO-style
+// stamp since every reader (chat users and the model itself) is Thai and
+// the surrounding conversation is entirely in Thai.
+func TestFormatThaiTimestamp(t *testing.T) {
+	// 2026-08-16 is a Sunday.
+	got := formatThaiTimestamp(time.Date(2026, 8, 16, 14, 32, 0, 0, time.UTC))
+	want := "วันอาทิตย์ 16 ส.ค. 2569 เวลา 14:32 น."
+	if got != want {
+		t.Fatalf("formatThaiTimestamp = %q, want %q", got, want)
+	}
+	// A different month/weekday to catch an off-by-one in either lookup
+	// table - 2026-01-01 is a Thursday.
+	got2 := formatThaiTimestamp(time.Date(2026, 1, 1, 9, 5, 0, 0, time.UTC))
+	want2 := "วันพฤหัสบดี 1 ม.ค. 2569 เวลา 09:05 น."
+	if got2 != want2 {
+		t.Fatalf("formatThaiTimestamp = %q, want %q", got2, want2)
 	}
 }
 
@@ -9281,6 +9305,67 @@ func newMockLineRESTServer(t *testing.T) (*httptest.Server, *lineSentTracker, *s
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv, tracker, &lastAuth
+}
+
+// newMockLineRESTServerWithContent mirrors newMockLineRESTServer exactly
+// but serves caller-provided bytes at the content-download endpoint
+// instead of always returning minimalPNG - needed for PDF tests, which
+// need different bytes served there than every existing image test
+// already relies on that shared helper for.
+func newMockLineRESTServerWithContent(t *testing.T, content []byte) (*httptest.Server, *lineSentTracker) {
+	t.Helper()
+	tracker := &lineSentTracker{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/info", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"userId":"Ubot","displayName":"olabot"}`)
+	})
+	mux.HandleFunc("/profile/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"displayName":"สมชาย"}`)
+	})
+	mux.HandleFunc("/group/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"displayName":"สมหญิง"}`)
+	})
+	mux.HandleFunc("/message/", func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/content") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Write(content)
+	})
+	mux.HandleFunc("/message/reply", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ReplyToken string `json:"replyToken"`
+			Messages   []struct {
+				Text string `json:"text"`
+			} `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		for _, m := range body.Messages {
+			tracker.add(lineSentMessage{"reply", body.ReplyToken, m.Text})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{}`)
+	})
+	mux.HandleFunc("/message/push", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			To       string `json:"to"`
+			Messages []struct {
+				Text string `json:"text"`
+			} `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		for _, m := range body.Messages {
+			tracker.add(lineSentMessage{"push", body.To, m.Text})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, tracker
 }
 
 func TestLineRESTAuthHeaderUsesBearerScheme(t *testing.T) {
@@ -10029,6 +10114,80 @@ var minimalPNG = []byte{
 	0x00, 0x05, 0x00, 0x01, 0x5a, 0x39, 0x0e, 0x74, 0x00, 0x00, 0x00, 0x00,
 	0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
 }
+
+// minimalPDF is a small, genuinely valid single-page PDF (real content
+// stream, real xref/trailer structure) - used to exercise the REAL
+// pdftoppm conversion path in tests (this sandbox has poppler-utils
+// installed), not just a byte blob that happens to satisfy a mock. Any
+// test needing a second, distinguishable page uses minimalPDFTwoPage
+// below instead.
+var minimalPDF = []byte(`%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+5 0 obj
+<< /Length 44 >>
+stream
+BT /F1 24 Tf 20 100 Td (Test PDF Page) Tj ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+0
+%%EOF`)
+
+// minimalPDFTwoPage is minimalPDF's own two-page counterpart, used only
+// where a test specifically needs to confirm --pdf-max-pages actually
+// limits how many pages get converted.
+var minimalPDFTwoPage = []byte(`%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+5 0 obj
+<< /Length 40 >>
+stream
+BT /F1 24 Tf 20 100 Td (Page One) Tj ET
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 7 0 R >>
+endobj
+7 0 obj
+<< /Length 40 >>
+stream
+BT /F1 24 Tf 20 100 Td (Page Two) Tj ET
+endstream
+endobj
+xref
+0 8
+0000000000 65535 f 
+trailer
+<< /Size 8 /Root 1 0 R >>
+startxref
+0
+%%EOF`)
 
 func TestResolveWebBotAvatarLocalFileBecomesDataURI(t *testing.T) {
 	dir := t.TempDir()
@@ -11252,8 +11411,8 @@ func TestCmdBotFunctionsWireSaveImagesIntoChatBotCore(t *testing.T) {
 	}
 	text := string(src)
 
-	funcs := []string{"cmdTelegramBot", "cmdDiscordBot", "cmdLineBot"}
-	for _, fn := range funcs {
+	bodyOf := func(fn string) string {
+		t.Helper()
 		start := strings.Index(text, "\nfunc "+fn+"(")
 		if start == -1 {
 			t.Fatalf("could not locate func %s in main.go", fn)
@@ -11264,8 +11423,15 @@ func TestCmdBotFunctionsWireSaveImagesIntoChatBotCore(t *testing.T) {
 		if end == -1 {
 			end = len(rest)
 		}
-		body := rest[:end]
+		return rest[:end]
+	}
 
+	// saveImages/read_pic/read_saved_pdf are telegram/discord/line only -
+	// webbot deliberately never persists anything (see its own header
+	// comment), so it has no equivalent fields to check for here.
+	saveImagesFuncs := []string{"cmdTelegramBot", "cmdDiscordBot", "cmdLineBot"}
+	for _, fn := range saveImagesFuncs {
+		body := bodyOf(fn)
 		if !strings.Contains(body, "chatBotCore{") {
 			t.Fatalf("%s: expected a chatBotCore{...} literal", fn)
 		}
@@ -11274,8 +11440,22 @@ func TestCmdBotFunctionsWireSaveImagesIntoChatBotCore(t *testing.T) {
 				"the resolved --save-images/OLA_SAVE_IMAGES value never reaches the running session "+
 				"(this is exactly the bug this test exists to catch)", fn)
 		}
-		if !strings.Contains(body, "maxImageSize:") {
-			t.Fatalf("%s: chatBotCore{...} literal is missing a maxImageSize: assignment", fn)
+	}
+
+	// maxImageSize/maxPDFSize/pdfMaxPages/pdfDPI apply to all four bots,
+	// including webbot (which converts/attaches images and PDFs
+	// immediately without ever saving them, but still needs its own size
+	// limits and conversion settings wired through the same way).
+	allBotFuncs := []string{"cmdTelegramBot", "cmdDiscordBot", "cmdLineBot", "cmdWebBot"}
+	requiredFields := []string{"maxImageSize:", "maxPDFSize:", "pdfMaxPages:", "pdfDPI:"}
+	for _, fn := range allBotFuncs {
+		body := bodyOf(fn)
+		for _, field := range requiredFields {
+			if !strings.Contains(body, field) {
+				t.Fatalf("%s: chatBotCore{...} literal is missing a %s assignment - "+
+					"the resolved flag/env value never reaches the running session (same bug "+
+					"class the saveImages check above already caught once for a different field)", fn, field)
+			}
 		}
 	}
 }
@@ -11670,7 +11850,7 @@ func TestAutoAttachPriorPictureWhenModelNeverCallsReadPic(t *testing.T) {
 	if !strings.Contains(lastRequestBody, wantB64) {
 		t.Fatal("expected the real image bytes to reach the model's actual request automatically, even though the model never called read_pic")
 	}
-	if !strings.Contains(lastRequestBody, "แนบรูปจากข้อความก่อนหน้านี้ในแชทให้อัตโนมัติ") {
+	if !strings.Contains(lastRequestBody, "แนบรูป/ไฟล์จากข้อความก่อนหน้านี้ในแชทให้อัตโนมัติ") {
 		t.Fatal("expected the auto-attach note instructing the model to ground its answer in the real picture")
 	}
 	if len(*sent) != 1 || (*sent)[0].Content != "รูปนี้เป็นภาพวาดคู่รักในชุดอินเดียครับ" {
@@ -11726,7 +11906,7 @@ func TestAutoAttachPriorPictureDoesNotOverrideAnAlreadyAttachedImage(t *testing.
 	if !strings.Contains(lastRequestBody, wantB64) {
 		t.Fatal("expected the image actually attached to the addressed message to be used")
 	}
-	if strings.Contains(lastRequestBody, "แนบรูปจากข้อความก่อนหน้านี้ในแชทให้อัตโนมัติ") {
+	if strings.Contains(lastRequestBody, "แนบรูป/ไฟล์จากข้อความก่อนหน้านี้ในแชทให้อัตโนมัติ") {
 		t.Fatal("expected no auto-attach note when the message already carries its own image")
 	}
 }
@@ -11748,11 +11928,1051 @@ func TestAutoAttachPriorPictureSkipsWhenPrecedingTurnHasNoPicture(t *testing.T) 
 	defer logFile.Close()
 	c := &chatBotCore{contextDir: t.TempDir(), outFile: logFile}
 
-	got := c.autoAttachPriorPicture([]chatTurn{{Role: "user", Content: "สวัสดีครับ"}})
+	got := c.autoAttachPriorMedia([]chatTurn{{Role: "user", Content: "สวัสดีครับ"}})
 	if got != nil {
 		t.Fatalf("expected nil when the preceding turn has no picture tag, got: %#v", got)
 	}
-	if got := c.autoAttachPriorPicture(nil); got != nil {
+	if got := c.autoAttachPriorMedia(nil); got != nil {
 		t.Fatalf("expected nil for an empty turn history, got: %#v", got)
+	}
+}
+
+// ======================================================================
+// Section: PDF support (telegrambot/discordbot/linebot/webbot) and
+// --max-pdf-size/--pdf-max-pages/--pdf-dpi. Uses minimalPDF/
+// minimalPDFTwoPage (real, valid PDFs) against the REAL pdftoppm
+// conversion path throughout - this sandbox has poppler-utils installed,
+// so these tests exercise actual PDF-to-image rendering, not a mocked
+// stand-in for it.
+// ======================================================================
+
+func TestSavePDFFileWritesUnderPerChatSubfolder(t *testing.T) {
+	contextDir := t.TempDir()
+	ref, err := savePDFFile(contextDir, "group_-999", minimalPDF)
+	if err != nil {
+		t.Fatalf("savePDFFile error: %v", err)
+	}
+	if !strings.HasPrefix(ref, "pdfs/group_-999/") {
+		t.Fatalf("expected the ref to be scoped under pdfs/<chatKey>/, got: %q", ref)
+	}
+	if !strings.HasSuffix(ref, ".pdf") {
+		t.Fatalf("expected a .pdf extension, got: %q", ref)
+	}
+	full := filepath.Join(contextDir, filepath.FromSlash(ref))
+	data, err := os.ReadFile(full)
+	if err != nil {
+		t.Fatalf("expected the file to actually exist on disk at %s: %v", full, err)
+	}
+	if !bytes.Equal(data, minimalPDF) {
+		t.Fatal("expected the saved file's bytes to exactly match the input")
+	}
+}
+
+func TestSavePDFFileIsolatesDifferentChats(t *testing.T) {
+	contextDir := t.TempDir()
+	refA, err := savePDFFile(contextDir, "group_-111", minimalPDF)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refB, err := savePDFFile(contextDir, "group_-222", minimalPDF)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refA == refB {
+		t.Fatal("expected two different chats saving the same PDF bytes to land in different per-chat paths")
+	}
+}
+
+func TestConvertDownloadedPDFBytesRealConversion(t *testing.T) {
+	pages, truncated, err := convertDownloadedPDFBytes(minimalPDFTwoPage, 20, 100)
+	if err != nil {
+		t.Fatalf("convertDownloadedPDFBytes error: %v", err)
+	}
+	if len(pages) != 2 {
+		t.Fatalf("expected 2 pages from the real conversion, got %d", len(pages))
+	}
+	if truncated {
+		t.Fatal("expected truncated=false when maxPages exceeds the actual page count")
+	}
+	// Each page must be a real, valid base64-encoded PNG - decode and
+	// sniff it rather than just trusting the string isn't empty.
+	for i, p := range pages {
+		raw, err := base64.StdEncoding.DecodeString(p)
+		if err != nil {
+			t.Fatalf("page %d is not valid base64: %v", i, err)
+		}
+		if !strings.HasPrefix(http.DetectContentType(raw), "image/png") {
+			t.Fatalf("page %d does not look like a real PNG", i)
+		}
+	}
+}
+
+func TestConvertDownloadedPDFBytesRejectsGarbage(t *testing.T) {
+	if _, _, err := convertDownloadedPDFBytes([]byte("this is not a pdf at all"), 20, 100); err == nil {
+		t.Fatal("expected an error for data that isn't a real PDF")
+	}
+}
+
+func TestToolReadSavedPDFHappyPath(t *testing.T) {
+	contextDir := t.TempDir()
+	ref, err := savePDFFile(contextDir, "group_-999", minimalPDFTwoPage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := toolReadSavedPDF(map[string]interface{}{"path": ref}, contextDir, 20, 100)
+	if err != nil {
+		t.Fatalf("toolReadSavedPDF error: %v", err)
+	}
+	if !strings.Contains(result, "2 หน้า") {
+		t.Fatalf("expected the result to mention the real page count, got: %q", result)
+	}
+	popped := popLastReadSavedPDF()
+	if popped == nil {
+		t.Fatal("expected toolReadSavedPDF to stash a result for the follow-up message mechanism")
+	}
+	if popped.Path != ref || len(popped.Images) != 2 {
+		t.Fatalf("unexpected stashed result: %#v", popped)
+	}
+}
+
+func TestToolReadSavedPDFReportsTruncation(t *testing.T) {
+	contextDir := t.TempDir()
+	ref, err := savePDFFile(contextDir, "group_-999", minimalPDFTwoPage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := toolReadSavedPDF(map[string]interface{}{"path": ref}, contextDir, 1, 100)
+	if err != nil {
+		t.Fatalf("toolReadSavedPDF error: %v", err)
+	}
+	if !strings.Contains(result, "--pdf-max-pages") {
+		t.Fatalf("expected a truncation note when maxPages < the real page count, got: %q", result)
+	}
+	popped := popLastReadSavedPDF()
+	if popped == nil || len(popped.Images) != 1 {
+		t.Fatalf("expected exactly 1 stashed page when maxPages=1, got: %#v", popped)
+	}
+}
+
+func TestToolReadSavedPDFRejectsPathTraversal(t *testing.T) {
+	contextDir := t.TempDir()
+	outsideDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outsideDir, "secret.pdf"), minimalPDF, 0644); err != nil {
+		t.Fatal(err)
+	}
+	traversal := "../" + filepath.Base(outsideDir) + "/secret.pdf"
+	if _, err := toolReadSavedPDF(map[string]interface{}{"path": traversal}, contextDir, 20, 100); err == nil {
+		t.Fatal("expected a path-traversal attempt to be rejected")
+	}
+}
+
+func TestToolReadSavedPDFRejectsPathsOutsidePdfsSubfolder(t *testing.T) {
+	contextDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(contextDir, "knowledge-index.json"), []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := toolReadSavedPDF(map[string]interface{}{"path": "knowledge-index.json"}, contextDir, 20, 100); err == nil {
+		t.Fatal("expected a path outside pdfs/ to be rejected even though it's inside contextDir")
+	}
+}
+
+func TestToolReadSavedPDFMissingPathArgument(t *testing.T) {
+	if _, err := toolReadSavedPDF(map[string]interface{}{}, t.TempDir(), 20, 100); err == nil {
+		t.Fatal("expected an error when path is missing")
+	}
+}
+
+func TestReadSavedPDFFollowUpMessageBuildsMultiImageUserMessage(t *testing.T) {
+	setLastReadSavedPDFResult(readSavedPDFResult{Path: "pdfs/group_-999/x.pdf", Images: []string{"cGFnZTE=", "cGFnZTI="}})
+	msg, ok := readSavedPDFFollowUpMessage("read_saved_pdf", "อ่านสำเร็จ")
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if msg.Role != "user" || len(msg.Images) != 2 {
+		t.Fatalf("unexpected follow-up message: %#v", msg)
+	}
+	if !strings.Contains(msg.Content, "ห้ามเดาหรือแต่งรายละเอียดขึ้นเอง") {
+		t.Fatalf("expected the same anti-fabrication instruction pattern as read_pic's own follow-up, got: %q", msg.Content)
+	}
+}
+
+func TestReadSavedPDFFollowUpMessageIgnoresOtherToolsAndErrors(t *testing.T) {
+	setLastReadSavedPDFResult(readSavedPDFResult{Path: "pdfs/x.pdf", Images: []string{"cGFnZTE="}})
+	if _, ok := readSavedPDFFollowUpMessage("read_pic", "ok"); ok {
+		t.Fatal("expected no follow-up for a different tool name")
+	}
+	popLastReadSavedPDF()
+
+	setLastReadSavedPDFResult(readSavedPDFResult{Path: "pdfs/x.pdf", Images: []string{"cGFnZTE="}})
+	if _, ok := readSavedPDFFollowUpMessage("read_saved_pdf", "ERROR: แปลงไม่สำเร็จ"); ok {
+		t.Fatal("expected no follow-up when the tool call itself failed")
+	}
+	popLastReadSavedPDF()
+
+	if _, ok := readSavedPDFFollowUpMessage("read_saved_pdf", "ok"); ok {
+		t.Fatal("expected no follow-up when nothing was stashed")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Telegram: PDF document message handling
+// ─────────────────────────────────────────────────────────────────
+
+func TestHandleTelegramMessagePDFReachesModelAsConvertedPagesAndIsNotPersistedRaw(t *testing.T) {
+	var lastReqBody string
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		lastReqBody = string(body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("เอกสารนี้มี 2 หน้าครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	telegramSrv, sent, downloadCalls := newMockTelegramSendMessageAndFileServer(t, minimalPDFTwoPage)
+
+	contextDir := t.TempDir()
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, contextDir, map[int64]bool{111: true})
+	session.maxPDFSize = defaultMaxPDFSize
+	session.pdfMaxPages = 20
+	session.pdfDPI = 100
+	session.saveImages = true
+
+	msg := &tgMessage{
+		From:     tgUser{ID: 111, FirstName: "สมชาย"},
+		Chat:     tgChat{ID: 111, Type: "private"},
+		Caption:  "เอกสารนี้มีกี่หน้า",
+		Document: &tgDocument{FileID: "doc-id", FileName: "notes.pdf", MimeType: "application/pdf"},
+	}
+	session.handleTelegramMessage(msg)
+
+	if atomic.LoadInt32(downloadCalls) != 1 {
+		t.Fatalf("expected exactly 1 download, got %d", *downloadCalls)
+	}
+	// The real converted page images (not the raw PDF bytes) must reach
+	// the model - confirm by decoding what pdftoppm actually produced and
+	// checking those exact bytes are present in the request.
+	pages, _, err := convertDownloadedPDFBytes(minimalPDFTwoPage, 20, 100)
+	if err != nil {
+		t.Fatalf("reference conversion failed: %v", err)
+	}
+	for i, p := range pages {
+		if !strings.Contains(lastReqBody, p) {
+			t.Fatalf("expected converted page %d to reach the model request", i)
+		}
+	}
+	if len(*sent) != 1 || (*sent)[0].Text != "เอกสารนี้มี 2 หน้าครับ" {
+		t.Fatalf("expected the model's answer to be sent back, got: %#v", *sent)
+	}
+
+	cctx, err := loadChatContext(contextDir, telegramContextKey(msg.Chat))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	wantPDFB64 := base64.StdEncoding.EncodeToString(minimalPDFTwoPage)
+	for _, turn := range cctx.Turns {
+		if strings.Contains(turn.Content, wantPDFB64) {
+			t.Fatal("expected the persisted context turn to never contain raw PDF bytes")
+		}
+	}
+	if !strings.Contains(cctx.Turns[0].Content, "pdfs/user_111/") {
+		t.Fatalf("expected the persisted turn to reference the saved pdfs/ path, got: %q", cctx.Turns[0].Content)
+	}
+
+	entries, err := os.ReadDir(filepath.Join(contextDir, "pdfs", "user_111"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected exactly one saved PDF file, got %v (err=%v)", entries, err)
+	}
+	savedData, err := os.ReadFile(filepath.Join(contextDir, "pdfs", "user_111", entries[0].Name()))
+	if err != nil || !bytes.Equal(savedData, minimalPDFTwoPage) {
+		t.Fatal("expected the saved file to contain the exact original PDF bytes, not the converted pages")
+	}
+}
+
+func TestHandleTelegramMessagePDFOverSizeLimitRejectedWithoutDownload(t *testing.T) {
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	telegramSrv, sent, downloadCalls := newMockTelegramSendMessageAndFileServer(t, minimalPDF)
+
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, t.TempDir(), map[int64]bool{111: true})
+	session.maxPDFSize = 100 // tiny
+
+	msg := &tgMessage{
+		From:     tgUser{ID: 111, FirstName: "สมชาย"},
+		Chat:     tgChat{ID: 111, Type: "private"},
+		Document: &tgDocument{FileID: "doc-id", FileName: "big.pdf", MimeType: "application/pdf", FileSize: 5_000_000},
+	}
+	session.handleTelegramMessage(msg)
+
+	if atomic.LoadInt32(downloadCalls) != 0 {
+		t.Fatalf("expected the oversized PDF to be rejected BEFORE downloading (using Telegram's own reported size), got %d download(s)", *downloadCalls)
+	}
+	if len(*sent) != 1 || !strings.Contains((*sent)[0].Text, "เกินขีดจำกัด") {
+		t.Fatalf("expected a size-limit-exceeded reply, got: %#v", *sent)
+	}
+}
+
+func TestHandleTelegramMessageUnaddressedGroupPDFIsSavedWhenSaveImagesOn(t *testing.T) {
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) { atomic.AddInt32(&ollamaCalls, 1) })
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	telegramSrv, sent, downloadCalls := newMockTelegramSendMessageAndFileServer(t, minimalPDF)
+
+	contextDir := t.TempDir()
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, contextDir, map[int64]bool{})
+	session.access.Groups = map[int64]bool{-999: true}
+	session.saveImages = true
+	session.maxPDFSize = defaultMaxPDFSize
+	session.pdfMaxPages = 20
+	session.pdfDPI = 100
+
+	msg := &tgMessage{
+		From:     tgUser{ID: 111, FirstName: "สมชาย"},
+		Chat:     tgChat{ID: -999, Type: "group", Title: "ห้องเรียน"},
+		Document: &tgDocument{FileID: "doc-id", FileName: "notes.pdf", MimeType: "application/pdf"},
+	}
+	session.handleTelegramMessage(msg)
+
+	if atomic.LoadInt32(downloadCalls) != 1 {
+		t.Fatalf("expected the PDF to be downloaded (to save it) even though unaddressed, got %d", *downloadCalls)
+	}
+	if atomic.LoadInt32(&ollamaCalls) != 0 {
+		t.Fatal("expected no model call - it was never addressed, so it's never converted for analysis, only saved")
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("expected no reply, got: %#v", *sent)
+	}
+
+	cctx, err := loadChatContext(contextDir, telegramContextKey(msg.Chat))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	if len(cctx.Turns) != 1 || !strings.Contains(cctx.Turns[0].Content, "pdfs/group_-999/") {
+		t.Fatalf("expected a placeholder note referencing the saved PDF path, got: %#v", cctx.Turns)
+	}
+}
+
+func TestHandleTelegramMessagePDFSaveImagesOffKeepsGenericTag(t *testing.T) {
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	telegramSrv, sent, downloadCalls := newMockTelegramSendMessageAndFileServer(t, minimalPDF)
+
+	contextDir := t.TempDir()
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, contextDir, map[int64]bool{})
+	session.access.Groups = map[int64]bool{-999: true}
+	// saveImages deliberately left false
+
+	msg := &tgMessage{
+		From:     tgUser{ID: 111, FirstName: "สมชาย"},
+		Chat:     tgChat{ID: -999, Type: "group", Title: "ห้องเรียน"},
+		Document: &tgDocument{FileID: "doc-id", FileName: "notes.pdf", MimeType: "application/pdf"},
+	}
+	session.handleTelegramMessage(msg)
+
+	if atomic.LoadInt32(downloadCalls) != 0 {
+		t.Fatalf("expected no download at all when --save-images is off, got %d", *downloadCalls)
+	}
+	if len(*sent) != 0 {
+		t.Fatal("expected no reply")
+	}
+	cctx, err := loadChatContext(contextDir, telegramContextKey(msg.Chat))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	if len(cctx.Turns) != 1 || cctx.Turns[0].Content != "[ส่งไฟล์ PDF]" {
+		t.Fatalf("expected the bare placeholder tag with no pdfs/ reference, got: %#v", cctx.Turns)
+	}
+}
+
+func TestTgDocumentIsPDFDetection(t *testing.T) {
+	cases := []struct {
+		doc  tgDocument
+		want bool
+	}{
+		{tgDocument{MimeType: "application/pdf"}, true},
+		{tgDocument{MimeType: "text/plain"}, false},
+		{tgDocument{MimeType: "", FileName: "report.PDF"}, true}, // extension fallback, case-insensitive
+		{tgDocument{MimeType: "", FileName: "photo.jpg"}, false},
+	}
+	for _, c := range cases {
+		if got := c.doc.isPDF(); got != c.want {
+			t.Fatalf("isPDF() for %#v = %v, want %v", c.doc, got, c.want)
+		}
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Discord: PDF attachment handling
+// ─────────────────────────────────────────────────────────────────
+
+func TestHandleDiscordMessagePDFReachesModelAndIsNotPersistedRaw(t *testing.T) {
+	var lastReqBody string
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		lastReqBody = string(body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("เอกสารนี้มี 2 หน้าครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	discordSrv, sent, _ := newMockDiscordRESTServer(t)
+	cdnSrv, downloadCalls := newMockImageCDNServer(t, minimalPDFTwoPage)
+
+	contextDir := t.TempDir()
+	session := newTestDiscordSession(t, discordSrv, ollamaSrv, contextDir, map[string]bool{"111": true})
+	session.saveImages = true
+	session.maxPDFSize = defaultMaxPDFSize
+	session.pdfMaxPages = 20
+	session.pdfDPI = 100
+
+	msg := &discordMessage{
+		ChannelID:   "channel-1",
+		Author:      discordUser{ID: "111", Username: "somchai"},
+		Content:     "เอกสารนี้มีกี่หน้า",
+		Attachments: []discordAttachment{{URL: cdnSrv.URL + "/image.png", ContentType: "application/pdf", Filename: "notes.pdf"}},
+	}
+	session.handleDiscordMessage(msg)
+
+	if atomic.LoadInt32(downloadCalls) != 1 {
+		t.Fatalf("expected exactly 1 download, got %d", *downloadCalls)
+	}
+	pages, _, err := convertDownloadedPDFBytes(minimalPDFTwoPage, 20, 100)
+	if err != nil {
+		t.Fatalf("reference conversion failed: %v", err)
+	}
+	for i, p := range pages {
+		if !strings.Contains(lastReqBody, p) {
+			t.Fatalf("expected converted page %d to reach the model request", i)
+		}
+	}
+	if len(*sent) != 1 || (*sent)[0].Content != "เอกสารนี้มี 2 หน้าครับ" {
+		t.Fatalf("expected the model's answer to be sent back, got: %#v", *sent)
+	}
+
+	cctx, err := loadChatContext(contextDir, discordContextKey(msg))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	if !strings.Contains(cctx.Turns[0].Content, "pdfs/discord_dm_111/") {
+		t.Fatalf("expected the persisted turn to reference the saved pdfs/ path, got: %q", cctx.Turns[0].Content)
+	}
+}
+
+func TestHandleDiscordMessagePDFOverSizeLimitRejectedWithoutDownload(t *testing.T) {
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	discordSrv, sent, _ := newMockDiscordRESTServer(t)
+	cdnSrv, downloadCalls := newMockImageCDNServer(t, minimalPDF)
+
+	session := newTestDiscordSession(t, discordSrv, ollamaSrv, t.TempDir(), map[string]bool{"111": true})
+	session.maxPDFSize = 100
+
+	msg := &discordMessage{
+		ChannelID:   "channel-1",
+		Author:      discordUser{ID: "111", Username: "somchai"},
+		Attachments: []discordAttachment{{URL: cdnSrv.URL + "/image.png", ContentType: "application/pdf", Size: 5_000_000, Filename: "big.pdf"}},
+	}
+	session.handleDiscordMessage(msg)
+
+	if atomic.LoadInt32(downloadCalls) != 0 {
+		t.Fatalf("expected the oversized PDF to be rejected BEFORE downloading (using Discord's own reported Size), got %d download(s)", *downloadCalls)
+	}
+	if len(*sent) != 1 || !strings.Contains((*sent)[0].Content, "เกินขีดจำกัด") {
+		t.Fatalf("expected a size-limit-exceeded reply, got: %#v", *sent)
+	}
+}
+
+func TestDiscordAttachmentIsPDFDetection(t *testing.T) {
+	cases := []struct {
+		att  discordAttachment
+		want bool
+	}{
+		{discordAttachment{ContentType: "application/pdf"}, true},
+		{discordAttachment{ContentType: "image/png"}, false},
+		{discordAttachment{ContentType: "", Filename: "report.PDF"}, true},
+		{discordAttachment{ContentType: "", Filename: "photo.jpg"}, false},
+	}
+	for _, c := range cases {
+		if got := c.att.isPDF(); got != c.want {
+			t.Fatalf("isPDF() for %#v = %v, want %v", c.att, got, c.want)
+		}
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// LINE: file (PDF) message handling
+// ─────────────────────────────────────────────────────────────────
+
+func newTestLineSessionWithContent(t *testing.T, lineSrv, ollamaSrv *httptest.Server, contextDir string, users map[string]bool) *lineSession {
+	t.Helper()
+	logFile, err := os.CreateTemp(t.TempDir(), "linebot-test-log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { logFile.Close() })
+	return &lineSession{
+		chatBotCore: chatBotCore{
+			client:       ollamaSrv.Client(),
+			systemPrompt: buildChatBotSystemPrompt("LINE", ""),
+			tools:        filterTools(builtinTools, "get_current_time", "delay"),
+			pcfg:         providerConfig{Provider: providerOllama, Host: ollamaSrv.URL, Model: "mock-model"},
+			ctxSize:      4096,
+			contextDir:   contextDir,
+			knowledgeIdx: &knowledgeIndexStore{},
+			keepRecent:   defaultChatBotKeepRecentTurns,
+			compactAfter: defaultChatBotCompactAfterTurns,
+			maxImageSize: defaultMaxImageSize,
+			maxPDFSize:   defaultMaxPDFSize,
+			pdfMaxPages:  20,
+			pdfDPI:       100,
+			outFile:      logFile,
+			locks:        map[string]*sync.Mutex{},
+		},
+		restClient:    lineSrv.Client(),
+		apiBase:       lineSrv.URL,
+		dataAPIBase:   lineSrv.URL,
+		channelSecret: "secret",
+		token:         "test-token",
+		botUserID:     "Ubot",
+		access:        lineAccessConfig{Users: users, Groups: map[string]bool{}},
+		sem:           make(chan struct{}, 4),
+		nameCache:     map[string]string{},
+		recentEvents:  map[string]bool{},
+	}
+}
+
+func TestHandleLineMessagePDFDMReachesModelAndIsNotPersistedRaw(t *testing.T) {
+	var lastReqBody string
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		lastReqBody = string(body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("เอกสารนี้มี 2 หน้าครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	lineSrv, sent := newMockLineRESTServerWithContent(t, minimalPDFTwoPage)
+
+	contextDir := t.TempDir()
+	session := newTestLineSessionWithContent(t, lineSrv, ollamaSrv, contextDir, map[string]bool{"U111": true})
+	session.saveImages = true
+
+	ev := &lineEvent{
+		Type:           "message",
+		Source:         lineSource{Type: "user", UserID: "U111"},
+		ReplyToken:     "rtoken",
+		Message:        &lineMessage{ID: "msg-1", Type: "file", FileName: "notes.pdf"},
+		WebhookEventID: "evt-pdf-1",
+	}
+	session.handleLineMessage(ev)
+
+	got := sent.snapshot()
+	pages, _, err := convertDownloadedPDFBytes(minimalPDFTwoPage, 20, 100)
+	if err != nil {
+		t.Fatalf("reference conversion failed: %v", err)
+	}
+	for i, p := range pages {
+		if !strings.Contains(lastReqBody, p) {
+			t.Fatalf("expected converted page %d to reach the model request", i)
+		}
+	}
+	if len(got) != 1 || got[0].Kind != "push" || got[0].Text != "เอกสารนี้มี 2 หน้าครับ" {
+		t.Fatalf("expected the model's answer to be pushed back, got: %#v", got)
+	}
+
+	cctx, err := loadChatContext(contextDir, lineContextKey(ev.Source))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	wantPDFB64 := base64.StdEncoding.EncodeToString(minimalPDFTwoPage)
+	for _, turn := range cctx.Turns {
+		if strings.Contains(turn.Content, wantPDFB64) {
+			t.Fatal("expected the persisted context turn to never contain raw PDF bytes")
+		}
+	}
+	if !strings.Contains(cctx.Turns[0].Content, "pdfs/line_user_U111/") {
+		t.Fatalf("expected the persisted turn to reference the saved pdfs/ path, got: %q", cctx.Turns[0].Content)
+	}
+}
+
+func TestHandleLineMessagePDFInGroupIsAlwaysUnaddressed(t *testing.T) {
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) { atomic.AddInt32(&ollamaCalls, 1) })
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	lineSrv, sent := newMockLineRESTServerWithContent(t, minimalPDF)
+
+	contextDir := t.TempDir()
+	session := newTestLineSessionWithContent(t, lineSrv, ollamaSrv, contextDir, map[string]bool{})
+	session.access.Groups = map[string]bool{"C999": true}
+	session.saveImages = true
+
+	ev := &lineEvent{
+		Type:           "message",
+		Source:         lineSource{Type: "group", GroupID: "C999", UserID: "U111"},
+		ReplyToken:     "rtoken",
+		Message:        &lineMessage{ID: "msg-2", Type: "file", FileName: "notes.pdf"},
+		WebhookEventID: "evt-pdf-2",
+	}
+	session.handleLineMessage(ev)
+
+	// LINE file messages carry no mention object at all, same as image
+	// messages - see handleLineMessage's own comment.
+	if atomic.LoadInt32(&ollamaCalls) != 0 {
+		t.Fatal("expected a group PDF (unaddressable by definition) to never reach the model")
+	}
+	if len(sent.snapshot()) != 0 {
+		t.Fatalf("expected no reply, got: %#v", sent.snapshot())
+	}
+
+	cctx, err := loadChatContext(contextDir, lineContextKey(ev.Source))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	if len(cctx.Turns) != 1 || !strings.Contains(cctx.Turns[0].Content, "pdfs/line_group_C999/") {
+		t.Fatalf("expected a placeholder note referencing the saved PDF path, got: %#v", cctx.Turns)
+	}
+}
+
+func TestLineMessageIsPDFDetection(t *testing.T) {
+	cases := []struct {
+		msg  lineMessage
+		want bool
+	}{
+		{lineMessage{Type: "file", FileName: "report.pdf"}, true},
+		{lineMessage{Type: "file", FileName: "report.PDF"}, true},
+		{lineMessage{Type: "file", FileName: "report.docx"}, false},
+		{lineMessage{Type: "image", FileName: "x.pdf"}, false}, // type must be "file"
+		{lineMessage{Type: "text"}, false},
+	}
+	for _, c := range cases {
+		m := c.msg
+		if got := m.isPDF(); got != c.want {
+			t.Fatalf("isPDF() for %#v = %v, want %v", c.msg, got, c.want)
+		}
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// webbot: PDF upload handling
+// ─────────────────────────────────────────────────────────────────
+
+func TestWebBotChatHandlerPDFUploadReachesModelAndIsNotPersistedRaw(t *testing.T) {
+	var lastReqBody string
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		lastReqBody = string(body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("เอกสารนี้มี 2 หน้าครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	session := newTestWebBotSession(t, ollamaSrv, "")
+	session.maxPDFSize = defaultMaxPDFSize
+	session.pdfMaxPages = 20
+	session.pdfDPI = 100
+
+	sessRec := httptest.NewRecorder()
+	session.sessionHandler(sessRec, httptest.NewRequest(http.MethodPost, "/api/session", nil))
+	var sessResp webBotSessionResponse
+	_ = json.Unmarshal(sessRec.Body.Bytes(), &sessResp)
+
+	pdfB64 := base64.StdEncoding.EncodeToString(minimalPDFTwoPage)
+	chatBody, _ := json.Marshal(webBotChatRequest{
+		SessionID: sessResp.SessionID,
+		Message:   "เอกสารนี้มีกี่หน้า",
+		PDF:       "data:application/pdf;base64," + pdfB64,
+	})
+	chatRec := httptest.NewRecorder()
+	session.chatHandler(chatRec, httptest.NewRequest(http.MethodPost, "/api/chat", bytes.NewReader(chatBody)))
+
+	if chatRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", chatRec.Code, chatRec.Body.String())
+	}
+	pages, _, err := convertDownloadedPDFBytes(minimalPDFTwoPage, 20, 100)
+	if err != nil {
+		t.Fatalf("reference conversion failed: %v", err)
+	}
+	for i, p := range pages {
+		if !strings.Contains(lastReqBody, p) {
+			t.Fatalf("expected converted page %d to reach the model request", i)
+		}
+	}
+
+	ctx, ok := session.getSession(sessResp.SessionID)
+	if !ok {
+		t.Fatal("expected the session to still exist")
+	}
+	for _, turn := range ctx.Turns {
+		if strings.Contains(turn.Content, pdfB64) {
+			t.Fatal("expected the in-memory session turn to never contain raw PDF bytes")
+		}
+	}
+	found := false
+	for _, turn := range ctx.Turns {
+		if strings.Contains(turn.Content, "แนบไฟล์ PDF 2 หน้า") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a page-count tag noting the PDF was attached, got turns: %#v", ctx.Turns)
+	}
+}
+
+func TestWebBotChatHandlerRejectsOversizedPDF(t *testing.T) {
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	session := newTestWebBotSession(t, ollamaSrv, "")
+	session.maxPDFSize = 10 // bytes - trivially smaller than any real PDF
+
+	sessRec := httptest.NewRecorder()
+	session.sessionHandler(sessRec, httptest.NewRequest(http.MethodPost, "/api/session", nil))
+	var sessResp webBotSessionResponse
+	_ = json.Unmarshal(sessRec.Body.Bytes(), &sessResp)
+
+	pdfB64 := base64.StdEncoding.EncodeToString(minimalPDF)
+	chatBody, _ := json.Marshal(webBotChatRequest{SessionID: sessResp.SessionID, Message: "ดูไฟล์นี้", PDF: "data:application/pdf;base64," + pdfB64})
+	chatRec := httptest.NewRecorder()
+	session.chatHandler(chatRec, httptest.NewRequest(http.MethodPost, "/api/chat", bytes.NewReader(chatBody)))
+
+	if chatRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an oversized PDF, got %d", chatRec.Code)
+	}
+	var resp webBotChatResponse
+	_ = json.Unmarshal(chatRec.Body.Bytes(), &resp)
+	if !strings.Contains(resp.Error, "เกินขีดจำกัด") {
+		t.Fatalf("expected a size-limit-exceeded error, got: %q", resp.Error)
+	}
+}
+
+func TestWebBotChatHandlerRejectsGarbagePDF(t *testing.T) {
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	session := newTestWebBotSession(t, ollamaSrv, "")
+	session.maxPDFSize = defaultMaxPDFSize
+	session.pdfMaxPages = 20
+	session.pdfDPI = 100
+
+	sessRec := httptest.NewRecorder()
+	session.sessionHandler(sessRec, httptest.NewRequest(http.MethodPost, "/api/session", nil))
+	var sessResp webBotSessionResponse
+	_ = json.Unmarshal(sessRec.Body.Bytes(), &sessResp)
+
+	garbageB64 := base64.StdEncoding.EncodeToString([]byte("not a real pdf"))
+	chatBody, _ := json.Marshal(webBotChatRequest{SessionID: sessResp.SessionID, Message: "ดูไฟล์นี้", PDF: garbageB64})
+	chatRec := httptest.NewRecorder()
+	session.chatHandler(chatRec, httptest.NewRequest(http.MethodPost, "/api/chat", bytes.NewReader(chatBody)))
+
+	if chatRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a file that isn't a real PDF, got %d", chatRec.Code)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Auto-attach extended to PDFs, and the full read_saved_pdf
+// cross-conversation round trip - mirrors the equivalent picture tests
+// exactly, using real PDF conversion throughout.
+// ─────────────────────────────────────────────────────────────────
+
+func TestAutoAttachPriorMediaHandlesPDFWhenModelNeverCallsReadSavedPDF(t *testing.T) {
+	var lastRequestBody string
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		lastRequestBody = string(body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		// Reproduces the exact observed failure mode from the picture
+		// case: the model answers directly in a single round, never
+		// calling read_saved_pdf at all.
+		fmt.Fprint(w, streamLine("เอกสารนี้มี 2 หน้าครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	discordSrv, sent, _ := newMockDiscordRESTServer(t)
+	cdnSrv, _ := newMockImageCDNServer(t, minimalPDFTwoPage)
+
+	contextDir := t.TempDir()
+	session := newTestDiscordSession(t, discordSrv, ollamaSrv, contextDir, map[string]bool{"111": true})
+	session.access.Guilds = map[string]bool{"guild-1": true}
+	session.saveImages = true
+	session.maxPDFSize = defaultMaxPDFSize
+	session.pdfMaxPages = 20
+	session.pdfDPI = 100
+
+	// Step 1: a PDF posted in a guild channel with no mention at all -
+	// unaddressed, gets downloaded and saved silently per the prior
+	// feature (same as the picture case's own equivalent step).
+	session.handleDiscordMessage(&discordMessage{
+		GuildID: "guild-1", ChannelID: "channel-1",
+		Author:      discordUser{ID: "111", Username: "authapon"},
+		Attachments: []discordAttachment{{URL: cdnSrv.URL + "/image.png", ContentType: "application/pdf", Filename: "notes.pdf"}},
+	})
+
+	// Step 2: a short, separate, addressed question with NO file attached
+	// to this specific message - exactly the reported pattern, just for
+	// a document instead of a picture.
+	session.handleDiscordMessage(&discordMessage{
+		GuildID: "guild-1", ChannelID: "channel-1",
+		Author:   discordUser{ID: "111", Username: "authapon"},
+		Content:  "<@999> เอกสารนี้มีกี่หน้า",
+		Mentions: []discordUser{{ID: "999"}},
+	})
+
+	pages, _, err := convertDownloadedPDFBytes(minimalPDFTwoPage, 20, 100)
+	if err != nil {
+		t.Fatalf("reference conversion failed: %v", err)
+	}
+	for i, p := range pages {
+		if !strings.Contains(lastRequestBody, p) {
+			t.Fatalf("expected converted page %d to reach the model's actual request automatically, even though the model never called read_saved_pdf", i)
+		}
+	}
+	if !strings.Contains(lastRequestBody, "แนบรูป/ไฟล์จากข้อความก่อนหน้านี้ในแชทให้อัตโนมัติ") {
+		t.Fatal("expected the auto-attach note instructing the model to ground its answer in the real document")
+	}
+	if len(*sent) != 1 || (*sent)[0].Content != "เอกสารนี้มี 2 หน้าครับ" {
+		t.Fatalf("expected exactly one reply (the real answer), got: %#v", *sent)
+	}
+}
+
+func TestPdfRefsInTurnTextExtractsPath(t *testing.T) {
+	got := pdfRefsInTurnText("[แนบไฟล์ PDF: pdfs/group_-999/x.pdf]")
+	if len(got) != 1 || got[0] != "pdfs/group_-999/x.pdf" {
+		t.Fatalf("unexpected refs: %#v", got)
+	}
+	if got := pdfRefsInTurnText("ข้อความธรรมดาไม่มีไฟล์"); got != nil {
+		t.Fatalf("expected nil for text with no PDF tag, got: %#v", got)
+	}
+}
+
+// TestSavedPDFCanLaterBeReReadViaReadSavedPDF is the full end-to-end
+// proof of the actual model-initiated (not auto-attach) path: a PDF sent
+// in turn 1 gets saved; in a SEPARATE, later turn (simulated as several
+// turns later, past what auto-attach's own single-preceding-turn scope
+// would reach), the model itself decides to call read_saved_pdf on the
+// path from its own context history, and the real converted pages reach
+// it a second time.
+func TestSavedPDFCanLaterBeReReadViaReadSavedPDF(t *testing.T) {
+	round := 0
+	var finalRequestBody string
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		round++
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		if round == 1 {
+			fmt.Fprint(w, streamLine("บันทึกไว้แล้วครับ", "", "", true)) // first turn: acknowledge the PDF
+			return
+		}
+		if round == 2 {
+			// second turn: an unrelated chat message in between - no tool call.
+			fmt.Fprint(w, streamLine("ครับ ยินดีช่วยเหลือครับ", "", "", true))
+			return
+		}
+		if round == 3 {
+			// third turn: the model decides to call read_saved_pdf using
+			// the path from its own context history.
+			fmt.Fprint(w, streamLine("", "read_saved_pdf", `{"path":"`+lastSavedPDFRef+`"}`, true))
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		finalRequestBody = string(body)
+		fmt.Fprint(w, streamLine("เอกสารมี 2 หน้าตามที่เห็นครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	telegramSrv, sent, _ := newMockTelegramSendMessageAndFileServer(t, minimalPDFTwoPage)
+	contextDir := t.TempDir()
+	session := newTestTelegramSession(t, telegramSrv, ollamaSrv, contextDir, map[int64]bool{111: true})
+	session.saveImages = true
+	session.maxPDFSize = defaultMaxPDFSize
+	session.pdfMaxPages = 20
+	session.pdfDPI = 100
+	session.tools = append(session.tools, readSavedPDFTool)
+
+	chat := tgChat{ID: 111, Type: "private"}
+	// Turn 1: send the PDF with a caption.
+	session.handleTelegramMessage(&tgMessage{
+		From: tgUser{ID: 111, FirstName: "สมชาย"}, Chat: chat,
+		Caption:  "นี่คือเอกสารประกอบการเรียน",
+		Document: &tgDocument{FileID: "doc-1", FileName: "notes.pdf", MimeType: "application/pdf"},
+	})
+
+	cctx, err := loadChatContext(contextDir, telegramContextKey(chat))
+	if err != nil {
+		t.Fatalf("loadChatContext: %v", err)
+	}
+	idx := strings.Index(cctx.Turns[0].Content, "pdfs/")
+	if idx == -1 {
+		t.Fatalf("expected the first turn's stored text to reference a saved pdfs/ path, got: %#v", cctx.Turns)
+	}
+	end := strings.IndexAny(cctx.Turns[0].Content[idx:], "]\n")
+	if end == -1 {
+		end = len(cctx.Turns[0].Content) - idx
+	}
+	lastSavedPDFRef = cctx.Turns[0].Content[idx : idx+end]
+
+	// Turn 2: an unrelated message.
+	session.handleTelegramMessage(&tgMessage{
+		From: tgUser{ID: 111, FirstName: "สมชาย"}, Chat: chat,
+		Text: "สวัสดีครับ",
+	})
+
+	// Turn 3: ask about the document from much earlier - the model itself
+	// decides to call read_saved_pdf (simulated via round 3's scripted
+	// tool call above).
+	session.handleTelegramMessage(&tgMessage{
+		From: tgUser{ID: 111, FirstName: "สมชาย"}, Chat: chat,
+		Text: "เอกสารที่ส่งไปตอนแรก มีกี่หน้านะ",
+	})
+
+	if round != 4 {
+		t.Fatalf("expected exactly 4 model rounds (ack, unrelated reply, read_saved_pdf call, final answer after follow-up), got %d", round)
+	}
+	pages, _, err := convertDownloadedPDFBytes(minimalPDFTwoPage, 20, 100)
+	if err != nil {
+		t.Fatalf("reference conversion failed: %v", err)
+	}
+	for i, p := range pages {
+		if !strings.Contains(finalRequestBody, p) {
+			t.Fatalf("expected the re-read PDF page %d to reach the model in the follow-up round", i)
+		}
+	}
+	if len(*sent) != 3 || (*sent)[2].Text != "เอกสารมี 2 หน้าตามที่เห็นครับ" {
+		t.Fatalf("expected the third turn's real answer to be sent, got: %#v", *sent)
+	}
+}
+
+var lastSavedPDFRef string
+
+// ─────────────────────────────────────────────────────────────────
+// Timestamps in every prompt turn - added so the model always knows the
+// current date/time without needing to call get_current_time (real
+// reports showed it wasn't reliably calling that tool on its own for
+// this). Thai-localized format chosen deliberately (see
+// formatThaiTimestamp's own doc comment); get_current_time itself stays
+// available for anything needing more precision.
+// ─────────────────────────────────────────────────────────────────
+
+func TestHandleDiscordMessageIncludesTimestampInLiveOutgoingMessage(t *testing.T) {
+	var lastReqBody string
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		lastReqBody = string(body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("โอเคครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	discordSrv, _, _ := newMockDiscordRESTServer(t)
+
+	session := newTestDiscordSession(t, discordSrv, ollamaSrv, t.TempDir(), map[string]bool{"111": true})
+	msg := &discordMessage{
+		ChannelID: "channel-1",
+		Author:    discordUser{ID: "111", Username: "somchai"},
+		Content:   "วันนี้วันอะไร",
+	}
+	session.handleDiscordMessage(msg)
+
+	// Confirm the request genuinely contains a Thai timestamp bracket -
+	// not asserting the exact minute (the test would be flaky), just the
+	// recognizable shape: "วัน<ชื่อวัน> ... พ.ศ. ... เวลา HH:MM น."
+	if !strings.Contains(lastReqBody, "เวลา") || !strings.Contains(lastReqBody, "น.") {
+		t.Fatalf("expected a Thai timestamp bracket in the outgoing request, got: %s", lastReqBody[:min(600, len(lastReqBody))])
+	}
+	nowBEYear := time.Now().Year() + 543
+	if !strings.Contains(lastReqBody, fmt.Sprintf("%d", nowBEYear)) {
+		t.Fatalf("expected the current Buddhist Era year (%d) in the timestamp, got: %s", nowBEYear, lastReqBody[:min(600, len(lastReqBody))])
+	}
+}
+
+func TestBuildMessagesUsesEachTurnsOwnStoredTimestampNotNow(t *testing.T) {
+	oldTime := time.Date(2020, 3, 15, 9, 0, 0, 0, time.UTC) // deliberately long in the past, nowhere near "now"
+	cctx := &chatContext{
+		Key: "test",
+		Turns: []chatTurn{
+			{Role: "user", Content: "สวัสดี", Time: oldTime},
+			{Role: "assistant", Content: "สวัสดีครับ", Time: oldTime},
+		},
+	}
+	msgs := cctx.buildMessages("system prompt")
+	// msgs[0] is the system prompt; msgs[1] is the first real turn.
+	if !strings.Contains(msgs[1].Content, "2563") { // 2020 + 543 = 2563 BE
+		t.Fatalf("expected the replayed turn to show ITS OWN original 2020 timestamp (2563 BE), not today's, got: %q", msgs[1].Content)
+	}
+	if strings.Contains(msgs[1].Content, fmt.Sprintf("%d", time.Now().Year()+543)) {
+		t.Fatal("expected the replayed old turn to NOT show today's year - it should reflect when it actually happened")
+	}
+}
+
+func TestPersistedChatContextStoresRealTimestampPerTurn(t *testing.T) {
+	contextDir := t.TempDir()
+	before := time.Now()
+	cctx, err := loadChatContext(contextDir, "group_-999")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cctx.Turns = append(cctx.Turns, chatTurn{Role: "user", Content: "สวัสดี", Time: time.Now()})
+	if err := cctx.save(contextDir); err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now()
+
+	reloaded, err := loadChatContext(contextDir, "group_-999")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.Turns) != 1 {
+		t.Fatalf("expected 1 turn after reload, got %d", len(reloaded.Turns))
+	}
+	got := reloaded.Turns[0].Time
+	if got.Before(before.Add(-time.Second)) || got.After(after.Add(time.Second)) {
+		t.Fatalf("expected the persisted turn's timestamp to genuinely round-trip through the JSON file, got %v (expected between %v and %v)", got, before, after)
+	}
+}
+
+func TestWebBotChatHandlerIncludesTimestampInOutgoingMessage(t *testing.T) {
+	var lastReqBody string
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		lastReqBody = string(body)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("โอเคครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+	session := newTestWebBotSession(t, ollamaSrv, "")
+
+	sessRec := httptest.NewRecorder()
+	session.sessionHandler(sessRec, httptest.NewRequest(http.MethodPost, "/api/session", nil))
+	var sessResp webBotSessionResponse
+	_ = json.Unmarshal(sessRec.Body.Bytes(), &sessResp)
+
+	chatBody, _ := json.Marshal(webBotChatRequest{SessionID: sessResp.SessionID, Message: "วันนี้วันอะไร"})
+	chatRec := httptest.NewRecorder()
+	session.chatHandler(chatRec, httptest.NewRequest(http.MethodPost, "/api/chat", bytes.NewReader(chatBody)))
+
+	if !strings.Contains(lastReqBody, "เวลา") || !strings.Contains(lastReqBody, "น.") {
+		t.Fatalf("expected a Thai timestamp bracket in webbot's outgoing request too, got: %s", lastReqBody[:min(600, len(lastReqBody))])
+	}
+}
+
+// TestBuildChatBotSystemPromptExplainsTimestampsSoModelStopsCallingGetCurrentTime
+// pins the rule telling the model it no longer needs get_current_time
+// for basic "what's today's date" questions, since every message now
+// carries a real timestamp - added directly in response to reports that
+// the model wasn't reliably calling that tool on its own.
+func TestBuildChatBotSystemPromptExplainsTimestampsSoModelStopsCallingGetCurrentTime(t *testing.T) {
+	prompt := buildChatBotSystemPrompt("เว็บแชท", "")
+	if !strings.Contains(prompt, "โดยไม่ต้องเรียก get_current_time เลย") {
+		t.Fatal("expected the rules to explicitly tell the model it can read the timestamp instead of calling get_current_time")
 	}
 }

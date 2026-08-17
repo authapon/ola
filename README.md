@@ -511,6 +511,21 @@ ola telegrambot \
 
 ข้อควรรู้: กลุ่มที่ไม่อยู่ใน allowlist จะไม่ถูกบันทึกอะไรเลย (ไม่ว่าจะ mention บอทหรือไม่) — บอทไม่มีเหตุผลต้องจดจำบทสนทนาของกลุ่มที่ไม่ได้รับอนุญาตให้ใช้งานตั้งแต่แรก และ private chat (DM) ไม่มีการระบุชื่อผู้พูดกำกับ (มีคนเดียวคุยด้วยอยู่แล้ว การระบุชื่อไม่ได้เพิ่มข้อมูลอะไร)
 
+### วันเวลาในบทสนทนา — ไม่ต้องเรียก tool เพื่อถามวันที่/เวลาปัจจุบันอีกต่อไป
+
+ทุกข้อความที่ส่งให้โมเดิลดู (ทั้งของผู้ใช้และของบอทเอง ทั้งเทิร์นล่าสุดและเทิร์นเก่าที่ถูก replay กลับมาจากประวัติ) จะมี**วันเวลาจริงกำกับไว้ที่หน้าข้อความเสมอ** เช่น:
+```
+[วันอังคาร 16 ส.ค. 2569 เวลา 14:32 น.] [สมชาย] รูปนี้คืออะไร
+```
+เพิ่มเข้ามาโดยตรงเพราะพบจากการใช้งานจริงว่า**โมเดิลไม่เรียก `get_current_time` อย่างสม่ำเสมอ** แม้จะมี tool ให้ใช้อยู่แล้ว — ตรงกับ pattern เดียวกับที่แก้ปัญหาเรื่องรูปภาพ/PDF มาก่อน (อย่าพึ่งให้โมเดิลเรียก tool เอง ฝังข้อมูลที่จำเป็นเข้าไปตรงๆ แทนสำหรับกรณีที่พบบ่อยที่สุด)
+
+**รายละเอียดการออกแบบ:**
+- รูปแบบเป็นภาษาไทยธรรมชาติ (วันในสัปดาห์เต็ม, เดือนไทยย่อ, ปี พ.ศ., เวลา 24 ชม.) เลือกแบบนี้เพราะผู้อ่านข้อความนี้ทั้งหมด (ทั้งผู้ใช้ในแชทและตัวโมเดิลเอง) เป็นคนไทย/ใช้ภาษาไทย ใส่แบบสากล (ISO) เข้าไปจะดูแปลกแยกจากบริบทรอบข้าง
+- **แต่ละเทิร์นใช้เวลาจริงตอนที่เทิร์นนั้นเกิดขึ้น ไม่ใช่เวลาปัจจุบันเสมอไป** — เทิร์นเก่าที่ replay กลับมาจากประวัติ (เช่น เมื่อ 3 วันก่อน) จะยังโชว์เวลาของ 3 วันก่อนจริงๆ ไม่ถูกเขียนทับเป็น "ตอนนี้" ช่วยให้โมเดิลแยกแยะได้ว่าอะไรเพิ่งเกิดขึ้น อะไรเป็นเรื่องเก่า
+- **ไม่ได้ฝังลงไฟล์ context ที่บันทึกลงดิสก์** — `content` ที่เก็บไว้ยังสะอาดเหมือนเดิม (ไม่มี timestamp ปนอยู่ในข้อความ) เพราะแต่ละเทิร์นมี field `time` แยกเก็บอยู่แล้ว (มีมาตั้งแต่แรก) ระบบแค่เอามาประกอบเป็นข้อความตอนจะส่งให้โมเดิลดูเท่านั้น
+- **`get_current_time` ยังคงมีอยู่และยังใช้งานได้** — สำหรับกรณีที่ต้องการความละเอียดระดับวินาที หรือถามเรื่องเขตเวลาอื่นที่ timestamp ที่ฝังมาให้ไม่ครอบคลุม
+- ใช้เวลาตาม timezone ของเครื่องที่รัน service เอง — ถ้า deploy ผ่าน systemd แนะนำเช็คให้แน่ใจว่าตั้งเขตเวลาเครื่องถูกต้อง (`timedatectl` หรือ `Environment="TZ=Asia/Bangkok"` ใน service file)
+
 ### รองรับรูปภาพ — `--max-image-size`/`OLA_MAX_IMAGE_SIZE`
 
 ทั้งสี่บอทแชท (`telegrambot`/`discordbot`/`linebot`/`webbot`) รับรูปภาพจากผู้ใช้ได้ ผ่าน `chatBotCore` ตัวเดียวกัน — หลักการเดียวกันหมดทุกบอท:
@@ -544,6 +559,17 @@ ola telegrambot \
 - ไม่มีการลบรูปเก่าอัตโนมัติเลย — `pics/` จะโตขึ้นเรื่อยๆ ตามจำนวนรูปที่ส่งเข้ามา **ผู้ดูแลต้องจัดการพื้นที่ดิสก์เอง** (เช่น cron job ลบไฟล์เก่ากว่า N วัน) เหมือนกับที่ `knowledge-index.json` ก็ไม่มีการ prune อัตโนมัติเช่นกัน
 - รูปที่ save ไว้ไม่ถูกส่งกลับเข้า context ทุกรอบอัตโนมัติ (ถ้าทำแบบนั้นจะแพงขึ้นเรื่อยๆ ตามจำนวนรูปสะสม) โมเดิลต้องเรียก `read_pic` เองเมื่อต้องการดูจริงๆ เท่านั้น
 - ข้อความที่ไม่ addressed จะไม่มีการตอบกลับใดๆ เสมอ (ทั้งตอนบันทึกสำเร็จและตอนล้มเหลว เช่น รูปเกิน `--max-image-size` หรือดาวน์โหลดไม่สำเร็จ) ตรงกับหลักการเดิมที่ข้อความไม่ addressed จะถูก "บันทึกเงียบๆ" เสมอ ไม่ส่งอะไรกลับเลย
+
+### รองรับไฟล์ PDF — `--max-pdf-size`/`--pdf-max-pages`/`--pdf-dpi`
+
+ทั้งสี่บอทแชทรับไฟล์ PDF ได้แบบเดียวกับรูปภาพทุกประการ — **reuse กลไกแปลง PDF→ภาพเดียวกับที่ `read_pdf` ของ `ola ask`/`ola coding` ใช้อยู่แล้ว** (`pdftoppm` จาก poppler-utils) ไม่ใช่ระบบแยกใหม่:
+
+- **`--max-pdf-size`/`OLA_MAX_PDF_SIZE`** — ขนาดไฟล์ PDF สูงสุด default **20M** (ใหญ่กว่า `--max-image-size` เพราะเอกสารหลายหน้ามักมีขนาดใหญ่กว่ารูปเดี่ยวมาก) แยก flag ต่างหากจากรูปภาพโดยเจตนา จะได้ปรับแยกกันได้
+- **`--pdf-max-pages`/`OLA_PDF_MAX_PAGES`** (default 20) และ **`--pdf-dpi`/`OLA_PDF_DPI`** (default 150) — ตัวแปรเดียวกับที่ `read_pdf` ของ `ask`/`coding` ใช้อยู่แล้ว ไม่ใช่ชุดใหม่
+- ไฟล์ PDF ถูกแปลงเป็นภาพแต่ละหน้าแล้วแนบให้โมเดิลดูทันที (เฉพาะข้อความที่ addressed แล้วเท่านั้น หลักการเดียวกับรูปภาพทุกประการ — ดูหัวข้อด้านบน)
+- **telegrambot/discordbot/linebot** — ถ้าเปิด `--save-images` ไว้ (ตัวเดียวกับที่คุมรูปภาพ ไม่มี flag แยกสำหรับ PDF) จะบันทึกไฟล์ PDF ตัวจริง (ไม่ใช่ภาพที่แปลงแล้ว) ไว้ที่ `<context-dir>/pdfs/<chat-key>/` ด้วย — ประหยัดพื้นที่ดิสก์กว่าการเก็บภาพทุกหน้าไว้ถาวร เพราะแปลงใหม่จากไฟล์ต้นฉบับทุกครั้งที่เรียกดูซ้ำ โมเดิลมี tool ใหม่ **`read_saved_pdf`** ให้เรียกดูไฟล์เก่าอีกครั้ง (กลไก sandbox/auto-attach/กฎบังคับเรียกก่อนตอบ ทั้งหมดเหมือน `read_pic` ทุกประการ แค่ใช้กับ `pdfs/` แทน `pics/`)
+- **webbot** — แปลง+แนบให้ดูทันทีเหมือนกัน แต่**ไม่มีการบันทึกไฟล์ไว้เลย** (ไม่มี `--save-images`/`read_saved_pdf` สำหรับ webbot เพราะไม่ persist อะไรทั้งสิ้นตามหลักการเดิม) — ไฟล์ที่แนบมาจะถูกลืมทันทีที่ปิดแท็บ เหมือนรูปภาพ
+- ใน UI ของ webbot ปุ่มแนบไฟล์ (📎) รับได้ทั้งรูปและ PDF ในปุ่มเดียว — preview จะโชว์เป็น thumbnail สำหรับรูป หรือ badge 📄+ชื่อไฟล์สำหรับ PDF
 
 ### Persona — เติมต่อท้ายเท่านั้น ไม่ใช่ override
 
@@ -631,6 +657,9 @@ ola telegrambot \
 | — | `--telegram-max-concurrent` | `4` | จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส |
 | `OLA_MAX_IMAGE_SIZE` | `--max-image-size` | `10M` | ขนาดรูปภาพสูงสุด เช่น `10K`/`12M`/`1G` — ดูหัวข้อ "รองรับรูปภาพ" ด้านล่าง |
 | `OLA_SAVE_IMAGES` | `--save-images` | ปิด | บันทึกรูปที่ผู้ใช้ส่งไว้ที่ `<context-dir>/pics/` เพื่อให้โมเดิลเรียก `read_pic` ดูซ้ำได้ — ดูหัวข้อ "บันทึกรูปภาพไว้อ้างอิงข้ามบทสนทนา" ด้านล่าง |
+| `OLA_MAX_PDF_SIZE` | `--max-pdf-size` | `20M` | ขนาดไฟล์ PDF สูงสุด — ดูหัวข้อ "รองรับไฟล์ PDF" ด้านล่าง |
+| `OLA_PDF_MAX_PAGES` | `--pdf-max-pages` | `20` | จำนวนหน้าแรกสูงสุดที่แปลงต่อไฟล์ PDF (ตัวแปรเดียวกับ `read_pdf` ของ `ask`/`coding`) |
+| `OLA_PDF_DPI` | `--pdf-dpi` | `150` | ความละเอียดตอนแปลงหน้า PDF เป็นภาพ (ตัวแปรเดียวกับ `read_pdf` ของ `ask`/`coding`) |
 | — | `-o, --output` | `telegrambot.log` | log ไฟล์แบบเต็ม เปิดแบบ **append เสมอ** (ต่างจาก `ask`/`coding` ที่ overwrite เป็น default — `telegrambot` เป็น process เดียวรันยาวข้าม restart) |
 
 ตัวแปรที่เหลือ (การเชื่อมต่อโมเดล `-m/-c/-P/--api-base/-k`, `-x/--topic`, และ web search/fetch ทั้งชุด `--searxng-url`/`--ollama-search-key`/`--no-web-search`/ฯลฯ) ใช้ร่วมกับ `ola ask` ทุกประการ — ดู [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด) และ [Web search / web fetch](#web-search--web-fetch) `web_search` เปิดอัตโนมัติเมื่อมีการตั้ง backend ไว้ (SearXNG หรือ Ollama search key) ส่วน `web_fetch` เปิดอัตโนมัติเสมอเหมือน `ask` จนกว่าจะสั่ง `--no-web-search`
@@ -699,6 +728,9 @@ Discord ซ้อนโครงสร้างลึกกว่า Telegram: S
 | — | `--discord-max-concurrent` | `4` | จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส |
 | `OLA_MAX_IMAGE_SIZE` | `--max-image-size` | `10M` | ขนาดรูปภาพสูงสุด — เหมือน `ola telegrambot` ทุกประการ |
 | `OLA_SAVE_IMAGES` | `--save-images` | ปิด | บันทึกรูปไว้ดูซ้ำได้ — เหมือน `ola telegrambot` ทุกประการ |
+| `OLA_MAX_PDF_SIZE` | `--max-pdf-size` | `20M` | ขนาดไฟล์ PDF สูงสุด — เหมือน `ola telegrambot` ทุกประการ |
+| `OLA_PDF_MAX_PAGES` | `--pdf-max-pages` | `20` | จำนวนหน้าแรกสูงสุดที่แปลง — เหมือน `ola telegrambot` ทุกประการ |
+| `OLA_PDF_DPI` | `--pdf-dpi` | `150` | ความละเอียดตอนแปลง PDF — เหมือน `ola telegrambot` ทุกประการ |
 | — | `-o, --output` | `discordbot.log` | log ไฟล์แบบเต็ม เปิดแบบ append เสมอ |
 
 ตัวแปรที่เหลือทั้งหมด (`--persona`/`--persona-file`/`OLA_PERSONA`/`OLA_PERSONA_FILE`, `--knowledge-dir`/`OLA_KNOWLEDGE_DIR`, `--embed-model`/`OLA_EMBED_MODEL`/`--embed-top-k`/`--embed-min-score`/`--embed-refresh-interval`, `--context-dir`/`OLA_CONTEXT_DIR` (default ต่างกัน: `discord-context` ที่นี่ vs `telegram-context` ฝั่ง telegrambot ถ้าไม่ได้ตั้ง แต่**ตัวแปร env ตัวเดียวกัน** — ตั้ง `OLA_CONTEXT_DIR` แล้วสองบอทจะไปที่เดียวกันได้ถ้าต้องการ)/`--context-keep-recent`/`--context-compact-after`, การเชื่อมต่อโมเดล, web search/fetch ทั้งชุด) **ใช้ร่วมกับ `ola telegrambot` ทุก flag ทุกพฤติกรรมเป๊ะๆ** — ดู [`ola telegrambot`](#ola-telegrambot) และ [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด)
@@ -784,6 +816,9 @@ LINE อาจส่ง webhook event ซ้ำได้เอง (เช่น 
 | — | `--line-max-concurrent` | `4` | จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส |
 | `OLA_MAX_IMAGE_SIZE` | `--max-image-size` | `10M` | ขนาดรูปภาพสูงสุด — เหมือน `ola telegrambot` ทุกประการ |
 | `OLA_SAVE_IMAGES` | `--save-images` | ปิด | บันทึกรูปไว้ดูซ้ำได้ — เหมือน `ola telegrambot` ทุกประการ |
+| `OLA_MAX_PDF_SIZE` | `--max-pdf-size` | `20M` | ขนาดไฟล์ PDF สูงสุด — เหมือน `ola telegrambot` ทุกประการ |
+| `OLA_PDF_MAX_PAGES` | `--pdf-max-pages` | `20` | จำนวนหน้าแรกสูงสุดที่แปลง — เหมือน `ola telegrambot` ทุกประการ |
+| `OLA_PDF_DPI` | `--pdf-dpi` | `150` | ความละเอียดตอนแปลง PDF — เหมือน `ola telegrambot` ทุกประการ |
 | — | `-o, --output` | `linebot.log` | log ไฟล์แบบเต็ม เปิดแบบ append เสมอ |
 
 ตัวแปรที่เหลือทั้งหมด (`--persona`/`--persona-file`, `--knowledge-dir`, `--embed-model`/`--embed-top-k`/`--embed-min-score`/`--embed-refresh-interval`, `--context-dir`/`OLA_CONTEXT_DIR` (default `line-context` ถ้าไม่ได้ตั้ง — ตัวแปรเดียวกับอีกสองบอท), `--context-keep-recent`/`--context-compact-after`, การเชื่อมต่อโมเดล, web search/fetch ทั้งชุด) **ใช้ร่วมกับ `ola telegrambot` ทุก flag ทุกพฤติกรรมเป๊ะๆ** — ดู [`ola telegrambot`](#ola-telegrambot) และ [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด)
@@ -860,6 +895,9 @@ ola webbot \
 | `OLA_WEBBOT_TITLE` | `--webbot-title` | `ola webbot` | ข้อความใน `<title>` และหัวหน้าเว็บ |
 | `OLA_WEBBOT_AVATAR` | `--webbot-avatar` | — | URL (`http(s)://`/`data:`) หรือ path ไฟล์รูปภาพในเครื่อง (ฝังเป็น `data:` URI ให้อัตโนมัติ) |
 | `OLA_MAX_IMAGE_SIZE` | `--max-image-size` | `10M` | ขนาดรูปภาพสูงสุด — เหมือน `ola telegrambot` ทุกประการ |
+| `OLA_MAX_PDF_SIZE` | `--max-pdf-size` | `20M` | ขนาดไฟล์ PDF สูงสุด — แปลงเป็นภาพแนบให้ดูทันที **ไม่มีการบันทึกไฟล์ไว้เลย** (ไม่มี `--save-images`/`read_saved_pdf` สำหรับ webbot) |
+| `OLA_PDF_MAX_PAGES` | `--pdf-max-pages` | `20` | จำนวนหน้าแรกสูงสุดที่แปลงต่อไฟล์ PDF |
+| `OLA_PDF_DPI` | `--pdf-dpi` | `150` | ความละเอียดตอนแปลงหน้า PDF เป็นภาพ |
 | — | `-o, --output` | `webbot.log` | log ไฟล์แบบเต็ม เปิดแบบ append เสมอ |
 
 ตัวแปรที่เหลือทั้งหมด (`--persona`/`--persona-file`, `--knowledge-dir`, `--embed-model`/`--embed-top-k`/`--embed-min-score`/`--embed-refresh-interval`, `--context-dir`/`OLA_CONTEXT_DIR` (default `webbot-context` — เก็บเฉพาะ knowledge index เท่านั้น ไม่มีบทสนทนา), `--context-keep-recent`/`--context-compact-after` (compact บทสนทนาในหน่วยความจำเท่านั้น), การเชื่อมต่อโมเดล, web search/fetch ทั้งชุด) **ใช้ร่วมกับ `ola telegrambot` ทุก flag ทุกพฤติกรรมเป๊ะๆ** — ดู [`ola telegrambot`](#ola-telegrambot) และ [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด) **ไม่มี** flag allowlist แบบ `--*-allowed-users`/`--*-allowed-groups` เหมือนสามบอทก่อน เพราะไม่มีแนวคิด "ผู้ใช้แต่ละคน" ให้ allowlist — การควบคุมการเข้าถึงทำผ่าน network binding + token เท่านั้น
