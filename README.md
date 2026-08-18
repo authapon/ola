@@ -2,7 +2,7 @@
 
 **ola** เป็น CLI (คำสั่งเดียว, ไบนารีเดียว, เขียนด้วย Go ล้วน ไม่พึ่งพา `curl`/`jq`/`perl`/`base64` ภายนอก) สำหรับคุยกับ LLM ผ่าน Ollama (หรือ endpoint แบบ OpenAI-compatible ใดก็ได้) พร้อม **tool calling ที่เปิดใช้งานเสมอ** — โมเดลไม่ได้แค่ตอบข้อความ แต่ *อ่าน/เขียน/แก้ไฟล์จริงบนดิสก์*, รันคำสั่ง shell, ค้นเว็บ, เรียก API, โอนไฟล์ข้าม host, และถามคุณกลับเมื่อจำเป็น ทั้งหมดนี้ sandbox อยู่ใน current directory ที่คุณรัน `ola` เท่านั้น
 
-โปรเจกต์นี้มีหกคำสั่งย่อย:
+โปรเจกต์นี้มีแปดคำสั่งย่อย:
 
 | คำสั่ง | ใช้เมื่อไหร่ |
 |---|---|
@@ -11,9 +11,11 @@
 | [`ola telegrambot`](#ola-telegrambot) | รัน ola เป็น Telegram bot แบบ long-running ตอบเฉพาะ user/group ที่กำหนดไว้ล่วงหน้า ใช้ toolset แบบ read-only (ไม่แตะไฟล์/shell) พร้อมความจำต่อแชทที่ persist ข้าม process |
 | [`ola discordbot`](#ola-discordbot) | Discord counterpart ของ `telegrambot` — หลักการ/toolset/ความจำเหมือนกันทุกประการ ต่างแค่วิธีเชื่อมต่อกับแพลตฟอร์ม (Gateway WebSocket แทน long-polling) |
 | [`ola linebot`](#ola-linebot) | LINE counterpart ของ `telegrambot`/`discordbot` — หลักการ/toolset/ความจำเหมือนกันทุกประการ ต่างแค่วิธีเชื่อมต่อ (รับ webhook เข้ามาแทนที่จะ poll/เปิด connection ออกไปเอง) |
-| [`ola webbot`](#ola-webbot) | เว็บแอปแชทหน้าเดียวฝังในตัวไบนารี toolset เดียวกับสามบอทข้างบน แต่ไม่มี allowlist ผู้ใช้ (ป้องกันด้วย network binding + token แทน) และไม่ persist context ลงดิสก์เลย |
+| [`ola messengerbot`](#ola-messengerbot) | Facebook Messenger counterpart ของ `linebot` — เชื่อมต่อแบบ webhook เหมือนกัน แต่ Messenger ไม่มีแนวคิด "กลุ่ม" เลย ทุกบทสนทนาเป็น 1-on-1 กับ Page เท่านั้น |
+| [`ola whatsappbot`](#ola-whatsappbot) | WhatsApp counterpart ของ `messengerbot` ผ่าน WhatsApp Cloud API — เชื่อมต่อ/หลักการเหมือนกัน ต่างที่มีข้อจำกัดเรื่อง 24-hour customer service window ของ WhatsApp เอง |
+| [`ola webbot`](#ola-webbot) | เว็บแอปแชทหน้าเดียวฝังในตัวไบนารี toolset เดียวกับบอทข้างบน แต่ไม่มี allowlist ผู้ใช้ (ป้องกันด้วย network binding + token แทน) และไม่ persist context ลงดิสก์เลย |
 
-> ทั้งหกคำสั่งพูดได้สองภาษา (protocol): Ollama's native `/api/chat` (ค่าเริ่มต้น) หรือ endpoint แบบ OpenAI chat-completions (`-P openai`) — ดู [Provider](#provider-ollama-vs-openai-compatible)
+> ทั้งแปดคำสั่งพูดได้สองภาษา (protocol): Ollama's native `/api/chat` (ค่าเริ่มต้น) หรือ endpoint แบบ OpenAI chat-completions (`-P openai`) — ดู [Provider](#provider-ollama-vs-openai-compatible)
 
 ---
 
@@ -28,18 +30,20 @@
 7. [`ola telegrambot`](#ola-telegrambot)
 8. [`ola discordbot`](#ola-discordbot)
 9. [`ola linebot`](#ola-linebot)
-10. [`ola webbot`](#ola-webbot)
-11. [Provider: ollama vs openai-compatible](#provider-ollama-vs-openai-compatible)
-12. [Web search / web fetch](#web-search--web-fetch)
-13. [ตั้งค่า SearXNG ด้วย `websearch.yml`](#ตั้งค่า-searxng-ด้วย-websearchyml)
-14. [Skills system](#skills-system)
-15. [scp_copy — โอนไฟล์ข้าม host](#scp_copy--โอนไฟล์ข้าม-host)
-16. [api_request — เรียก HTTP API](#api_request--เรียก-http-api)
-17. [Quiet mode](#quiet-mode)
-18. [ntfy.sh push notifications](#ntfysh-push-notifications)
-19. [ไฟล์แพลตฟอร์ม (`platform_linux.go` / `platform_other.go`)](#ไฟล์แพลตฟอร์ม)
-20. [การรันเทสต์](#การรันเทสต์)
-21. [ข้อจำกัด/สิ่งที่ควรรู้](#ข้อจำกัดสิ่งที่ควรรู้)
+10. [`ola messengerbot`](#ola-messengerbot)
+11. [`ola whatsappbot`](#ola-whatsappbot)
+12. [`ola webbot`](#ola-webbot)
+13. [Provider: ollama vs openai-compatible](#provider-ollama-vs-openai-compatible)
+14. [Web search / web fetch](#web-search--web-fetch)
+15. [ตั้งค่า SearXNG ด้วย `websearch.yml`](#ตั้งค่า-searxng-ด้วย-websearchyml)
+16. [Skills system](#skills-system)
+17. [scp_copy — โอนไฟล์ข้าม host](#scp_copy--โอนไฟล์ข้าม-host)
+18. [api_request — เรียก HTTP API](#api_request--เรียก-http-api)
+19. [Quiet mode](#quiet-mode)
+20. [ntfy.sh push notifications](#ntfysh-push-notifications)
+21. [ไฟล์แพลตฟอร์ม (`platform_linux.go` / `platform_other.go`)](#ไฟล์แพลตฟอร์ม)
+22. [การรันเทสต์](#การรันเทสต์)
+23. [ข้อจำกัด/สิ่งที่ควรรู้](#ข้อจำกัดสิ่งที่ควรรู้)
 
 ---
 
@@ -50,9 +54,9 @@
 - **เขียนไฟล์จริง ไม่ใช่ข้อความให้ copy-paste** — ola รุ่นเก่าเคยมีกลไก marker พิเศษ (`<<<ooo FILENAME ooo>>> ... <<<xxx FILENAME xxx>>>`) กับคำสั่งย่อย `extract` ให้มนุษย์ค่อยแยกไฟล์เอาทีหลัง กลไกนั้นถูกถอดออกไปแล้ว — ตอนนี้ `write_file`/`edit_file` แก้ไฟล์บนดิสก์ทันที
 - **System prompt คงที่ ตายตัวในไบนารี** — ไม่มี `-s/--system` ให้เปลี่ยนจากภายนอกอีกต่อไป เพราะ contract ของ tool calling (tool มีอะไรบ้าง, sandbox ยังไง, เมื่อไหร่ต้องถาม user) สำคัญเกินกว่าจะให้ override แบบเสี่ยง prompt พังตอนรันจริง ข้อยกเว้นเดียวคือส่วน "AVAILABLE SKILLS" ที่ *เติมต่อ* ท้าย prompt เมื่อตั้งค่า skills เท่านั้น (ดู [Skills system](#skills-system))
 - **ไม่เชื่อคำพูดโมเดิลเปล่า ๆ** — เมื่อโมเดิลแก้ไฟล์โค้ด ola จะรัน build/test ของโปรเจกต์เองอย่างอิสระอีกครั้งก่อนยอมรับว่า "เสร็จ" (`ola ask`) หรือบังคับ gate หลายชั้น (`ola coding`) แทนที่จะเชื่อว่าโมเดิลพูดว่า "compiles/passes tests" แล้วจบ
-- **โครงสร้างซอร์สโค้ด** — โปรเจกต์รวมไฟล์ทั้งหมดเหลือน้อยไฟล์ (file-count cleanup): `main.go` (entry point + tool-calling loop ของทั้งหกคำสั่งย่อย + integrations ทั้งหมด รวม `telegrambot`/`discordbot`/`linebot`/`webbot`), `main_test.go` (เทสต์ทั้งหมด), และ `platform_linux.go`/`platform_other.go` ที่แยกเฉพาะโค้ดที่ผูกกับ build tag (`//go:build linux` / `//go:build !linux`) เพราะไฟล์แบบ build-tag ต้องมี "เฉพาะ" โค้ดที่ตรงเงื่อนไขเท่านั้น เลยรวมเข้า `main.go` ไม่ได้
-- **`telegrambot`/`discordbot`/`linebot`/`webbot` เป็น trust model คนละแบบกับ `ask`/`coding`** — สองคำสั่งนั้นรันในเทอร์มินัลของผู้ดำเนินการเอง แต่แชทบอททั้งสี่รับข้อความจากคนอื่นผ่านอินเทอร์เน็ต (หรือเครือข่ายท้องถิ่น กรณี `webbot`) จึงมี toolset แบบ read-only เท่านั้น (ไม่มี `read_file`/`write_file`/`run_command`/ฯลฯ) และ dispatcher tool ของตัวเอง (`dispatchChatToolCall`) แยกจาก `ask`/`coding` โดยเจตนา — ดู [`ola telegrambot`](#ola-telegrambot)/[`ola discordbot`](#ola-discordbot)/[`ola linebot`](#ola-linebot)/[`ola webbot`](#ola-webbot)
-- **`telegrambot`/`discordbot`/`linebot`/`webbot` ใช้ core ร่วมกัน** — persona, ฐานความรู้ (grep + embedding search), context compaction, grounding marker กัน hallucination, และ tool-calling loop ล้วนอยู่ใน `chatBotCore` ที่ทั้งสี่บอท embed ใช้ร่วมกัน มีแค่การเชื่อมต่อ/รับส่งข้อความกับแพลตฟอร์มเท่านั้นที่ต่างกันจริงๆ (และ `webbot` ไม่เรียก `.save()` เลย เพราะตั้งใจไม่ persist ลงดิสก์ — ดู [`ola webbot`](#ola-webbot)) — บั๊กที่แก้ในส่วน core จะได้ประโยชน์กับทุกบอทพร้อมกันเสมอ
+- **โครงสร้างซอร์สโค้ด** — โปรเจกต์รวมไฟล์ทั้งหมดเหลือน้อยไฟล์ (file-count cleanup): `main.go` (entry point + tool-calling loop ของทั้งแปดคำสั่งย่อย + integrations ทั้งหมด รวม `telegrambot`/`discordbot`/`linebot`/`messengerbot`/`whatsappbot`/`webbot`), `main_test.go` (เทสต์ทั้งหมด), และ `platform_linux.go`/`platform_other.go` ที่แยกเฉพาะโค้ดที่ผูกกับ build tag (`//go:build linux` / `//go:build !linux`) เพราะไฟล์แบบ build-tag ต้องมี "เฉพาะ" โค้ดที่ตรงเงื่อนไขเท่านั้น เลยรวมเข้า `main.go` ไม่ได้
+- **`telegrambot`/`discordbot`/`linebot`/`messengerbot`/`whatsappbot`/`webbot` เป็น trust model คนละแบบกับ `ask`/`coding`** — สองคำสั่งนั้นรันในเทอร์มินัลของผู้ดำเนินการเอง แต่แชทบอททั้งหกรับข้อความจากคนอื่นผ่านอินเทอร์เน็ต (หรือเครือข่ายท้องถิ่น กรณี `webbot`) จึงมี toolset แบบ read-only เท่านั้น (ไม่มี `read_file`/`write_file`/`run_command`/ฯลฯ) และ dispatcher tool ของตัวเอง (`dispatchChatToolCall`) แยกจาก `ask`/`coding` โดยเจตนา — ดู [`ola telegrambot`](#ola-telegrambot)/[`ola discordbot`](#ola-discordbot)/[`ola linebot`](#ola-linebot)/[`ola messengerbot`](#ola-messengerbot)/[`ola whatsappbot`](#ola-whatsappbot)/[`ola webbot`](#ola-webbot)
+- **`telegrambot`/`discordbot`/`linebot`/`messengerbot`/`whatsappbot`/`webbot` ใช้ core ร่วมกัน** — persona, ฐานความรู้ (grep + embedding search), context compaction, grounding marker กัน hallucination, และ tool-calling loop ล้วนอยู่ใน `chatBotCore` ที่ทั้งหกบอท embed ใช้ร่วมกัน มีแค่การเชื่อมต่อ/รับส่งข้อความกับแพลตฟอร์มเท่านั้นที่ต่างกันจริงๆ (และ `webbot` ไม่เรียก `.save()` เลย เพราะตั้งใจไม่ persist ลงดิสก์ — ดู [`ola webbot`](#ola-webbot); `messengerbot`/`whatsappbot` ไม่มีแนวคิดกลุ่ม/addressed เลยเพราะทั้งสองแพลตฟอร์มไม่มี "กลุ่ม" ผ่าน API ที่ใช้ — ดู [`ola messengerbot`](#ola-messengerbot)) — บั๊กที่แก้ในส่วน core จะได้ประโยชน์กับทุกบอทพร้อมกันเสมอ
 - **ต้องมี `github.com/gorilla/websocket` เป็น Go dependency เดียว** — เพราะ Discord ไม่มี long-polling ต้องเปิด WebSocket connection ค้างไว้ (Gateway) ซึ่ง Go stdlib ไม่มี WebSocket client ให้ใช้ ส่วนที่เหลือทั้งหมด (Gateway protocol เอง, REST client, ทุก integration อื่น) ยังเขียนด้วย stdlib ล้วนเหมือนเดิม — ดู [`ola discordbot`](#ola-discordbot) สำหรับรายละเอียดการตัดสินใจนี้
 
 ---
@@ -530,11 +534,11 @@ ola telegrambot \
 
 ### รองรับรูปภาพ — `--max-image-size`/`OLA_MAX_IMAGE_SIZE`
 
-ทั้งสี่บอทแชท (`telegrambot`/`discordbot`/`linebot`/`webbot`) รับรูปภาพจากผู้ใช้ได้ ผ่าน `chatBotCore` ตัวเดียวกัน — หลักการเดียวกันหมดทุกบอท:
+ทั้งหกบอทแชท (`telegrambot`/`discordbot`/`linebot`/`messengerbot`/`whatsappbot`/`webbot`) รับรูปภาพจากผู้ใช้ได้ ผ่าน `chatBotCore` ตัวเดียวกัน — หลักการเดียวกันหมดทุกบอท:
 
 - **ต้องใช้โมเดิลที่รองรับ vision จริง** (เช่น `llava`, `qwen2-vl`, `gemma3`/`gemma4` บางเวอร์ชัน หรือ GPT-4V-style ผ่าน OpenAI-compatible) โมเดิลข้อความล้วนจะเห็นแค่ข้อความ ไม่เห็นรูป — system prompt สั่งให้โมเดิลบอกตรงๆ ว่าดูรูปไม่ได้แทนที่จะแต่งคำอธิบายขึ้นเอง แต่ก็ยังขึ้นกับว่าโมเดิลจะทำตามจริงแค่ไหน
 - **`--max-image-size <size>`/`OLA_MAX_IMAGE_SIZE`** — ขนาดรูปภาพสูงสุดที่รับได้ เช่น `10K`, `12M`, `1G` (ไม่ใส่หน่วย = bytes) หน่วยเป็นแบบ binary (K=1024 ไม่ใช่ 1000) default **10M** — รูปเกินขนาดจะถูกปฏิเสธก่อนส่งให้โมเดิลเสมอ (Telegram/Discord ปฏิเสธได้ตั้งแต่ก่อนดาวน์โหลดด้วยซ้ำถ้าแพลตฟอร์มรายงานขนาดไฟล์มาให้ล่วงหน้า)
-- **โดยปกติรูปภาพไม่ถูกบันทึกลง context ถาวร** (ทั้งที่เก็บลงดิสก์อย่าง telegrambot/discordbot/linebot และที่เก็บในหน่วยความจำอย่าง webbot) — โมเดิลเห็นรูปแค่ในเทิร์นที่ส่งมาเท่านั้น เทิร์นที่บันทึกไว้จะมีแค่ข้อความ + tag สั้นๆ เช่น `[แนบรูปภาพ 1 รูป]` แทน กันไม่ให้ context โตเร็วเกินไปจากไฟล์ base64 — **ถ้าอยากให้ดูรูปเก่าซ้ำข้ามบทสนทนาได้ ดูหัวข้อ `--save-images` ด้านล่าง**
+- **โดยปกติรูปภาพไม่ถูกบันทึกลง context ถาวร** (ทั้งที่เก็บลงดิสก์อย่าง telegrambot/discordbot/linebot/messengerbot/whatsappbot และที่เก็บในหน่วยความจำอย่าง webbot) — โมเดิลเห็นรูปแค่ในเทิร์นที่ส่งมาเท่านั้น เทิร์นที่บันทึกไว้จะมีแค่ข้อความ + tag สั้นๆ เช่น `[แนบรูปภาพ 1 รูป]` แทน กันไม่ให้ context โตเร็วเกินไปจากไฟล์ base64 — **ถ้าอยากให้ดูรูปเก่าซ้ำข้ามบทสนทนาได้ ดูหัวข้อ `--save-images` ด้านล่าง**
 - **ในกลุ่ม/channel: ดาวน์โหลดรูปเฉพาะข้อความที่ถูก mention เท่านั้น** (เหมือนหลักการ record-แต่ไม่ตอบ ของข้อความทั่วไป — ดูหัวข้อ [พฤติกรรมใน group chat](#พฤติกรรมใน-group-chat) ด้านล่าง) ข้อความที่มีรูปแต่ไม่ถูก mention จะถูกบันทึกเป็น `[ส่งรูปภาพ]` เฉยๆ ไม่ดาวน์โหลดจริง ประหยัด bandwidth
 
 **ความต่างเฉพาะแพลตฟอร์ม:**
@@ -545,7 +549,7 @@ ola telegrambot \
 
 ### บันทึกรูปภาพไว้อ้างอิงข้ามบทสนทนา — `--save-images`/`OLA_SAVE_IMAGES`
 
-**เฉพาะ telegrambot/discordbot/linebot เท่านั้น — ไม่มีใน webbot โดยเจตนา** เพราะขัดกับดีไซน์ "ไม่ persist อะไรเลย" ของ webbot ที่ตั้งใจไว้ตั้งแต่แรก
+**เฉพาะ telegrambot/discordbot/linebot/messengerbot/whatsappbot เท่านั้น — ไม่มีใน webbot โดยเจตนา** เพราะขัดกับดีไซน์ "ไม่ persist อะไรเลย" ของ webbot ที่ตั้งใจไว้ตั้งแต่แรก
 
 ปิดโดย default (`--save-images`/`OLA_SAVE_IMAGES=1`/`true`/`yes`/`on` เพื่อเปิด) — เป็น **opt-in ไม่ใช่พฤติกรรมเริ่มต้นใหม่** เพราะเก็บรูปจริงที่ผู้ใช้ส่งมาไว้ถาวรมีนัยเรื่อง privacy/พื้นที่ดิสก์ที่มากกว่าการเก็บแค่ text tag เดิม
 
@@ -564,12 +568,12 @@ ola telegrambot \
 
 ### รองรับไฟล์ PDF — `--max-pdf-size`/`--pdf-max-pages`/`--pdf-dpi`
 
-ทั้งสี่บอทแชทรับไฟล์ PDF ได้แบบเดียวกับรูปภาพทุกประการ — **reuse กลไกแปลง PDF→ภาพเดียวกับที่ `read_pdf` ของ `ola ask`/`ola coding` ใช้อยู่แล้ว** (`pdftoppm` จาก poppler-utils) ไม่ใช่ระบบแยกใหม่:
+ทั้งหกบอทแชทรับไฟล์ PDF ได้แบบเดียวกับรูปภาพทุกประการ — **reuse กลไกแปลง PDF→ภาพเดียวกับที่ `read_pdf` ของ `ola ask`/`ola coding` ใช้อยู่แล้ว** (`pdftoppm` จาก poppler-utils) ไม่ใช่ระบบแยกใหม่:
 
 - **`--max-pdf-size`/`OLA_MAX_PDF_SIZE`** — ขนาดไฟล์ PDF สูงสุด default **20M** (ใหญ่กว่า `--max-image-size` เพราะเอกสารหลายหน้ามักมีขนาดใหญ่กว่ารูปเดี่ยวมาก) แยก flag ต่างหากจากรูปภาพโดยเจตนา จะได้ปรับแยกกันได้
 - **`--pdf-max-pages`/`OLA_PDF_MAX_PAGES`** (default 20) และ **`--pdf-dpi`/`OLA_PDF_DPI`** (default 150) — ตัวแปรเดียวกับที่ `read_pdf` ของ `ask`/`coding` ใช้อยู่แล้ว ไม่ใช่ชุดใหม่
 - ไฟล์ PDF ถูกแปลงเป็นภาพแต่ละหน้าแล้วแนบให้โมเดิลดูทันที (เฉพาะข้อความที่ addressed แล้วเท่านั้น หลักการเดียวกับรูปภาพทุกประการ — ดูหัวข้อด้านบน)
-- **telegrambot/discordbot/linebot** — ถ้าเปิด `--save-images` ไว้ (ตัวเดียวกับที่คุมรูปภาพ ไม่มี flag แยกสำหรับ PDF) จะบันทึกไฟล์ PDF ตัวจริง (ไม่ใช่ภาพที่แปลงแล้ว) ไว้ที่ `<context-dir>/pdfs/<chat-key>/` ด้วย — ประหยัดพื้นที่ดิสก์กว่าการเก็บภาพทุกหน้าไว้ถาวร เพราะแปลงใหม่จากไฟล์ต้นฉบับทุกครั้งที่เรียกดูซ้ำ โมเดิลมี tool ใหม่ **`read_saved_pdf`** ให้เรียกดูไฟล์เก่าอีกครั้ง (กลไก sandbox/auto-attach/กฎบังคับเรียกก่อนตอบ ทั้งหมดเหมือน `read_pic` ทุกประการ แค่ใช้กับ `pdfs/` แทน `pics/`)
+- **telegrambot/discordbot/linebot/messengerbot/whatsappbot** — ถ้าเปิด `--save-images` ไว้ (ตัวเดียวกับที่คุมรูปภาพ ไม่มี flag แยกสำหรับ PDF) จะบันทึกไฟล์ PDF ตัวจริง (ไม่ใช่ภาพที่แปลงแล้ว) ไว้ที่ `<context-dir>/pdfs/<chat-key>/` ด้วย — ประหยัดพื้นที่ดิสก์กว่าการเก็บภาพทุกหน้าไว้ถาวร เพราะแปลงใหม่จากไฟล์ต้นฉบับทุกครั้งที่เรียกดูซ้ำ โมเดิลมี tool ใหม่ **`read_saved_pdf`** ให้เรียกดูไฟล์เก่าอีกครั้ง (กลไก sandbox/auto-attach/กฎบังคับเรียกก่อนตอบ ทั้งหมดเหมือน `read_pic` ทุกประการ แค่ใช้กับ `pdfs/` แทน `pics/`)
 - **webbot** — แปลง+แนบให้ดูทันทีเหมือนกัน แต่**ไม่มีการบันทึกไฟล์ไว้เลย** (ไม่มี `--save-images`/`read_saved_pdf` สำหรับ webbot เพราะไม่ persist อะไรทั้งสิ้นตามหลักการเดิม) — ไฟล์ที่แนบมาจะถูกลืมทันทีที่ปิดแท็บ เหมือนรูปภาพ
 - ใน UI ของ webbot ปุ่มแนบไฟล์ (📎) รับได้ทั้งรูปและ PDF ในปุ่มเดียว — preview จะโชว์เป็น thumbnail สำหรับรูป หรือ badge 📄+ชื่อไฟล์สำหรับ PDF
 
@@ -827,22 +831,176 @@ LINE อาจส่ง webhook event ซ้ำได้เอง (เช่น 
 
 ---
 
+## `ola messengerbot`
+
+Facebook Messenger counterpart ของ `ola linebot` — **หลักการ, toolset, persona, ฐานความรู้ (grep + embedding search), context compaction, grounding marker ทั้งหมดเหมือนกันทุกประการ** เพราะใช้ `chatBotCore` ตัวเดียวกัน — **หัวข้อนี้จะพูดถึงเฉพาะส่วนที่ต่างเท่านั้น** ดูรายละเอียดส่วนที่เหมือนกันได้ที่ [`ola telegrambot`](#ola-telegrambot)
+
+### ความต่างสำคัญที่สุด: Messenger ไม่มีแนวคิด "กลุ่ม" เลย
+
+Telegram/Discord/LINE ทั้งสามมีทั้งแชท 1-on-1 และแชทกลุ่มที่บอทถูกเชิญเข้าไปได้ — **Messenger ไม่มีสิ่งนี้ผ่าน Messenger Platform API เลย** กล่องข้อความของ Page หนึ่งคือชุดของบทสนทนา 1-on-1 ระหว่างคนคนหนึ่ง (ระบุด้วย PSID — page-scoped ID เฉพาะของ Page นั้น) กับ Page เท่านั้น ดังนั้น:
+- **ไม่มีกลไก @mention/addressed** — ทุกข้อความที่เข้ามาถูกตอบเสมอ
+- **ไม่มี speaker attribution** — ไม่มีคนอื่นในบทสนทนาให้ต้องแยกว่าใครพูด
+- **allowlist มีชั้นเดียว** (PSID) ไม่ใช่สองสามชั้นแบบ Telegram/Discord/LINE
+
+### ยิง webhook เข้ามาเหมือน LINE (คนละทิศกับ Telegram/Discord)
+
+เหมือน `ola linebot` ทุกประการ: ต้องมี **public HTTPS endpoint** ให้ Messenger ยิง HTTP POST เข้ามาทุกครั้งที่มีข้อความ `ola messengerbot` รัน HTTP server เองด้วย `net/http` ตรงๆ ไม่มี Go dependency ใหม่เลย แต่**ต้องมี reverse proxy (เช่น Caddy/nginx) ที่จัดการ TLS ให้อยู่ข้างหน้า**
+
+การยืนยัน webhook URL ครั้งแรกใน Meta for Developers ใช้กลไก **GET request handshake** (`hub.mode`/`hub.verify_token`/`hub.challenge`) ต่างจาก LINE ที่แค่กดปุ่ม Verify ในคอนโซล — `ola messengerbot` ตอบ handshake นี้อัตโนมัติ (เทียบค่า `hub.verify_token` กับ `OLA_MESSENGER_VERIFY_TOKEN` ที่ตั้งไว้ แล้ว echo `hub.challenge` กลับถ้าตรงกัน)
+
+ทุก POST request จาก Messenger มี header `X-Hub-Signature-256` แนบมาด้วยเสมอ (HMAC-SHA256 ของ body คีย์ด้วย App Secret, hex-encoded, prefix `sha256=`) — กลไกเดียวกับที่ `ola whatsappbot` ใช้ (ทั้งสองเป็น Meta Graph API product เดียวกัน) ต่างจาก LINE's `X-Line-Signature` แค่รูปแบบ encoding
+
+### ⚠️ ต้องกด Subscribe หัวข้อ "messages" ให้ Page ด้วยมือ
+
+หลัง verify webhook URL ผ่านแล้ว ต้องกลับไปที่ Meta for Developers → [App] → Messenger → Webhooks → เลือก Page ของคุณ → กด Subscribe ให้ field `messages` (อย่างน้อย) **ลืมขั้นตอนนี้คือสาเหตุที่ verify ผ่านแล้วแต่ไม่มี event ส่งเข้ามาเลย** เหมือนกับ Discord's Message Content Intent และ LINE's "Allow bot to join group chats" — เป็น gotcha คนละแบบต่อแพลตฟอร์มที่ต้องเปิดเองเสมอ
+
+### เริ่มต้นใช้งาน
+
+```bash
+export OLA_MESSENGER_PAGE_TOKEN='page-access-token-from-meta-for-developers'
+export OLA_MESSENGER_APP_SECRET='your-app-secret'
+export OLA_MESSENGER_VERIFY_TOKEN='ตั้งค่าอะไรก็ได้ที่คุณกำหนดเอง-เอาไปกรอกตอน verify webhook'
+export OLA_OLLAMA_MODEL=qwen3.6:27b
+
+# ยังไม่รู้ PSID ของตัวเอง? ทัก /whoami กับ Page ก่อน (ทำงานแม้ยังไม่อยู่ใน allowlist)
+ola messengerbot --messenger-allowed-users 0000000000000000
+
+# ใช้งานจริง
+ola messengerbot \
+  --messenger-allowed-users 1111111111111111 \
+  --persona 'คุณคือผู้ช่วยตอบคำถามวิชา Network Security ของภาควิชา ตอบสุภาพ กระชับ เป็นภาษาไทย' \
+  --knowledge-dir /srv/course-docs/network-security \
+  --embed-model bge-m3 \
+  --messenger-listen-addr 127.0.0.1:8081
+```
+
+เหมือน `ola linebot` — แนะนำให้ฟังแค่ `127.0.0.1:8081` แล้ววาง reverse proxy ไว้ข้างหน้าจัดการ TLS แทนที่จะให้ `ola messengerbot` ฟัง public interface เองตรงๆ
+
+### Access control (allowlist ชั้นเดียว)
+
+| Flag | ความหมาย |
+|---|---|
+| `--messenger-allowed-users` | PSID ที่แชท 1-on-1 ได้ — ไม่มี `--messenger-allowed-groups` เพราะไม่มีแนวคิดกลุ่มให้ allowlist |
+
+### ความจำต่อแชท
+
+`messenger_user_<psid>.json` — คีย์ขึ้นต้นด้วย `messenger_` เสมอ ชนกับ Telegram/Discord/LINE/WhatsApp ไม่ได้ **ใช้ `--context-dir` เดียวกับบอทอื่นได้อย่างปลอดภัย**
+
+### รูปภาพ/PDF: ดาวน์โหลดตรงจาก URL ที่แนบมาเลย ไม่ต้องมี extra lookup
+
+Attachment ของ Messenger (`message.attachments[].payload.url`) เป็น URL ที่ resolve พร้อมดาวน์โหลดได้ทันทีอยู่แล้ว (เหมือน Discord's attachment URL) ต่างจาก Telegram/LINE ที่ต้องเรียก API แยกเพื่อขอ URL จริงก่อน (`ola whatsappbot` เองก็ต้องทำแบบ Telegram/LINE — ดูหัวข้อถัดไป) — `ola messengerbot` วิเคราะห์รูป/PDF แรกที่เจอในข้อความเท่านั้น (ข้อความหนึ่งมี attachment ได้หลายไฟล์ แต่ไม่รองรับหลายไฟล์พร้อมกัน)
+
+### Flags / Environment variables
+
+| ตัวแปร | Flag | ค่าเริ่มต้น | หมายเหตุ |
+|---|---|---|---|
+| `OLA_MESSENGER_PAGE_TOKEN` | *(env เท่านั้น)* | — | **จำเป็น** — Page Access Token จาก Meta for Developers |
+| `OLA_MESSENGER_APP_SECRET` | *(env เท่านั้น)* | — | **จำเป็น** — App Secret ใช้ตรวจสอบ signature ของ webhook |
+| `OLA_MESSENGER_VERIFY_TOKEN` | *(env เท่านั้น)* | — | **จำเป็น** — ค่าที่กำหนดเอง ใช้ตอนยืนยัน webhook URL ครั้งแรก |
+| `OLA_MESSENGER_ALLOWED_USERS` | `--messenger-allowed-users` | — | comma-separated PSID |
+| `OLA_MESSENGER_API_BASE` | `--messenger-api-base` | `https://graph.facebook.com/v21.0` | override สำหรับทดสอบกับ mock server |
+| `OLA_MESSENGER_LISTEN_ADDR` | `--messenger-listen-addr` | `:8081` | แนะนำผูกแค่ `127.0.0.1:8081` แล้ววาง reverse proxy ไว้ข้างหน้า |
+| `OLA_MESSENGER_WEBHOOK_PATH` | `--messenger-webhook-path` | `/messenger/webhook` | path ของ webhook (ต้องตรงกับที่ตั้งใน Meta for Developers) |
+| — | `--messenger-max-concurrent` | `4` | จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส |
+| `OLA_MAX_IMAGE_SIZE` | `--max-image-size` | `10M` | เหมือน `ola telegrambot` ทุกประการ |
+| `OLA_SAVE_IMAGES` | `--save-images` | ปิด | เหมือน `ola telegrambot` ทุกประการ |
+| `OLA_MAX_PDF_SIZE`/`OLA_PDF_MAX_PAGES`/`OLA_PDF_DPI` | `--max-pdf-size`/`--pdf-max-pages`/`--pdf-dpi` | `20M`/`20`/`150` | เหมือน `ola telegrambot` ทุกประการ |
+| — | `-o, --output` | `messengerbot.log` | log ไฟล์แบบเต็ม เปิดแบบ append เสมอ |
+
+ตัวแปรที่เหลือ (`--persona`/`--persona-file`, `--knowledge-dir`, `--embed-*`, `--context-dir`/`OLA_CONTEXT_DIR` (default `messenger-context`), `--context-keep-recent`/`--context-compact-after`, การเชื่อมต่อโมเดล, web search/fetch ทั้งชุด) **ใช้ร่วมกับ `ola telegrambot` ทุก flag ทุกพฤติกรรมเป๊ะๆ** — ดู [`ola telegrambot`](#ola-telegrambot)
+
+---
+
+## `ola whatsappbot`
+
+WhatsApp counterpart ของ `ola messengerbot` ผ่าน **WhatsApp Cloud API** — **หลักการ/toolset/persona/ฐานความรู้/context compaction ทั้งหมดเหมือนกันทุกประการ** (ใช้ `chatBotCore` ตัวเดียวกัน) รวมถึง**ไม่มีแนวคิดกลุ่มเลยเหมือนกัน** (ทุกบทสนทนาเป็น 1-on-1 ระหว่างเบอร์โทรกับเบอร์ธุรกิจ allowlist ชั้นเดียว ไม่มี @mention/addressed) — **หัวข้อนี้จะพูดถึงเฉพาะส่วนที่ต่างจาก `messengerbot` เท่านั้น** ดู [`ola messengerbot`](#ola-messengerbot) และ [`ola telegrambot`](#ola-telegrambot) สำหรับส่วนที่เหมือนกัน
+
+### เชื่อมต่อแบบเดียวกับ Messenger เป๊ะ (Graph API product เดียวกัน)
+
+WhatsApp Cloud API และ Messenger Platform ตั้งค่าผ่าน App เดียวกันใน Meta for Developers (คนละ Product ที่แนบเข้าไป) จึงใช้ **กลไก webhook verify handshake (GET) และ `X-Hub-Signature-256` (POST) เหมือนกันทุกประการ** — โค้ดส่วนนี้ใช้ร่วมกันจริงๆ ระหว่างสองบอท
+
+### ความต่างที่แท้จริงมีสองจุด: การยืนยันตัวตน กับการดาวน์โหลดไฟล์
+
+1. **Authentication**: Messenger ใช้ access token เป็น **query parameter** (`?access_token=...`) แต่ WhatsApp Cloud API ใช้ **`Authorization: Bearer <token>` header** ทุก request (แบบเดียวกับที่ LINE ใช้)
+2. **ดาวน์โหลดรูป/ไฟล์**: Messenger ให้ URL ที่ดาวน์โหลดได้ทันทีในตัว attachment เลย แต่ **WhatsApp ให้แค่ media ID เปล่าๆ** ต้องเรียก `GET /<media_id>` (Bearer-authenticated) เพื่อขอ URL ชั่วคราว (อายุประมาณ 5 นาทีตามที่ Meta ระบุ) ก่อน แล้วค่อยดาวน์โหลด URL นั้น (ก็ต้องแนบ Bearer token อีกครั้ง) — สองสเต็ปแบบเดียวกับที่ `ola telegrambot` ต้องทำกับ Telegram's `getFile`
+
+### ⚠️ ข้อจำกัดสำคัญเฉพาะ WhatsApp: 24-hour customer service window
+
+Meta บังคับว่าธุรกิจจะส่งข้อความแบบอิสระ (free-form) หาผู้ใช้ได้เฉพาะ**ภายใน 24 ชั่วโมง**หลังผู้ใช้ทักมาข้อความล่าสุดเท่านั้น ("customer service window") — เกินจากนั้นต้องใช้ **pre-approved message template** เท่านั้น (ต้องส่งไปให้ Meta อนุมัติล่วงหน้า)
+
+**`ola whatsappbot` ยังไม่รองรับ message template ในรุ่นนี้** เพราะบอทนี้ถูกออกแบบให้ตอบแบบ **reactive เท่านั้น** (ตอบเมื่อมีคนทักมา ไม่เคยทักหาใครก่อนเอง) — ในทางปฏิบัติแทบไม่มีทางที่การตอบกลับปกติจะหลุดไปนอกช่วง 24 ชม. (เว้นแต่โมเดิลใช้เวลาคิดคำตอบนานเกิน 24 ชม. ซึ่งไม่ใช่การใช้งานจริงของบอทนี้) แต่ควรรู้ไว้เป็นข้อจำกัดที่มีอยู่จริง ถ้าต้องการส่งข้อความเชิงรุก (เช่น แจ้งเตือนล่วงหน้า, ส่งข่าวสาร) จะต้องพัฒนาระบบ template message เพิ่มเติมเอง
+
+### เริ่มต้นใช้งาน
+
+```bash
+export OLA_WHATSAPP_ACCESS_TOKEN='access-token-from-meta-for-developers'
+export OLA_WHATSAPP_APP_SECRET='your-app-secret'
+export OLA_WHATSAPP_VERIFY_TOKEN='ตั้งค่าอะไรก็ได้ที่คุณกำหนดเอง'
+export OLA_WHATSAPP_PHONE_NUMBER_ID='phone-number-id-ไม่ใช่ตัวเบอร์โทร'
+export OLA_OLLAMA_MODEL=qwen3.6:27b
+
+# ยังไม่รู้ wa_id ของตัวเอง? ทัก /whoami กับเบอร์ธุรกิจก่อน (ทำงานแม้ยังไม่อยู่ใน allowlist)
+ola whatsappbot --whatsapp-allowed-users 000000000000
+
+# ใช้งานจริง
+ola whatsappbot \
+  --whatsapp-allowed-users 66811111111 \
+  --persona 'คุณคือผู้ช่วยตอบคำถามวิชา Network Security ของภาควิชา ตอบสุภาพ กระชับ เป็นภาษาไทย' \
+  --knowledge-dir /srv/course-docs/network-security \
+  --embed-model bge-m3 \
+  --whatsapp-listen-addr 127.0.0.1:8082
+```
+
+ระหว่างพัฒนา/ทดสอบ ใช้เบอร์ทดสอบฟรีที่ Meta ให้มาพร้อม App ได้เลย ไม่ต้องผูกเบอร์จริงก่อน
+
+### Access control (allowlist ชั้นเดียว, wa_id คือเบอร์โทรไม่มี `+`)
+
+| Flag | ความหมาย |
+|---|---|
+| `--whatsapp-allowed-users` | wa_id (เบอร์โทรรูปแบบสากลไม่มี `+`, เช่น `66811111111`) ที่แชทได้ |
+
+### ความจำต่อแชท
+
+`whatsapp_user_<wa_id>.json` — คีย์ขึ้นต้นด้วย `whatsapp_` เสมอ ชนกับบอทอื่นไม่ได้ **ใช้ `--context-dir` เดียวกับบอทอื่นได้อย่างปลอดภัย**
+
+### Flags / Environment variables
+
+| ตัวแปร | Flag | ค่าเริ่มต้น | หมายเหตุ |
+|---|---|---|---|
+| `OLA_WHATSAPP_ACCESS_TOKEN` | *(env เท่านั้น)* | — | **จำเป็น** — แนะนำใช้ System User token สำหรับ production (ไม่หมดอายุเหมือน token ชั่วคราว) |
+| `OLA_WHATSAPP_APP_SECRET` | *(env เท่านั้น)* | — | **จำเป็น** — App Secret ใช้ตรวจสอบ signature ของ webhook |
+| `OLA_WHATSAPP_VERIFY_TOKEN` | *(env เท่านั้น)* | — | **จำเป็น** — ค่าที่กำหนดเอง ใช้ตอนยืนยัน webhook URL ครั้งแรก |
+| `OLA_WHATSAPP_PHONE_NUMBER_ID` | *(env เท่านั้น)* | — | **จำเป็น** — Phone Number ID ของเบอร์ธุรกิจที่จะใช้ส่ง (ไม่ใช่ตัวเบอร์โทรเอง) |
+| `OLA_WHATSAPP_ALLOWED_USERS` | `--whatsapp-allowed-users` | — | comma-separated wa_id |
+| `OLA_WHATSAPP_API_BASE` | `--whatsapp-api-base` | `https://graph.facebook.com/v21.0` | override สำหรับทดสอบกับ mock server |
+| `OLA_WHATSAPP_LISTEN_ADDR` | `--whatsapp-listen-addr` | `:8082` | แนะนำผูกแค่ `127.0.0.1:8082` แล้ววาง reverse proxy ไว้ข้างหน้า |
+| `OLA_WHATSAPP_WEBHOOK_PATH` | `--whatsapp-webhook-path` | `/whatsapp/webhook` | path ของ webhook |
+| — | `--whatsapp-max-concurrent` | `4` | จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส |
+| `OLA_MAX_IMAGE_SIZE` | `--max-image-size` | `10M` | เหมือน `ola telegrambot` ทุกประการ |
+| `OLA_SAVE_IMAGES` | `--save-images` | ปิด | เหมือน `ola telegrambot` ทุกประการ |
+| `OLA_MAX_PDF_SIZE`/`OLA_PDF_MAX_PAGES`/`OLA_PDF_DPI` | `--max-pdf-size`/`--pdf-max-pages`/`--pdf-dpi` | `20M`/`20`/`150` | เหมือน `ola telegrambot` ทุกประการ |
+| — | `-o, --output` | `whatsappbot.log` | log ไฟล์แบบเต็ม เปิดแบบ append เสมอ |
+
+ตัวแปรที่เหลือ (`--persona`/`--persona-file`, `--knowledge-dir`, `--embed-*`, `--context-dir`/`OLA_CONTEXT_DIR` (default `whatsapp-context`), `--context-keep-recent`/`--context-compact-after`, การเชื่อมต่อโมเดล, web search/fetch ทั้งชุด) **ใช้ร่วมกับ `ola telegrambot` ทุก flag ทุกพฤติกรรมเป๊ะๆ** — ดู [`ola telegrambot`](#ola-telegrambot)
+
+---
+
 ## `ola webbot`
 
-เว็บแอปแชทหน้าเดียว (HTML/CSS/JS ฝังอยู่ในตัวไบนารีเอง — ไม่มี build step, ไม่มี npm, ไม่มีไฟล์แยกให้ deploy คู่กัน) **toolset แบบ read-only เดียวกับ telegrambot/discordbot/linebot ทุกประการ ผ่าน `chatBotCore` ตัวเดียวกัน** (persona, ฐานความรู้, grounding marker ฯลฯ เหมือนกันหมด — ดูรายละเอียดที่ [`ola telegrambot`](#ola-telegrambot)) **ไม่ใช่ `ola ask` เวอร์ชันเว็บ** — ไม่มี `read_file`/`write_file`/`run_command` ให้เรียกเลย
+เว็บแอปแชทหน้าเดียว (HTML/CSS/JS ฝังอยู่ในตัวไบนารีเอง — ไม่มี build step, ไม่มี npm, ไม่มีไฟล์แยกให้ deploy คู่กัน) **toolset แบบ read-only เดียวกับบอทอื่นทั้งหมดทุกประการ ผ่าน `chatBotCore` ตัวเดียวกัน** (persona, ฐานความรู้, grounding marker ฯลฯ เหมือนกันหมด — ดูรายละเอียดที่ [`ola telegrambot`](#ola-telegrambot)) **ไม่ใช่ `ola ask` เวอร์ชันเว็บ** — ไม่มี `read_file`/`write_file`/`run_command` ให้เรียกเลย
 
-### ความต่างจากสามบอทก่อนหน้า: ไม่มีแพลตฟอร์มภายนอกยืนยันตัวตนให้
+### ความต่างจากบอทอื่นก่อนหน้า: ไม่มีแพลตฟอร์มภายนอกยืนยันตัวตนให้
 
 Telegram/Discord/LINE ต่างมี "แพลตฟอร์ม" ที่ยืนยัน user identity มาให้ก่อนแล้ว เทียบกับ allowlist ได้เลย — **`webbot` ไม่มีสิ่งนี้** เพราะเป็น HTTP server ของ ola เองตรงๆ ป้องกันด้วยสองชั้น:
 
 1. **ผูก `127.0.0.1` เป็นค่าเริ่มต้นเสมอ** (`--webbot-listen-addr`) ไม่ใช่ public interface — ถ้าจะให้เข้าถึงจากเน็ตได้จริง ต้องตั้งใจวาง reverse proxy ไว้ข้างหน้าเอง
-2. **`OLA_WEBBOT_TOKEN`** (env เท่านั้น, ไม่มี flag — หลักการเดียวกับ token ของอีกสามบอท) — ถ้าตั้งไว้ ทุก request (ทั้งโหลดหน้าเว็บและเรียก API) ต้องผ่าน `?token=...` อย่างน้อยครั้งแรก (ระบบตั้ง cookie ให้เองหลังจากนั้น ไม่ต้องแปะ token ซ้ำทุกครั้ง) เทียบ token แบบ constant-time (`crypto/subtle`) กันการโจมตีแบบ timing attack ไม่ตั้งไว้ = ไม่มีการตรวจสอบสิทธิ์เลย (พึ่ง network exposure อย่างเดียว)
+2. **`OLA_WEBBOT_TOKEN`** (env เท่านั้น, ไม่มี flag — หลักการเดียวกับ token ของบอทอื่น) — ถ้าตั้งไว้ ทุก request (ทั้งโหลดหน้าเว็บและเรียก API) ต้องผ่าน `?token=...` อย่างน้อยครั้งแรก (ระบบตั้ง cookie ให้เองหลังจากนั้น ไม่ต้องแปะ token ซ้ำทุกครั้ง) เทียบ token แบบ constant-time (`crypto/subtle`) กันการโจมตีแบบ timing attack ไม่ตั้งไว้ = ไม่มีการตรวจสอบสิทธิ์เลย (พึ่ง network exposure อย่างเดียว)
 
 ### ไม่เก็บบทสนทนาลงดิสก์เลย — ตามที่ตั้งใจออกแบบไว้
 
-แต่ละ browser session ได้ `chatContext` ของตัวเองที่อยู่ใน**หน่วยความจำล้วนๆ** ตลอดอายุ session — ไม่มีการเรียก `.save()` ที่ไหนในโค้ดส่วนนี้เลยสักที่ ปิดแท็บหรือรีสตาร์ท process แล้วบทสนทนานั้นหายไปทันที (ตรงข้ามกับ telegrambot/discordbot/linebot ที่การหายไปแบบนี้ถือเป็นบั๊ก — ที่นี่คือพฤติกรรมที่ตั้งใจ) session ที่ไม่มีการใช้งานเกิน `--webbot-session-ttl` (default 2 ชั่วโมง) จะถูกเก็บกวาดทิ้งอัตโนมัติเป็นระยะ กัน memory โตไม่มีที่สิ้นสุดถ้ามีคนเปิดแท็บทิ้งไว้นานๆ หลายแท็บ
+แต่ละ browser session ได้ `chatContext` ของตัวเองที่อยู่ใน**หน่วยความจำล้วนๆ** ตลอดอายุ session — ไม่มีการเรียก `.save()` ที่ไหนในโค้ดส่วนนี้เลยสักที่ ปิดแท็บหรือรีสตาร์ท process แล้วบทสนทนานั้นหายไปทันที (ตรงข้ามกับบอทอื่นที่ persist ลงดิสก์ (telegrambot/discordbot/linebot/messengerbot/whatsappbot) ที่การหายไปแบบนี้ถือเป็นบั๊ก — ที่นี่คือพฤติกรรมที่ตั้งใจ) session ที่ไม่มีการใช้งานเกิน `--webbot-session-ttl` (default 2 ชั่วโมง) จะถูกเก็บกวาดทิ้งอัตโนมัติเป็นระยะ กัน memory โตไม่มีที่สิ้นสุดถ้ามีคนเปิดแท็บทิ้งไว้นานๆ หลายแท็บ
 
-ถ้าเปิด `--embed-model` ด้วย ตัว knowledge index จะถูก cache ลง `--context-dir`/`OLA_CONTEXT_DIR` (default `webbot-context`) **เหมือนกับ telegrambot/discordbot/linebot ทุกประการ** — restart แล้วโหลด index เดิมกลับมา และ embed ใหม่เฉพาะไฟล์ที่เปลี่ยนแปลงเท่านั้น ไม่ต้อง embed ทั้งฐานความรู้ใหม่ทุกครั้งที่รีสตาร์ท **ข้อควรรู้:** `--context-dir` ของ webbot ใช้เก็บ**เฉพาะ** `knowledge-index.json` เท่านั้น ไม่มีบทสนทนาของผู้ใช้ถูกเขียนไว้ที่นี่เลย (บทสนทนายังคงอยู่ในหน่วยความจำล้วนๆ ตามเดิม)
+ถ้าเปิด `--embed-model` ด้วย ตัว knowledge index จะถูก cache ลง `--context-dir`/`OLA_CONTEXT_DIR` (default `webbot-context`) **เหมือนกับบอทอื่นทุกประการ** — restart แล้วโหลด index เดิมกลับมา และ embed ใหม่เฉพาะไฟล์ที่เปลี่ยนแปลงเท่านั้น ไม่ต้อง embed ทั้งฐานความรู้ใหม่ทุกครั้งที่รีสตาร์ท **ข้อควรรู้:** `--context-dir` ของ webbot ใช้เก็บ**เฉพาะ** `knowledge-index.json` เท่านั้น ไม่มีบทสนทนาของผู้ใช้ถูกเขียนไว้ที่นี่เลย (บทสนทนายังคงอยู่ในหน่วยความจำล้วนๆ ตามเดิม)
 
 ### บอทแนะนำตัวเองก่อนเสมอ ก่อนผู้ใช้จะเริ่มพิมพ์ได้
 
@@ -902,7 +1060,7 @@ ola webbot \
 | `OLA_PDF_DPI` | `--pdf-dpi` | `150` | ความละเอียดตอนแปลงหน้า PDF เป็นภาพ |
 | — | `-o, --output` | `webbot.log` | log ไฟล์แบบเต็ม เปิดแบบ append เสมอ |
 
-ตัวแปรที่เหลือทั้งหมด (`--persona`/`--persona-file`, `--knowledge-dir`, `--embed-model`/`--embed-top-k`/`--embed-min-score`/`--embed-refresh-interval`, `--context-dir`/`OLA_CONTEXT_DIR` (default `webbot-context` — เก็บเฉพาะ knowledge index เท่านั้น ไม่มีบทสนทนา), `--context-keep-recent`/`--context-compact-after` (compact บทสนทนาในหน่วยความจำเท่านั้น), การเชื่อมต่อโมเดล, web search/fetch ทั้งชุด) **ใช้ร่วมกับ `ola telegrambot` ทุก flag ทุกพฤติกรรมเป๊ะๆ** — ดู [`ola telegrambot`](#ola-telegrambot) และ [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด) **ไม่มี** flag allowlist แบบ `--*-allowed-users`/`--*-allowed-groups` เหมือนสามบอทก่อน เพราะไม่มีแนวคิด "ผู้ใช้แต่ละคน" ให้ allowlist — การควบคุมการเข้าถึงทำผ่าน network binding + token เท่านั้น
+ตัวแปรที่เหลือทั้งหมด (`--persona`/`--persona-file`, `--knowledge-dir`, `--embed-model`/`--embed-top-k`/`--embed-min-score`/`--embed-refresh-interval`, `--context-dir`/`OLA_CONTEXT_DIR` (default `webbot-context` — เก็บเฉพาะ knowledge index เท่านั้น ไม่มีบทสนทนา), `--context-keep-recent`/`--context-compact-after` (compact บทสนทนาในหน่วยความจำเท่านั้น), การเชื่อมต่อโมเดล, web search/fetch ทั้งชุด) **ใช้ร่วมกับ `ola telegrambot` ทุก flag ทุกพฤติกรรมเป๊ะๆ** — ดู [`ola telegrambot`](#ola-telegrambot) และ [ตัวแปรสภาพแวดล้อมทั้งหมด](#ตัวแปรสภาพแวดล้อม-environment-variables-ทั้งหมด) **ไม่มี** flag allowlist แบบ `--*-allowed-users`/`--*-allowed-groups` เหมือนบอทอื่นก่อนหน้า เพราะไม่มีแนวคิด "ผู้ใช้แต่ละคน" ให้ allowlist — การควบคุมการเข้าถึงทำผ่าน network binding + token เท่านั้น
 
 ---
 
@@ -1145,3 +1303,4 @@ go test -run TestCodingQuietMode -v ./...
 - **`web_fetch` ไม่รัน JavaScript** — หน้าเว็บที่เป็น client-side-rendered SPA ล้วนจะได้ error ชัดเจน ไม่ใช่เนื้อหาว่างเปล่า
 - **ไม่รองรับ auto-detect .gitignore** สำหรับ directory tree ที่แปะเข้า prompt แรก — ยกเว้นเฉพาะโฟลเดอร์ที่รู้จักแบบ hardcode (`.git`, `node_modules`, `vendor`, `target`, `.venv`, `__pycache__`, `dist`, `build`, `.idea`, `.terraform` ฯลฯ) อาจไม่ตรงกับทุกโปรเจกต์เป๊ะ
 - **อ่าน PDF (ทั้ง `[files...]` และ tool `read_pdf`) ต้องมี `pdftoppm` ติดตั้งอยู่ และโมเดลที่ใช้ต้องรองรับ vision** — ola แปลง PDF เป็นภาพรายหน้าแล้วส่งแบบเดียวกับไฟล์รูป ไม่มีการดึงข้อความ (text extraction) หรือ OCR ใด ๆ ทั้งสิ้น ถ้าโมเดิลไม่รองรับ vision ภาพที่ส่งไปจะไม่ถูกนำไปใช้ประโยชน์ (ola ไม่เช็คความสามารถของโมเดลให้ล่วงหน้า) ดู [กลไกอ่าน PDF](#กลไกอ่าน-pdf)
+- **`ola messengerbot`/`ola whatsappbot` ไม่มีแนวคิดกลุ่มเลย** — ตอบทุกข้อความแบบ 1-on-1 เสมอ (ดู [`ola messengerbot`](#ola-messengerbot)) และ **`ola whatsappbot` ยังไม่รองรับ message template** จึงส่งข้อความได้เฉพาะภายใน 24-hour customer service window ของ WhatsApp เท่านั้น (ดู [`ola whatsappbot`](#ola-whatsappbot))

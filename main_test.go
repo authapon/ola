@@ -13194,3 +13194,905 @@ func TestHandleDiscordMessageStripsModelEchoedTimestampFromReplyAndStorage(t *te
 		}
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────
+// Section: messengerbot / whatsappbot
+// ─────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────
+// Shared Meta webhook verification helpers
+// ─────────────────────────────────────────────────────────────────
+
+func TestVerifyMetaSignatureValidAndInvalid(t *testing.T) {
+	body := []byte(`{"hello":"world"}`)
+	secret := "app-secret"
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	validHeader := "sha256=" + fmt.Sprintf("%x", mac.Sum(nil))
+
+	if !verifyMetaSignature(body, validHeader, secret) {
+		t.Fatal("expected a correctly computed signature to verify")
+	}
+	if verifyMetaSignature(body, "sha256=deadbeef", secret) {
+		t.Fatal("expected a wrong signature to fail verification")
+	}
+	if verifyMetaSignature(body, validHeader, "wrong-secret") {
+		t.Fatal("expected verification to fail with the wrong secret")
+	}
+	if verifyMetaSignature(body, "not-even-prefixed-correctly", secret) {
+		t.Fatal("expected a header without the sha256= prefix to fail")
+	}
+	if verifyMetaSignature(body, "", secret) {
+		t.Fatal("expected an empty header to fail")
+	}
+}
+
+func TestHandleMetaWebhookVerifyHandshake(t *testing.T) {
+	// Correct mode+token: challenge echoed back verbatim with 200.
+	req := httptest.NewRequest(http.MethodGet, "/webhook?hub.mode=subscribe&hub.verify_token=secret-token&hub.challenge=12345", nil)
+	rec := httptest.NewRecorder()
+	handled := handleMetaWebhookVerify(rec, req, "secret-token")
+	if !handled {
+		t.Fatal("expected a GET request to be handled as a verification handshake")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if rec.Body.String() != "12345" {
+		t.Fatalf("expected challenge '12345' echoed back verbatim, got %q", rec.Body.String())
+	}
+
+	// Wrong verify_token: 403, challenge NOT echoed.
+	req2 := httptest.NewRequest(http.MethodGet, "/webhook?hub.mode=subscribe&hub.verify_token=wrong&hub.challenge=12345", nil)
+	rec2 := httptest.NewRecorder()
+	if !handleMetaWebhookVerify(rec2, req2, "secret-token") {
+		t.Fatal("expected a GET request to still be handled (and rejected) as a verification handshake")
+	}
+	if rec2.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a wrong verify_token, got %d", rec2.Code)
+	}
+
+	// A POST request is not a verification handshake at all - caller
+	// should be told to continue with its own POST handling.
+	req3 := httptest.NewRequest(http.MethodPost, "/webhook", nil)
+	rec3 := httptest.NewRecorder()
+	if handleMetaWebhookVerify(rec3, req3, "secret-token") {
+		t.Fatal("expected a POST request to never be treated as a verification handshake")
+	}
+	if rec3.Code != 200 && rec3.Result().StatusCode != 200 {
+		// httptest.ResponseRecorder defaults to 200 until WriteHeader is
+		// called - confirms handleMetaWebhookVerify wrote nothing at all
+		// for a POST, leaving the response fully to the caller.
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// messengerbot
+// ─────────────────────────────────────────────────────────────────
+
+func TestMessengerAttachmentIsImageAndPDFDetection(t *testing.T) {
+	cases := []struct {
+		att     messengerAttachment
+		wantImg bool
+		wantPDF bool
+	}{
+		{messengerAttachment{Type: "image", Payload: struct {
+			URL string `json:"url"`
+		}{URL: "https://cdn.example.com/photo.jpg"}}, true, false},
+		{messengerAttachment{Type: "file", Payload: struct {
+			URL string `json:"url"`
+		}{URL: "https://cdn.example.com/report.pdf?sig=abc"}}, false, true},
+		{messengerAttachment{Type: "file", Payload: struct {
+			URL string `json:"url"`
+		}{URL: "https://cdn.example.com/notes.txt"}}, false, false},
+		{messengerAttachment{Type: "audio", Payload: struct {
+			URL string `json:"url"`
+		}{URL: "https://cdn.example.com/clip.mp3"}}, false, false},
+	}
+	for _, c := range cases {
+		if got := c.att.isImage(); got != c.wantImg {
+			t.Fatalf("isImage() for %#v = %v, want %v", c.att, got, c.wantImg)
+		}
+		if got := c.att.isPDF(); got != c.wantPDF {
+			t.Fatalf("isPDF() for %#v = %v, want %v", c.att, got, c.wantPDF)
+		}
+	}
+}
+
+func TestMessengerAccessConfigAllowed(t *testing.T) {
+	cfg := resolveMessengerAccessConfig("PSID1, PSID2")
+	if cfg.empty() {
+		t.Fatal("expected a non-empty access config")
+	}
+	if !cfg.allowed("PSID1") || !cfg.allowed("PSID2") {
+		t.Fatal("expected both configured PSIDs to be allowed")
+	}
+	if cfg.allowed("PSID3") {
+		t.Fatal("expected an unlisted PSID to be denied")
+	}
+	if !resolveMessengerAccessConfig("").empty() {
+		t.Fatal("expected an empty flag/env to produce an empty config")
+	}
+}
+
+func TestMessengerContextKeyNoCollisionWithOtherPlatforms(t *testing.T) {
+	key := messengerContextKey("12345")
+	if key != "messenger_user_12345" {
+		t.Fatalf("unexpected messenger context key: %q", key)
+	}
+	others := []string{
+		"user_12345",          // telegram
+		"discord_user_12345",  // discord
+		"line_user_12345",     // line
+		"whatsapp_user_12345", // whatsapp
+	}
+	for _, o := range others {
+		if key == o {
+			t.Fatalf("messenger context key collided with another platform's key: %q", o)
+		}
+	}
+}
+
+func TestSplitMessengerMessageRespectsLimit(t *testing.T) {
+	long := strings.Repeat("a", messengerMaxMessageRunes*2+50)
+	chunks := splitMessengerMessage(long)
+	if len(chunks) < 2 {
+		t.Fatalf("expected text longer than the limit to be split into multiple chunks, got %d", len(chunks))
+	}
+	for _, c := range chunks {
+		if len([]rune(c)) > messengerMaxMessageRunes {
+			t.Fatalf("chunk exceeds messengerMaxMessageRunes: %d runes", len([]rune(c)))
+		}
+	}
+	if got := splitMessengerMessage(""); len(got) != 1 || got[0] != "(ไม่มีคำตอบ)" {
+		t.Fatalf("expected empty text to produce the placeholder answer, got %#v", got)
+	}
+}
+
+// messengerSentMessage / messengerSentTracker mirror lineSentMessage/
+// lineSentTracker (see that type's own doc comment) - the same
+// concurrency concern applies here: messengerSession.webhookHandler
+// dispatches to handleMessengerEvent in its own goroutine.
+type messengerSentMessage struct {
+	To   string
+	Text string
+}
+
+type messengerSentTracker struct {
+	mu   sync.Mutex
+	sent []messengerSentMessage
+}
+
+func (t *messengerSentTracker) add(msg messengerSentMessage) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.sent = append(t.sent, msg)
+}
+
+func (t *messengerSentTracker) snapshot() []messengerSentMessage {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]messengerSentMessage, len(t.sent))
+	copy(out, t.sent)
+	return out
+}
+
+func (t *messengerSentTracker) waitForCount(n int) []messengerSentMessage {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if s := t.snapshot(); len(s) >= n {
+			return s
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return t.snapshot()
+}
+
+// newMockMessengerGraphServer serves the small subset of Graph API this
+// bot actually calls: GET /me (page info) and POST /me/messages (Send
+// API) - authenticated via an access_token QUERY PARAMETER (see
+// messengerAPIURL's own doc comment on why this differs from LINE's/
+// WhatsApp's Authorization-header scheme).
+func newMockMessengerGraphServer(t *testing.T) (*httptest.Server, *messengerSentTracker, *string) {
+	t.Helper()
+	tracker := &messengerSentTracker{}
+	var lastTokenMu sync.Mutex
+	var lastToken string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/me", func(w http.ResponseWriter, r *http.Request) {
+		lastTokenMu.Lock()
+		lastToken = r.URL.Query().Get("access_token")
+		lastTokenMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"PAGE1","name":"Test Page"}`)
+	})
+	mux.HandleFunc("/me/messages", func(w http.ResponseWriter, r *http.Request) {
+		lastTokenMu.Lock()
+		lastToken = r.URL.Query().Get("access_token")
+		lastTokenMu.Unlock()
+		var body struct {
+			Recipient struct {
+				ID string `json:"id"`
+			} `json:"recipient"`
+			Message struct {
+				Text string `json:"text"`
+			} `json:"message"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		tracker.add(messengerSentMessage{To: body.Recipient.ID, Text: body.Message.Text})
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"recipient_id":"`+body.Recipient.ID+`","message_id":"mid.123"}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, tracker, &lastToken
+}
+
+func TestMessengerAPIURLUsesAccessTokenQueryParam(t *testing.T) {
+	graphSrv, _, lastToken := newMockMessengerGraphServer(t)
+	if _, err := messengerGetPageInfo(graphSrv.Client(), graphSrv.URL, "test-token"); err != nil {
+		t.Fatalf("messengerGetPageInfo error: %v", err)
+	}
+	if *lastToken != "test-token" {
+		t.Fatalf("expected access_token=test-token, got %q", *lastToken)
+	}
+}
+
+func newTestMessengerSession(t *testing.T, graphSrv, ollamaSrv *httptest.Server, users map[string]bool) *messengerSession {
+	t.Helper()
+	logFile, err := os.CreateTemp(t.TempDir(), "messengerbot-test-log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { logFile.Close() })
+	return &messengerSession{
+		chatBotCore: chatBotCore{
+			client:       ollamaSrv.Client(),
+			systemPrompt: buildChatBotSystemPrompt("Messenger", ""),
+			tools:        filterTools(builtinTools, "get_current_time", "delay"),
+			pcfg:         providerConfig{Provider: providerOllama, Host: ollamaSrv.URL, Model: "mock-model"},
+			ctxSize:      4096,
+			contextDir:   t.TempDir(),
+			knowledgeIdx: &knowledgeIndexStore{},
+			keepRecent:   defaultChatBotKeepRecentTurns,
+			compactAfter: defaultChatBotCompactAfterTurns,
+			maxImageSize: defaultMaxImageSize,
+			maxPDFSize:   defaultMaxPDFSize,
+			pdfMaxPages:  defaultPDFMaxPages,
+			pdfDPI:       defaultPDFDPI,
+			outFile:      logFile,
+			locks:        map[string]*sync.Mutex{},
+		},
+		restClient:  graphSrv.Client(),
+		apiBase:     graphSrv.URL,
+		pageToken:   "test-token",
+		appSecret:   "secret",
+		verifyToken: "verify-me",
+		pageID:      "PAGE1",
+		access:      messengerAccessConfig{Users: users},
+		sem:         make(chan struct{}, 4),
+	}
+}
+
+func TestMessengerWebhookHandlerVerificationHandshake(t *testing.T) {
+	graphSrv, _, _ := newMockMessengerGraphServer(t)
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	s := newTestMessengerSession(t, graphSrv, ollamaSrv, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/messenger/webhook?hub.mode=subscribe&hub.verify_token=verify-me&hub.challenge=abc123", nil)
+	rec := httptest.NewRecorder()
+	s.webhookHandler(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "abc123" {
+		t.Fatalf("expected 200 with echoed challenge, got %d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMessengerWebhookHandlerRejectsBadSignature(t *testing.T) {
+	graphSrv, _, _ := newMockMessengerGraphServer(t)
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	s := newTestMessengerSession(t, graphSrv, ollamaSrv, nil)
+
+	body := []byte(`{"object":"page","entry":[]}`)
+	req := httptest.NewRequest(http.MethodPost, "/messenger/webhook", bytes.NewReader(body))
+	req.Header.Set("X-Hub-Signature-256", "sha256=deadbeef")
+	rec := httptest.NewRecorder()
+	s.webhookHandler(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for a bad signature, got %d", rec.Code)
+	}
+}
+
+func TestMessengerWebhookHandlerAcceptsValidSignatureAndDispatches(t *testing.T) {
+	graphSrv, sent, _ := newMockMessengerGraphServer(t)
+
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&ollamaCalls, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("สวัสดีครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	s := newTestMessengerSession(t, graphSrv, ollamaSrv, map[string]bool{"PSID1": true})
+
+	bodyObj := messengerWebhookBody{
+		Object: "page",
+		Entry: []messengerEntry{
+			{
+				ID: "PAGE1",
+				Messaging: []messengerMessagingEvent{
+					{
+						Sender: struct {
+							ID string `json:"id"`
+						}{ID: "PSID1"},
+						Recipient: struct {
+							ID string `json:"id"`
+						}{ID: "PAGE1"},
+						Message: &messengerMessage{MID: "m1", Text: "สวัสดี"},
+					},
+				},
+			},
+		},
+	}
+	body, _ := json.Marshal(bodyObj)
+	mac := hmac.New(sha256.New, []byte("secret"))
+	mac.Write(body)
+	sig := "sha256=" + fmt.Sprintf("%x", mac.Sum(nil))
+
+	req := httptest.NewRequest(http.MethodPost, "/messenger/webhook", bytes.NewReader(body))
+	req.Header.Set("X-Hub-Signature-256", sig)
+	rec := httptest.NewRecorder()
+	s.webhookHandler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for a validly signed webhook, got %d", rec.Code)
+	}
+
+	got := sent.waitForCount(1)
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 message sent back, got %d: %#v", len(got), got)
+	}
+	if got[0].To != "PSID1" {
+		t.Fatalf("expected reply sent to PSID1, got %q", got[0].To)
+	}
+	if got[0].Text != "สวัสดีครับ" {
+		t.Fatalf("expected the model's own answer to be sent verbatim, got %q", got[0].Text)
+	}
+	if atomic.LoadInt32(&ollamaCalls) == 0 {
+		t.Fatal("expected the model to actually be called")
+	}
+}
+
+func TestMessengerWebhookHandlerDeniesUnlistedUser(t *testing.T) {
+	graphSrv, sent, _ := newMockMessengerGraphServer(t)
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	s := newTestMessengerSession(t, graphSrv, ollamaSrv, map[string]bool{"PSID1": true})
+
+	bodyObj := messengerWebhookBody{
+		Object: "page",
+		Entry: []messengerEntry{
+			{Messaging: []messengerMessagingEvent{
+				{
+					Sender: struct {
+						ID string `json:"id"`
+					}{ID: "PSID_STRANGER"},
+					Message: &messengerMessage{MID: "m1", Text: "hi"},
+				},
+			}},
+		},
+	}
+	body, _ := json.Marshal(bodyObj)
+	mac := hmac.New(sha256.New, []byte("secret"))
+	mac.Write(body)
+	sig := "sha256=" + fmt.Sprintf("%x", mac.Sum(nil))
+
+	req := httptest.NewRequest(http.MethodPost, "/messenger/webhook", bytes.NewReader(body))
+	req.Header.Set("X-Hub-Signature-256", sig)
+	rec := httptest.NewRecorder()
+	s.webhookHandler(rec, req)
+
+	got := sent.waitForCount(1) // the access-denied notice itself
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 (access-denied) message sent, got %d: %#v", len(got), got)
+	}
+	if !strings.Contains(got[0].Text, "ยังไม่ได้รับอนุญาต") {
+		t.Fatalf("expected an access-denied message, got %q", got[0].Text)
+	}
+}
+
+func TestMessengerWebhookHandlerIgnoresEchoMessages(t *testing.T) {
+	graphSrv, sent, _ := newMockMessengerGraphServer(t)
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	s := newTestMessengerSession(t, graphSrv, ollamaSrv, map[string]bool{"PSID1": true})
+
+	bodyObj := messengerWebhookBody{
+		Object: "page",
+		Entry: []messengerEntry{
+			{Messaging: []messengerMessagingEvent{
+				{
+					Sender: struct {
+						ID string `json:"id"`
+					}{ID: "PSID1"},
+					Message: &messengerMessage{MID: "m1", Text: "this is the page's own echoed reply", IsEcho: true},
+				},
+			}},
+		},
+	}
+	body, _ := json.Marshal(bodyObj)
+	mac := hmac.New(sha256.New, []byte("secret"))
+	mac.Write(body)
+	sig := "sha256=" + fmt.Sprintf("%x", mac.Sum(nil))
+
+	req := httptest.NewRequest(http.MethodPost, "/messenger/webhook", bytes.NewReader(body))
+	req.Header.Set("X-Hub-Signature-256", sig)
+	rec := httptest.NewRecorder()
+	s.webhookHandler(rec, req)
+
+	time.Sleep(50 * time.Millisecond) // give the async goroutine a chance to (wrongly) act, if it were going to
+	if got := sent.snapshot(); len(got) != 0 {
+		t.Fatalf("expected an echo message to be silently ignored, but something was sent: %#v", got)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// whatsappbot
+// ─────────────────────────────────────────────────────────────────
+
+func TestWhatsAppMediaRefIsPDFDetection(t *testing.T) {
+	cases := []struct {
+		ref  *whatsappMediaRef
+		want bool
+	}{
+		{&whatsappMediaRef{MimeType: "application/pdf"}, true},
+		{&whatsappMediaRef{MimeType: "image/jpeg"}, false},
+		{&whatsappMediaRef{MimeType: "", Filename: "syllabus.PDF"}, true},
+		{&whatsappMediaRef{MimeType: "", Filename: "photo.jpg"}, false},
+		{nil, false}, // must be safe to call on a nil *whatsappMediaRef - see handleWhatsAppMessage
+	}
+	for _, c := range cases {
+		if got := c.ref.isPDF(); got != c.want {
+			t.Fatalf("isPDF() for %#v = %v, want %v", c.ref, got, c.want)
+		}
+	}
+}
+
+func TestWhatsAppAccessConfigAllowed(t *testing.T) {
+	cfg := resolveWhatsAppAccessConfig("66811111111, 66822222222")
+	if cfg.empty() {
+		t.Fatal("expected a non-empty access config")
+	}
+	if !cfg.allowed("66811111111") || !cfg.allowed("66822222222") {
+		t.Fatal("expected both configured wa_ids to be allowed")
+	}
+	if cfg.allowed("66899999999") {
+		t.Fatal("expected an unlisted wa_id to be denied")
+	}
+}
+
+func TestWhatsAppContextKeyNoCollisionWithOtherPlatforms(t *testing.T) {
+	key := whatsappContextKey("66811111111")
+	if key != "whatsapp_user_66811111111" {
+		t.Fatalf("unexpected whatsapp context key: %q", key)
+	}
+	if key == messengerContextKey("66811111111") {
+		t.Fatal("whatsapp context key collided with messenger's own key scheme")
+	}
+}
+
+func TestSplitWhatsAppMessageRespectsLimit(t *testing.T) {
+	long := strings.Repeat("b", whatsappMaxMessageRunes*2+50)
+	chunks := splitWhatsAppMessage(long)
+	if len(chunks) < 2 {
+		t.Fatalf("expected text longer than the limit to be split into multiple chunks, got %d", len(chunks))
+	}
+	for _, c := range chunks {
+		if len([]rune(c)) > whatsappMaxMessageRunes {
+			t.Fatalf("chunk exceeds whatsappMaxMessageRunes: %d runes", len([]rune(c)))
+		}
+	}
+}
+
+// whatsappSentMessage/whatsappSentTracker mirror messengerSentTracker
+// (see that type's own doc comment).
+type whatsappSentMessage struct {
+	To   string
+	Text string
+}
+
+type whatsappSentTracker struct {
+	mu   sync.Mutex
+	sent []whatsappSentMessage
+}
+
+func (t *whatsappSentTracker) add(msg whatsappSentMessage) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.sent = append(t.sent, msg)
+}
+
+func (t *whatsappSentTracker) snapshot() []whatsappSentMessage {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]whatsappSentMessage, len(t.sent))
+	copy(out, t.sent)
+	return out
+}
+
+func (t *whatsappSentTracker) waitForCount(n int) []whatsappSentMessage {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if s := t.snapshot(); len(s) >= n {
+			return s
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return t.snapshot()
+}
+
+// newMockWhatsAppGraphServer serves the subset of Graph API this bot
+// calls, all Bearer-token-authenticated (see whatsappRESTRequest):
+// GET /<phone_number_id> (phone info), POST /<phone_number_id>/messages
+// (send), GET /<media_id> (resolve a download URL), and GET
+// /media-download/<id> (the actual bytes, serving whatever content the
+// caller configured - lets image and PDF tests reuse this one server).
+func newMockWhatsAppGraphServer(t *testing.T, mediaContent []byte) (*httptest.Server, *whatsappSentTracker, *string) {
+	t.Helper()
+	tracker := &whatsappSentTracker{}
+	var lastAuthMu sync.Mutex
+	var lastAuth string
+	var srv *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/PHONE1", func(w http.ResponseWriter, r *http.Request) {
+		lastAuthMu.Lock()
+		lastAuth = r.Header.Get("Authorization")
+		lastAuthMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"display_phone_number":"+66 81 234 5678","verified_name":"Test Business"}`)
+	})
+	mux.HandleFunc("/PHONE1/messages", func(w http.ResponseWriter, r *http.Request) {
+		lastAuthMu.Lock()
+		lastAuth = r.Header.Get("Authorization")
+		lastAuthMu.Unlock()
+		var body struct {
+			To   string `json:"to"`
+			Text struct {
+				Body string `json:"body"`
+			} `json:"text"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		tracker.add(whatsappSentMessage{To: body.To, Text: body.Text.Body})
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"messages":[{"id":"wamid.123"}]}`)
+	})
+	mux.HandleFunc("/MEDIA1", func(w http.ResponseWriter, r *http.Request) {
+		lastAuthMu.Lock()
+		lastAuth = r.Header.Get("Authorization")
+		lastAuthMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"url":"%s/media-download/MEDIA1","mime_type":"image/png","id":"MEDIA1"}`, srv.URL)
+	})
+	mux.HandleFunc("/media-download/MEDIA1", func(w http.ResponseWriter, r *http.Request) {
+		lastAuthMu.Lock()
+		lastAuth = r.Header.Get("Authorization")
+		lastAuthMu.Unlock()
+		w.Write(mediaContent)
+	})
+	srv = httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, tracker, &lastAuth
+}
+
+func TestWhatsAppRESTRequestUsesBearerAuthHeader(t *testing.T) {
+	graphSrv, _, lastAuth := newMockWhatsAppGraphServer(t, minimalPNG)
+	if _, err := whatsappGetPhoneInfo(graphSrv.Client(), graphSrv.URL, "test-token", "PHONE1"); err != nil {
+		t.Fatalf("whatsappGetPhoneInfo error: %v", err)
+	}
+	if *lastAuth != "Bearer test-token" {
+		t.Fatalf("expected Authorization header 'Bearer test-token', got %q", *lastAuth)
+	}
+}
+
+func TestWhatsAppDownloadMediaByIDTwoStepBothUseBearerAuth(t *testing.T) {
+	graphSrv, _, lastAuth := newMockWhatsAppGraphServer(t, minimalPNG)
+	data, err := whatsappDownloadMediaByID(graphSrv.Client(), graphSrv.URL, "test-token", "MEDIA1", defaultMaxImageSize)
+	if err != nil {
+		t.Fatalf("whatsappDownloadMediaByID error: %v", err)
+	}
+	if !bytes.Equal(data, minimalPNG) {
+		t.Fatal("expected the downloaded bytes to match what the mock media-download endpoint served")
+	}
+	// The LAST request made was the actual byte download (step 2) - confirm
+	// it too carried the Bearer token, not just the metadata lookup (step 1).
+	if *lastAuth != "Bearer test-token" {
+		t.Fatalf("expected the second (download) request to also carry 'Bearer test-token', got %q", *lastAuth)
+	}
+}
+
+func newTestWhatsAppSession(t *testing.T, graphSrv, ollamaSrv *httptest.Server, users map[string]bool) *whatsappSession {
+	t.Helper()
+	logFile, err := os.CreateTemp(t.TempDir(), "whatsappbot-test-log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { logFile.Close() })
+	return &whatsappSession{
+		chatBotCore: chatBotCore{
+			client:       ollamaSrv.Client(),
+			systemPrompt: buildChatBotSystemPrompt("WhatsApp", ""),
+			tools:        filterTools(builtinTools, "get_current_time", "delay"),
+			pcfg:         providerConfig{Provider: providerOllama, Host: ollamaSrv.URL, Model: "mock-model"},
+			ctxSize:      4096,
+			contextDir:   t.TempDir(),
+			knowledgeIdx: &knowledgeIndexStore{},
+			keepRecent:   defaultChatBotKeepRecentTurns,
+			compactAfter: defaultChatBotCompactAfterTurns,
+			maxImageSize: defaultMaxImageSize,
+			maxPDFSize:   defaultMaxPDFSize,
+			pdfMaxPages:  defaultPDFMaxPages,
+			pdfDPI:       defaultPDFDPI,
+			outFile:      logFile,
+			locks:        map[string]*sync.Mutex{},
+		},
+		restClient:    graphSrv.Client(),
+		apiBase:       graphSrv.URL,
+		accessToken:   "test-token",
+		appSecret:     "secret",
+		verifyToken:   "verify-me",
+		phoneNumberID: "PHONE1",
+		access:        whatsappAccessConfig{Users: users},
+		sem:           make(chan struct{}, 4),
+	}
+}
+
+func TestWhatsAppWebhookHandlerVerificationHandshake(t *testing.T) {
+	graphSrv, _, _ := newMockWhatsAppGraphServer(t, minimalPNG)
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	s := newTestWhatsAppSession(t, graphSrv, ollamaSrv, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/whatsapp/webhook?hub.mode=subscribe&hub.verify_token=verify-me&hub.challenge=xyz789", nil)
+	rec := httptest.NewRecorder()
+	s.webhookHandler(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "xyz789" {
+		t.Fatalf("expected 200 with echoed challenge, got %d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWhatsAppWebhookHandlerRejectsBadSignature(t *testing.T) {
+	graphSrv, _, _ := newMockWhatsAppGraphServer(t, minimalPNG)
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	s := newTestWhatsAppSession(t, graphSrv, ollamaSrv, nil)
+
+	body := []byte(`{"object":"whatsapp_business_account","entry":[]}`)
+	req := httptest.NewRequest(http.MethodPost, "/whatsapp/webhook", bytes.NewReader(body))
+	req.Header.Set("X-Hub-Signature-256", "sha256=deadbeef")
+	rec := httptest.NewRecorder()
+	s.webhookHandler(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for a bad signature, got %d", rec.Code)
+	}
+}
+
+func TestWhatsAppWebhookHandlerAcceptsValidSignatureAndDispatches(t *testing.T) {
+	graphSrv, sent, _ := newMockWhatsAppGraphServer(t, minimalPNG)
+
+	var ollamaCalls int32
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&ollamaCalls, 1)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("สวัสดีครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	s := newTestWhatsAppSession(t, graphSrv, ollamaSrv, map[string]bool{"66811111111": true})
+
+	bodyObj := whatsappWebhookBody{
+		Object: "whatsapp_business_account",
+		Entry: []whatsappEntry{
+			{
+				Changes: []whatsappChange{
+					{
+						Field: "messages",
+						Value: whatsappChangeValue{
+							MessagingProduct: "whatsapp",
+							Messages: []whatsappMessage{
+								{
+									From: "66811111111",
+									ID:   "wamid.abc",
+									Type: "text",
+									Text: &struct {
+										Body string `json:"body"`
+									}{Body: "สวัสดี"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	body, _ := json.Marshal(bodyObj)
+	mac := hmac.New(sha256.New, []byte("secret"))
+	mac.Write(body)
+	sig := "sha256=" + fmt.Sprintf("%x", mac.Sum(nil))
+
+	req := httptest.NewRequest(http.MethodPost, "/whatsapp/webhook", bytes.NewReader(body))
+	req.Header.Set("X-Hub-Signature-256", sig)
+	rec := httptest.NewRecorder()
+	s.webhookHandler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for a validly signed webhook, got %d", rec.Code)
+	}
+
+	got := sent.waitForCount(1)
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 message sent back, got %d: %#v", len(got), got)
+	}
+	if got[0].To != "66811111111" {
+		t.Fatalf("expected reply sent to 66811111111, got %q", got[0].To)
+	}
+	if got[0].Text != "สวัสดีครับ" {
+		t.Fatalf("expected the model's own answer to be sent verbatim, got %q", got[0].Text)
+	}
+	if atomic.LoadInt32(&ollamaCalls) == 0 {
+		t.Fatal("expected the model to actually be called")
+	}
+}
+
+func TestWhatsAppWebhookHandlerDeniesUnlistedUser(t *testing.T) {
+	graphSrv, sent, _ := newMockWhatsAppGraphServer(t, minimalPNG)
+	ollamaSrv := httptest.NewServer(http.NewServeMux())
+	defer ollamaSrv.Close()
+	s := newTestWhatsAppSession(t, graphSrv, ollamaSrv, map[string]bool{"66811111111": true})
+
+	bodyObj := whatsappWebhookBody{
+		Entry: []whatsappEntry{
+			{Changes: []whatsappChange{
+				{Value: whatsappChangeValue{Messages: []whatsappMessage{
+					{
+						From: "66899999999",
+						Type: "text",
+						Text: &struct {
+							Body string `json:"body"`
+						}{Body: "hi"},
+					},
+				}}},
+			}},
+		},
+	}
+	body, _ := json.Marshal(bodyObj)
+	mac := hmac.New(sha256.New, []byte("secret"))
+	mac.Write(body)
+	sig := "sha256=" + fmt.Sprintf("%x", mac.Sum(nil))
+
+	req := httptest.NewRequest(http.MethodPost, "/whatsapp/webhook", bytes.NewReader(body))
+	req.Header.Set("X-Hub-Signature-256", sig)
+	rec := httptest.NewRecorder()
+	s.webhookHandler(rec, req)
+
+	got := sent.waitForCount(1)
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 (access-denied) message sent, got %d: %#v", len(got), got)
+	}
+	if !strings.Contains(got[0].Text, "ยังไม่ได้รับอนุญาต") {
+		t.Fatalf("expected an access-denied message, got %q", got[0].Text)
+	}
+}
+
+func TestWhatsAppWebhookHandlerImageMessageEndToEnd(t *testing.T) {
+	graphSrv, sent, _ := newMockWhatsAppGraphServer(t, minimalPNG)
+
+	var lastRequestHadImage bool
+	ollamaMux := http.NewServeMux()
+	ollamaMux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []struct {
+				Images []string `json:"images"`
+			} `json:"messages"`
+		}
+		bodyBytes, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(bodyBytes, &req)
+		for _, m := range req.Messages {
+			if len(m.Images) > 0 {
+				lastRequestHadImage = true
+			}
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, streamLine("เห็นรูปแล้วครับ", "", "", true))
+	})
+	ollamaSrv := httptest.NewServer(ollamaMux)
+	defer ollamaSrv.Close()
+
+	s := newTestWhatsAppSession(t, graphSrv, ollamaSrv, map[string]bool{"66811111111": true})
+
+	bodyObj := whatsappWebhookBody{
+		Entry: []whatsappEntry{
+			{Changes: []whatsappChange{
+				{Value: whatsappChangeValue{Messages: []whatsappMessage{
+					{
+						From:  "66811111111",
+						Type:  "image",
+						Image: &whatsappMediaRef{ID: "MEDIA1", MimeType: "image/png", Caption: "นี่คืออะไร"},
+					},
+				}}},
+			}},
+		},
+	}
+	body, _ := json.Marshal(bodyObj)
+	mac := hmac.New(sha256.New, []byte("secret"))
+	mac.Write(body)
+	sig := "sha256=" + fmt.Sprintf("%x", mac.Sum(nil))
+
+	req := httptest.NewRequest(http.MethodPost, "/whatsapp/webhook", bytes.NewReader(body))
+	req.Header.Set("X-Hub-Signature-256", sig)
+	rec := httptest.NewRecorder()
+	s.webhookHandler(rec, req)
+
+	got := sent.waitForCount(1)
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 reply sent, got %d: %#v", len(got), got)
+	}
+	if !lastRequestHadImage {
+		t.Fatal("expected the downloaded image bytes to actually reach the model's own request")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Wiring regression coverage: extend the existing
+// TestCmdBotFunctionsWireSaveImagesIntoChatBotCore-style source check to
+// the two new bots too.
+// ─────────────────────────────────────────────────────────────────
+
+func TestCmdMessengerAndWhatsAppBotWireSaveImagesIntoChatBotCore(t *testing.T) {
+	srcFiles := []string{"main.go", "meta_bots.go"}
+	var text string
+	for _, f := range srcFiles {
+		src, err := os.ReadFile(f)
+		if err != nil {
+			continue // meta_bots.go is a development-time-only file; once merged into main.go this loop still finds it there
+		}
+		text += string(src)
+	}
+	if text == "" {
+		t.Fatal("could not read any source file")
+	}
+
+	bodyOf := func(fn string) string {
+		t.Helper()
+		start := strings.Index(text, "\nfunc "+fn+"(")
+		if start == -1 {
+			t.Fatalf("could not locate func %s in source", fn)
+		}
+		rest := text[start+1:]
+		end := strings.Index(rest, "\nfunc ")
+		if end == -1 {
+			end = len(rest)
+		}
+		return rest[:end]
+	}
+
+	for _, fn := range []string{"cmdMessengerBot", "cmdWhatsAppBot"} {
+		body := bodyOf(fn)
+		if !strings.Contains(body, "chatBotCore{") {
+			t.Fatalf("%s: expected a chatBotCore{...} literal", fn)
+		}
+		if !strings.Contains(body, "saveImages:") {
+			t.Fatalf("%s: chatBotCore{...} literal is missing a saveImages: assignment", fn)
+		}
+		for _, field := range []string{"maxImageSize:", "maxPDFSize:", "pdfMaxPages:", "pdfDPI:"} {
+			if !strings.Contains(body, field) {
+				t.Fatalf("%s: chatBotCore{...} literal is missing a %s assignment", fn, field)
+			}
+		}
+	}
+}

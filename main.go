@@ -479,6 +479,10 @@ func main() {
 		os.Exit(cmdDiscordBot(os.Args[2:]))
 	case "linebot":
 		os.Exit(cmdLineBot(os.Args[2:]))
+	case "messengerbot":
+		os.Exit(cmdMessengerBot(os.Args[2:]))
+	case "whatsappbot":
+		os.Exit(cmdWhatsAppBot(os.Args[2:]))
 	case "webbot":
 		os.Exit(cmdWebBot(os.Args[2:]))
 	case "-h", "--help", "help":
@@ -519,13 +523,27 @@ func printTopUsage() {
 	fmt.Println("          calls you) instead of long-polling or a WebSocket - needs a public")
 	fmt.Println("          HTTPS endpoint reachable from LINE's platform.")
 	fmt.Println()
+	fmt.Println("  messengerbot Facebook Messenger counterpart of linebot - same webhook-based")
+	fmt.Println("          transport (public HTTPS endpoint required), but Messenger has no")
+	fmt.Println("          group concept at all: every conversation is a private 1-on-1")
+	fmt.Println("          thread between a person and your Facebook Page, so every message")
+	fmt.Println("          is always answered (no @mention/addressed logic, single-tier")
+	fmt.Println("          allowlist).")
+	fmt.Println()
+	fmt.Println("  whatsappbot  WhatsApp counterpart of messengerbot, via WhatsApp Cloud API -")
+	fmt.Println("          same webhook transport and 1-on-1-only principle. Subject to")
+	fmt.Println("          WhatsApp's own 24-hour customer-service-window policy for")
+	fmt.Println("          business-initiated messages (rarely relevant here since this bot")
+	fmt.Println("          only ever replies reactively).")
+	fmt.Println()
 	fmt.Println("  webbot       Single-page embedded web chat UI, same restrictive read-only")
-	fmt.Println("          toolset as the other three bots. No platform-verified user")
+	fmt.Println("          toolset as the other five bots. No platform-verified user")
 	fmt.Println("          identity (binds 127.0.0.1 by default; optional shared token gate)")
 	fmt.Println("          and no persisted context - each browser session lives in memory")
 	fmt.Println("          only, for as long as that session lasts.")
 	fmt.Println()
-	fmt.Println("Run 'ola ask -h', 'ola coding -h', 'ola telegrambot -h', 'ola discordbot -h', 'ola linebot -h', or 'ola webbot -h' for command-specific help.")
+	fmt.Println("Run 'ola ask -h', 'ola coding -h', 'ola telegrambot -h', 'ola discordbot -h', 'ola linebot -h',")
+	fmt.Println("'ola messengerbot -h', 'ola whatsappbot -h', or 'ola webbot -h' for command-specific help.")
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -14899,6 +14917,1900 @@ func cmdLineBot(args []string) int {
 		}
 	}
 	fmt.Fprintf(outFile, "=== ola linebot หยุดทำงาน %s ===\n", time.Now().Format(time.RFC3339))
+	return 0
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Section: Meta webhook verification (shared by messengerbot and
+// whatsappbot)
+//
+// Facebook Messenger and WhatsApp Cloud API are both Meta Graph API
+// products and share the exact same webhook subscription mechanism:
+// Meta calls YOUR server (the same "opposite direction" as linebot - see
+// that section's own header comment), a GET request handshake to prove
+// you control the callback URL (hub.mode/hub.verify_token/hub.challenge),
+// and every subsequent POST event payload signed with HMAC-SHA256 in an
+// X-Hub-Signature-256 header (hex-encoded, "sha256=" prefix - LINE's own
+// X-Line-Signature is the same HMAC-SHA256 idea but base64-encoded with
+// no prefix, see verifyLineSignature). Both helpers below are shared
+// byte-for-byte between the two bots; only the JSON event *shape* inside
+// the POST body differs (Messenger's flat "messaging" array vs
+// WhatsApp's nested "changes[].value.messages" array), which is why
+// messengerbot and whatsappbot still need their own separate
+// webhookHandler methods, not one shared one. Zero new Go dependencies -
+// same stdlib (crypto/hmac + crypto/sha256) linebot already uses.
+// ─────────────────────────────────────────────────────────────────
+
+// verifyMetaSignature checks the X-Hub-Signature-256 header Meta attaches
+// to every webhook POST request: HMAC-SHA256 of the raw request body,
+// keyed by the app secret, hex-encoded and prefixed "sha256=". hmac.Equal
+// is used rather than == to avoid a timing side-channel, same reasoning
+// as verifyLineSignature.
+func verifyMetaSignature(body []byte, signatureHeader, appSecret string) bool {
+	const prefix = "sha256="
+	if !strings.HasPrefix(signatureHeader, prefix) {
+		return false
+	}
+	got, err := hex.DecodeString(strings.TrimPrefix(signatureHeader, prefix))
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(appSecret))
+	mac.Write(body)
+	expected := mac.Sum(nil)
+	return hmac.Equal(expected, got)
+}
+
+// handleMetaWebhookVerify implements the GET-based callback URL
+// verification handshake Meta performs once when a webhook URL is first
+// saved (and again whenever re-verified) in the developer console - LINE
+// has no equivalent step (its own "Verify" console button just sends a
+// normal signed POST, see lineUsage). Meta sends hub.mode=subscribe,
+// hub.verify_token=<whatever was configured in the console>, and
+// hub.challenge=<random string>; the correct response is to echo
+// hub.challenge back verbatim as the response body with a 200 IF AND
+// ONLY IF hub.verify_token matches what this bot was actually configured
+// with - identical handshake for both Messenger and WhatsApp (same
+// Graph API infrastructure).
+//
+// Returns true if this request was handled as a verification handshake
+// (a GET) - the caller must return immediately either way, whether that
+// meant success (challenge echoed) or failure (403 written). Returns
+// false for anything that isn't a GET, meaning the caller should
+// continue on to its own POST-event handling.
+func handleMetaWebhookVerify(w http.ResponseWriter, r *http.Request, verifyToken string) bool {
+	if r.Method != http.MethodGet {
+		return false
+	}
+	if r.URL.Query().Get("hub.mode") == "subscribe" && r.URL.Query().Get("hub.verify_token") == verifyToken {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(r.URL.Query().Get("hub.challenge")))
+	} else {
+		w.WriteHeader(http.StatusForbidden)
+	}
+	return true
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Section: messengerbot (Facebook Messenger)
+//
+// "ola messengerbot" is Messenger's counterpart of telegrambot/discordbot/
+// linebot - same principles (allow-listed users, additive persona,
+// read-only knowledge base + optional embedding search, per-chat
+// persistent context with LLM-based compaction, the same restrictive
+// read-only toolset, grounding markers) via chatBotCore (see that
+// struct's own doc comment).
+//
+// TRANSPORT: webhook, same direction/shape as linebot (Meta calls this
+// process's HTTP server, not the other way around) - see the shared
+// "Meta webhook verification" section above for the GET handshake and
+// X-Hub-Signature-256 check both messengerbot and whatsappbot use.
+//
+// THE BIG STRUCTURAL DIFFERENCE FROM TELEGRAM/DISCORD/LINE: Messenger has
+// no "group" concept a bot can be added to at all - a Page's Messenger
+// inbox is always a collection of independent 1-on-1 threads between a
+// person (identified by a page-scoped ID, PSID) and the Page. There is
+// therefore no @mention/addressed distinction, no speaker attribution, no
+// group allowlist tier - every incoming message is always answered, and
+// the access-control allowlist is a single tier (PSIDs) rather than the
+// two/three tiers telegrambot/discordbot/linebot need.
+// ─────────────────────────────────────────────────────────────────
+
+const defaultMessengerAPIBase = "https://graph.facebook.com/v21.0"
+const defaultMessengerListenAddr = ":8081"
+const defaultMessengerWebhookPath = "/messenger/webhook"
+const defaultMessengerContextDir = "messenger-context"
+
+// messengerMaxMessageRunes stays a little under Messenger's documented
+// 2000-character text message limit - same margin-below-the-real-limit
+// convention every other chat bot's own split function already uses
+// (telegramMaxMessageRunes, discordMaxMessageRunes, lineMaxMessageRunes).
+const messengerMaxMessageRunes = 1900
+
+// ─────────────────────────────────────────────────────────────────
+// Webhook payload types (only the fields this bot actually uses)
+// ─────────────────────────────────────────────────────────────────
+
+type messengerAttachment struct {
+	Type    string `json:"type"` // "image", "file", "audio", "video", "fallback", ... - only "image" and "file" are handled
+	Payload struct {
+		URL string `json:"url"`
+	} `json:"payload"`
+}
+
+func (a messengerAttachment) isImage() bool {
+	return a.Type == "image"
+}
+
+// isPDF reports whether a "file"-type attachment looks like a PDF.
+// Messenger's payload carries only a URL, never a MIME type or original
+// filename - the URL's own path extension is the only signal available,
+// the same fallback lineMessage.isPDF uses when LINE's own file event
+// similarly gives no MIME type.
+func (a messengerAttachment) isPDF() bool {
+	if a.Type != "file" {
+		return false
+	}
+	if u, err := url.Parse(a.Payload.URL); err == nil {
+		return strings.EqualFold(filepath.Ext(u.Path), ".pdf")
+	}
+	return strings.EqualFold(filepath.Ext(a.Payload.URL), ".pdf")
+}
+
+type messengerMessage struct {
+	MID         string                `json:"mid"`
+	Text        string                `json:"text,omitempty"`
+	Attachments []messengerAttachment `json:"attachments,omitempty"`
+	IsEcho      bool                  `json:"is_echo,omitempty"` // see handleMessengerEvent's own comment
+}
+
+type messengerMessagingEvent struct {
+	Sender struct {
+		ID string `json:"id"`
+	} `json:"sender"`
+	Recipient struct {
+		ID string `json:"id"`
+	} `json:"recipient"`
+	Timestamp int64             `json:"timestamp"`
+	Message   *messengerMessage `json:"message,omitempty"`
+}
+
+type messengerEntry struct {
+	ID        string                    `json:"id"`
+	Messaging []messengerMessagingEvent `json:"messaging"`
+}
+
+type messengerWebhookBody struct {
+	Object string           `json:"object"`
+	Entry  []messengerEntry `json:"entry"`
+}
+
+// ─────────────────────────────────────────────────────────────────
+// REST client. Messenger's Send API traditionally authenticates via an
+// access_token QUERY PARAMETER (not an Authorization header) - a fourth
+// distinct auth scheme after Telegram's URL-embedded token, Discord's
+// "Bot <token>" header, and LINE's "Bearer <token>" header.
+// ─────────────────────────────────────────────────────────────────
+
+// messengerAPIURL appends "access_token=<token>" to path, using "&" if
+// path already has a "?" (e.g. "/me?fields=id,name") or "?" otherwise.
+func messengerAPIURL(apiBase, path, token string) string {
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	return strings.TrimRight(apiBase, "/") + path + sep + "access_token=" + url.QueryEscape(token)
+}
+
+type messengerPageInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// messengerGetPageInfo validates the page token works and gets the
+// Page's own name for the startup banner - mirrors lineGetBotInfo's own
+// "fail fast if credentials are wrong" reasoning.
+func messengerGetPageInfo(client *http.Client, apiBase, token string) (messengerPageInfo, error) {
+	resp, err := client.Get(messengerAPIURL(apiBase, "/me?fields=id,name", token))
+	if err != nil {
+		return messengerPageInfo{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return messengerPageInfo{}, fmt.Errorf("อ่าน response body ไม่ได้: %v", err)
+	}
+	if resp.StatusCode >= 400 {
+		return messengerPageInfo{}, fmt.Errorf("GET /me สถานะ %d: %s", resp.StatusCode, string(body))
+	}
+	var out messengerPageInfo
+	if err := json.Unmarshal(body, &out); err != nil {
+		return messengerPageInfo{}, fmt.Errorf("decode /me response ไม่ได้: %v", err)
+	}
+	return out, nil
+}
+
+// splitMessengerMessage mirrors splitLineMessage's own logic exactly
+// (trim, empty-answer placeholder, prefer cutting at the last newline
+// within the tail half of a chunk) with Messenger's own length constant -
+// each platform keeps its own small split function rather than sharing
+// one, matching the existing telegramMaxMessageRunes/splitTelegramMessage,
+// discordMaxMessageRunes/splitDiscordMessage,
+// lineMaxMessageRunes/splitLineMessage precedent.
+func splitMessengerMessage(text string) []string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		text = "(ไม่มีคำตอบ)"
+	}
+	runes := []rune(text)
+	if len(runes) <= messengerMaxMessageRunes {
+		return []string{text}
+	}
+	var chunks []string
+	for len(runes) > 0 {
+		n := messengerMaxMessageRunes
+		if n > len(runes) {
+			n = len(runes)
+		}
+		cut := n
+		if n == messengerMaxMessageRunes {
+			for i := n - 1; i > n/2; i-- {
+				if runes[i] == '\n' {
+					cut = i + 1
+					break
+				}
+			}
+		}
+		chunk := strings.TrimSpace(string(runes[:cut]))
+		if chunk != "" {
+			chunks = append(chunks, chunk)
+		}
+		runes = runes[cut:]
+	}
+	if len(chunks) == 0 {
+		chunks = []string{"(ไม่มีคำตอบ)"}
+	}
+	return chunks
+}
+
+// messengerSendMessage sends via the Send API (POST /me/messages).
+// messaging_type "RESPONSE" is used unconditionally - correct for every
+// reply this bot ever sends, since it only ever replies to a message a
+// person just sent (never proactively messages someone first).
+func messengerSendMessage(client *http.Client, apiBase, token, psid, text string) error {
+	for _, chunk := range splitMessengerMessage(text) {
+		body := map[string]interface{}{
+			"messaging_type": "RESPONSE",
+			"recipient":      map[string]string{"id": psid},
+			"message":        map[string]string{"text": chunk},
+		}
+		data, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("marshal request ไม่ได้: %v", err)
+		}
+		req, err := http.NewRequest(http.MethodPost, messengerAPIURL(apiBase, "/me/messages", token), bytes.NewReader(data))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		respBody, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return fmt.Errorf("อ่าน response body ไม่ได้: %v", readErr)
+		}
+		if resp.StatusCode >= 400 {
+			return fmt.Errorf("POST /me/messages สถานะ %d: %s", resp.StatusCode, string(respBody))
+		}
+	}
+	return nil
+}
+
+// buildMessengerHTTPClients mirrors buildLineHTTPClients'/
+// buildTelegramHTTPClients' own reasoning exactly - the model
+// (Ollama/OpenAI) client must stay unbounded, only the Messenger REST
+// client gets a short fail-fast timeout.
+func buildMessengerHTTPClients() (rest, model *http.Client) {
+	rest = &http.Client{Timeout: 30 * time.Second}
+	model = newHTTPClient()
+	return rest, model
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Access control: a single allowlist tier (PSIDs) - see this section's
+// own header comment on why Messenger has no group/channel tier at all.
+// ─────────────────────────────────────────────────────────────────
+
+type messengerAccessConfig struct {
+	Users map[string]bool
+}
+
+func (c messengerAccessConfig) allowed(psid string) bool {
+	return c.Users[psid]
+}
+
+func (c messengerAccessConfig) empty() bool {
+	return len(c.Users) == 0
+}
+
+func parseMessengerIDList(raw string) map[string]bool {
+	ids := map[string]bool{}
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		// PSIDs are opaque numeric-looking strings scoped to this Page -
+		// no cross-checkable format the way Telegram/Discord snowflake IDs
+		// have, so (like LINE's own ID parsing) any non-empty token is
+		// accepted as-is.
+		ids[part] = true
+	}
+	return ids
+}
+
+func resolveMessengerAccessConfig(usersFlag string) messengerAccessConfig {
+	usersRaw := usersFlag
+	if usersRaw == "" {
+		usersRaw = os.Getenv("OLA_MESSENGER_ALLOWED_USERS")
+	}
+	return messengerAccessConfig{Users: parseMessengerIDList(usersRaw)}
+}
+
+// messengerContextKey mirrors telegramContextKey/discordContextKey/
+// lineContextKey - the "messenger_" prefix lets this bot safely share one
+// --context-dir with any of the other three with no key collisions.
+func messengerContextKey(psid string) string {
+	return "messenger_user_" + psid
+}
+
+// ─────────────────────────────────────────────────────────────────
+// messengerSession embeds chatBotCore (see that struct's own doc
+// comment) - everything platform-agnostic is inherited from there
+// unchanged. Only the Messenger-specific transport/access pieces live
+// here.
+// ─────────────────────────────────────────────────────────────────
+
+type messengerSession struct {
+	chatBotCore
+	restClient  *http.Client
+	apiBase     string
+	pageToken   string
+	appSecret   string
+	verifyToken string
+	pageID      string
+	access      messengerAccessConfig
+	sem         chan struct{}
+}
+
+// handleMessengerEvent processes exactly one incoming messaging event end
+// to end. Unlike telegramSession/discordSession/lineSession's own message
+// handlers, there is no "addressed" branch at all here (see this
+// section's own header comment) - every message that reaches this
+// function is always answered.
+func (s *messengerSession) handleMessengerEvent(ev messengerMessagingEvent) {
+	s.sem <- struct{}{}
+	defer func() { <-s.sem }()
+
+	msg := ev.Message
+	if msg == nil || msg.IsEcho {
+		// msg == nil: a postback/delivery/read event, not a message.
+		// IsEcho: Messenger can be configured (message_echoes subscription
+		// field) to also deliver copies of messages the PAGE ITSELF sent
+		// back through this same webhook - without this guard, a reply
+		// this bot just sent would loop back in as if a user sent it.
+		return
+	}
+	psid := ev.Sender.ID
+	if psid == "" {
+		return
+	}
+	text := strings.TrimSpace(msg.Text)
+
+	if text == "/whoami" || text == "/start" {
+		_ = messengerSendMessage(s.restClient, s.apiBase, s.pageToken, psid, fmt.Sprintf("PSID ของคุณ: %s", psid))
+		return
+	}
+
+	if !s.access.allowed(psid) {
+		_ = messengerSendMessage(s.restClient, s.apiBase, s.pageToken, psid,
+			fmt.Sprintf("คุณยังไม่ได้รับอนุญาตให้ใช้บอทนี้ ส่ง /whoami เพื่อดู PSID แล้วแจ้งผู้ดูแลให้เพิ่มสิทธิ์\nPSID: %s", psid))
+		s.logf("[messenger_denied] psid=%s\n", psid)
+		return
+	}
+
+	if text == "/tools" {
+		_ = messengerSendMessage(s.restClient, s.apiBase, s.pageToken, psid, s.toolsStatusText())
+		return
+	}
+
+	key := messengerContextKey(psid)
+	lock := s.contextMutex(key)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// Messenger attachments arrive as an array (unlike Telegram/LINE's
+	// single-attachment-per-message model) - a real message could in
+	// principle carry more than one, but this bot only ever analyzes the
+	// first image and first PDF-like file it finds, matching the scope
+	// every other chat bot here already settled on (one attachment
+	// analyzed per turn) rather than adding multi-attachment handling for
+	// a case that's rare in practice.
+	var imageURL, pdfURL string
+	for _, a := range msg.Attachments {
+		if imageURL == "" && a.isImage() {
+			imageURL = a.Payload.URL
+		}
+		if pdfURL == "" && a.isPDF() {
+			pdfURL = a.Payload.URL
+		}
+	}
+
+	var images []string
+	var imageRefs []string
+	var pdfRefs []string
+
+	if imageURL != "" {
+		// Messenger attachment URLs are already fully resolved, signed CDN
+		// links - no getFile-style extra lookup needed, the same shape as
+		// Discord's own attachment URLs (see discordAttachment) - so this
+		// reuses discordDownloadFile directly rather than duplicating an
+		// identical plain-GET-with-size-cap helper under a new name.
+		data, err := discordDownloadFile(s.client, imageURL, s.maxImageSize)
+		if err != nil {
+			s.logf("[messenger_error] ดาวน์โหลดรูปภาพไม่ได้: %v\n", err)
+			_ = messengerSendMessage(s.restClient, s.apiBase, s.pageToken, psid, fmt.Sprintf("ขออภัย ดาวน์โหลดรูปภาพไม่สำเร็จ: %v", err))
+			return
+		}
+		images = append(images, base64.StdEncoding.EncodeToString(data))
+		if s.saveImages {
+			if ref, err := savePicture(s.contextDir, key, data); err != nil {
+				s.logf("[messenger_error] บันทึกรูปภาพไม่ได้: %v\n", err)
+			} else {
+				imageRefs = []string{ref}
+			}
+		}
+	}
+
+	if pdfURL != "" {
+		data, err := discordDownloadFile(s.client, pdfURL, s.maxPDFSize)
+		if err != nil {
+			s.logf("[messenger_error] ดาวน์โหลดไฟล์ PDF ไม่ได้: %v\n", err)
+			_ = messengerSendMessage(s.restClient, s.apiBase, s.pageToken, psid, fmt.Sprintf("ขออภัย ดาวน์โหลดไฟล์ PDF ไม่สำเร็จ: %v", err))
+			return
+		}
+		var savedPath string
+		if s.saveImages {
+			if ref, err := savePDFFile(s.contextDir, key, data); err != nil {
+				s.logf("[messenger_error] บันทึกไฟล์ PDF ไม่ได้: %v\n", err)
+			} else {
+				pdfRefs = []string{ref}
+				savedPath = filepath.Join(s.contextDir, filepath.FromSlash(ref))
+			}
+		}
+		var pages []string
+		var convErr error
+		if savedPath != "" {
+			pages, _, convErr = convertPDFToImages(savedPath, s.pdfMaxPages, s.pdfDPI)
+		} else {
+			pages, _, convErr = convertDownloadedPDFBytes(data, s.pdfMaxPages, s.pdfDPI)
+		}
+		if convErr != nil {
+			s.logf("[messenger_error] แปลง PDF ไม่สำเร็จ: %v\n", convErr)
+			_ = messengerSendMessage(s.restClient, s.apiBase, s.pageToken, psid, fmt.Sprintf("ขออภัย แปลงไฟล์ PDF ไม่สำเร็จ: %v", convErr))
+			return
+		}
+		images = append(images, pages...)
+	}
+
+	if text == "" && imageURL == "" && pdfURL == "" {
+		return // e.g. a sticker/like/thumbs-up quick reaction - nothing this bot can act on
+	}
+
+	s.logf("\n=== messenger key=%s psid=%s ===\n[user] %s\n", key, psid, text)
+
+	answer, err := s.recordAndRespond(key, "", text, true, images, imageRefs, pdfRefs)
+	if err != nil {
+		s.logf("[messenger_error] key=%s: %v\n", key, err)
+		if s.ntfyTopic != "" {
+			sendNotification(s.ntfyTopic, truncateWords(fmt.Sprintf("[messengerbot error] key=%s: %v", key, err), maxNotificationWords))
+		}
+		_ = messengerSendMessage(s.restClient, s.apiBase, s.pageToken, psid, "ขออภัย เกิดข้อผิดพลาดระหว่างประมวลผล ลองใหม่อีกครั้ง")
+		return
+	}
+	s.logf("[assistant] %s\n", answer)
+	if err := messengerSendMessage(s.restClient, s.apiBase, s.pageToken, psid, answer); err != nil {
+		s.logf("[messenger_error] ส่งข้อความกลับไม่ได้: %v\n", err)
+	}
+}
+
+// webhookHandler is the actual net/http.HandlerFunc Messenger both GETs
+// (verification handshake) and POSTs (message events) to. GET requests
+// are delegated entirely to handleMetaWebhookVerify; POST requests are
+// signature-checked, acknowledged immediately (Meta expects a fast
+// response), then each messaging event is processed in its own goroutine
+// so a slow model call never blocks the next incoming webhook delivery -
+// same reasoning as lineSession.webhookHandler.
+func (s *messengerSession) webhookHandler(w http.ResponseWriter, r *http.Request) {
+	if handleMetaWebhookVerify(w, r, s.verifyToken) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	// Messenger's own documented request size limits are generous, but
+	// there's no reason to ever buffer more than a few MB of JSON event
+	// data - same defensive cap linebot's own webhookHandler uses.
+	body, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if !verifyMetaSignature(body, r.Header.Get("X-Hub-Signature-256"), s.appSecret) {
+		s.logf("[messenger_error] signature ไม่ถูกต้อง - ปฏิเสธ request จาก %s\n", r.RemoteAddr)
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+
+	var payload messengerWebhookBody
+	if err := json.Unmarshal(body, &payload); err != nil {
+		s.logf("[messenger_error] parse webhook body ไม่ได้: %v\n", err)
+		return
+	}
+	for _, entry := range payload.Entry {
+		for i := range entry.Messaging {
+			ev := entry.Messaging[i]
+			go s.handleMessengerEvent(ev)
+		}
+	}
+}
+
+func messengerUsage(fs *flag.FlagSet) func() {
+	return func() {
+		fmt.Println("Usage: ola messengerbot [options]")
+		fmt.Println()
+		fmt.Println("รัน ola เป็น Facebook Messenger bot ผูกกับ Facebook Page - รับข้อความผ่าน webhook")
+		fmt.Println("(Messenger ยิง HTTP POST เข้ามาหาเซิร์ฟเวอร์นี้ เหมือน 'ola linebot' ทุกประการ)")
+		fmt.Println("หลักการ tool/persona/knowledge-base/context/web search เหมือน 'ola telegrambot' ทุกประการ")
+		fmt.Println("ต่างที่: Messenger ไม่มีแนวคิด 'กลุ่ม' เลย - ทุกบทสนทนาเป็น 1-on-1 ระหว่างคนกับ Page")
+		fmt.Println("เท่านั้น ทุกข้อความจึงถูกตอบเสมอ ไม่มีกลไก @mention/allowlist กลุ่มแบบ Telegram/Discord/LINE")
+		fmt.Println("(ดู README หัวข้อ messengerbot สำหรับรายละเอียด)")
+		fmt.Println()
+		fmt.Println("⚠️  ต้องมี public HTTPS endpoint ชี้เข้ามาที่ webhook นี้ (ปกติวางไว้หลัง reverse proxy")
+		fmt.Println("    เช่น Caddy/nginx ที่จัดการ TLS ให้ - messengerbot เองฟังแค่ plain HTTP) แล้วเอา URL")
+		fmt.Println("    นั้นไปตั้งใน Meta for Developers > [App ของคุณ] > Messenger > Webhooks")
+		fmt.Println("⚠️  ต้องกด Subscribe หัวข้อ 'messages' ให้ Page ของคุณในหน้าเดียวกันด้วย ไม่งั้นจะไม่มี")
+		fmt.Println("    event ส่งเข้ามาเลย แม้ webhook จะ verify ผ่านแล้วก็ตาม")
+		fmt.Println()
+		fmt.Println("Required (env เท่านั้น - ไม่มี flag รับค่าลับโดยตรง เพื่อไม่ให้หลุดไปอยู่ใน shell history/ps):")
+		fmt.Println("  OLA_MESSENGER_PAGE_TOKEN    Page Access Token จาก Meta for Developers")
+		fmt.Println("  OLA_MESSENGER_APP_SECRET    App Secret ของแอป - ใช้ตรวจสอบ signature ของ webhook")
+		fmt.Println("  OLA_MESSENGER_VERIFY_TOKEN  ค่าที่คุณกำหนดเอง - ใช้ตอนยืนยัน webhook URL ครั้งแรกในคอนโซล")
+		fmt.Println("  -m/--model หรือ OLA_OLLAMA_MODEL")
+		fmt.Println()
+		fmt.Println("Access control (allowlist ชั้นเดียว - ไม่มีชั้นกลุ่มเหมือนสามบอทแรก):")
+		fmt.Println("  --messenger-allowed-users <ids>  OLA_MESSENGER_ALLOWED_USERS  comma-separated PSID")
+		fmt.Println("                                    ส่ง /whoami คุยกับบอทเพื่อดู PSID ของตัวเอง (ใช้ได้แม้ยังไม่อยู่ใน allowlist)")
+		fmt.Println()
+		fmt.Println("Persona/Knowledge base/Context/Web search: เหมือน 'ola telegrambot' ทุก flag ทุกพฤติกรรม - ดู 'ola telegrambot -h'")
+		fmt.Println("  --persona, --persona-file, --knowledge-dir, --embed-model, --embed-top-k, --embed-min-score,")
+		fmt.Println("  --embed-refresh-interval, --context-dir (default: messenger-context), --context-keep-recent,")
+		fmt.Println("  --context-compact-after, --searxng-url, --ollama-search-key, --no-web-search, --search-*")
+		fmt.Println()
+		fmt.Println("Runtime:")
+		fmt.Println("  -c/--ctx, -P/--provider, --api-base, -k/--key   เหมือน 'ola ask'")
+		fmt.Println("  --messenger-listen-addr <addr>   OLA_MESSENGER_LISTEN_ADDR   ที่อยู่ที่ HTTP server ฟัง (default :8081)")
+		fmt.Println("  --messenger-webhook-path <path>  OLA_MESSENGER_WEBHOOK_PATH  path ของ webhook (default /messenger/webhook)")
+		fmt.Println("  --messenger-api-base <url>       OLA_MESSENGER_API_BASE      (default: https://graph.facebook.com/v21.0)")
+		fmt.Println("  --messenger-max-concurrent <n>   จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส (default 4)")
+		fmt.Println("  --max-image-size <size>      OLA_MAX_IMAGE_SIZE   ขนาดรูปภาพสูงสุด (default 10M) - ดู 'ola telegrambot -h'")
+		fmt.Println("  --save-images                OLA_SAVE_IMAGES      บันทึกรูปไว้ดูซ้ำได้ (default ปิด) - ดู 'ola telegrambot -h'")
+		fmt.Println("  --max-pdf-size, --pdf-max-pages, --pdf-dpi        รองรับไฟล์ PDF เหมือนกัน - ดู 'ola telegrambot -h'")
+		fmt.Println("  -x/--topic     ntfy.sh topic (แจ้งเตือนเมื่อเกิด error ระหว่างประมวลผลข้อความ)")
+		fmt.Println("  -o/--output    log ไฟล์แบบเต็ม (default: messengerbot.log, เปิดแบบ append เสมอ)")
+		fmt.Println()
+		fmt.Println("คำสั่งในตัว: /whoami หรือ /start (ดู PSID ของตัวเอง), /tools (เช็คสถานะ tool ปัจจุบัน - เฉพาะผู้ที่อยู่ใน allowlist)")
+		fs.PrintDefaults()
+	}
+}
+
+func cmdMessengerBot(args []string) int {
+	fs := flag.NewFlagSet("messengerbot", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+
+	var model, ctxStr, outputFile, topic string
+	var flagKey, flagHelp bool
+	var providerFlag, apiBaseFlag string
+	var messengerAPIBase, listenAddr, webhookPath string
+	var allowedUsers string
+	var persona, personaFile string
+	var knowledgeDir string
+	var embedModel string
+	var embedTopK int
+	var embedMinScore float64
+	var embedRefreshSec int
+	var contextDir string
+	var keepRecent, compactAfter int
+	var maxConcurrent int
+	var searxngURL, ollamaSearchKey string
+	var flagNoWebSearch bool
+	var maxImageSizeRaw string
+	var maxPDFSizeRaw string
+	var pdfMaxPages, pdfDPI int
+	var saveImages bool
+	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
+
+	fs.StringVar(&model, "m", "", "")
+	fs.StringVar(&model, "model", "", "")
+	fs.StringVar(&ctxStr, "c", "", "")
+	fs.StringVar(&ctxStr, "ctx", "", "")
+	fs.BoolVar(&flagKey, "k", false, "")
+	fs.BoolVar(&flagKey, "key", false, "")
+	fs.StringVar(&providerFlag, "P", "", "")
+	fs.StringVar(&providerFlag, "provider", "", "")
+	fs.StringVar(&apiBaseFlag, "api-base", "", "")
+	fs.StringVar(&messengerAPIBase, "messenger-api-base", "", "")
+	fs.StringVar(&listenAddr, "messenger-listen-addr", "", "")
+	fs.StringVar(&webhookPath, "messenger-webhook-path", "", "")
+	fs.StringVar(&allowedUsers, "messenger-allowed-users", "", "")
+	fs.StringVar(&persona, "persona", "", "")
+	fs.StringVar(&personaFile, "persona-file", "", "")
+	fs.StringVar(&knowledgeDir, "knowledge-dir", "", "")
+	fs.StringVar(&embedModel, "embed-model", "", "")
+	fs.IntVar(&embedTopK, "embed-top-k", 0, "")
+	fs.Float64Var(&embedMinScore, "embed-min-score", 0, "")
+	fs.IntVar(&embedRefreshSec, "embed-refresh-interval", 0, "")
+	fs.StringVar(&contextDir, "context-dir", "", "")
+	fs.IntVar(&keepRecent, "context-keep-recent", 0, "")
+	fs.IntVar(&compactAfter, "context-compact-after", 0, "")
+	fs.IntVar(&maxConcurrent, "messenger-max-concurrent", 0, "")
+	fs.StringVar(&searxngURL, "searxng-url", "", "")
+	fs.StringVar(&ollamaSearchKey, "ollama-search-key", "", "")
+	fs.BoolVar(&flagNoWebSearch, "no-web-search", false, "")
+	fs.IntVar(&searchMaxResults, "search-max-results", 0, "")
+	fs.IntVar(&searchConcurrency, "search-concurrency", 0, "")
+	fs.IntVar(&fetchConcurrency, "fetch-concurrency", 0, "")
+	fs.IntVar(&searchTimeoutSec, "search-timeout", 0, "")
+	fs.IntVar(&fetchTimeoutSec, "fetch-timeout", 0, "")
+	fs.StringVar(&maxImageSizeRaw, "max-image-size", "", "")
+	fs.StringVar(&maxPDFSizeRaw, "max-pdf-size", "", "")
+	fs.IntVar(&pdfMaxPages, "pdf-max-pages", 0, "")
+	fs.IntVar(&pdfDPI, "pdf-dpi", 0, "")
+	fs.BoolVar(&saveImages, "save-images", false, "")
+	fs.StringVar(&topic, "x", "", "")
+	fs.StringVar(&topic, "topic", "", "")
+	fs.StringVar(&outputFile, "o", "", "")
+	fs.StringVar(&outputFile, "output", "", "")
+	fs.BoolVar(&flagHelp, "h", false, "")
+	fs.BoolVar(&flagHelp, "help", false, "")
+
+	usage := messengerUsage(fs)
+	fs.Usage = usage
+
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	if flagHelp {
+		usage()
+		return 0
+	}
+
+	quietMode = true // headless daemon - see cmdTelegramBot's own comment on this exact line for the full reasoning
+
+	pageToken := strings.TrimSpace(os.Getenv("OLA_MESSENGER_PAGE_TOKEN"))
+	if pageToken == "" {
+		fmt.Fprintln(os.Stderr, "error: ต้องตั้งค่า OLA_MESSENGER_PAGE_TOKEN (env เท่านั้น - ไม่มี flag รับ token โดยตรง เพื่อไม่ให้หลุดไปอยู่ใน shell history/ps)")
+		return 1
+	}
+	appSecret := strings.TrimSpace(os.Getenv("OLA_MESSENGER_APP_SECRET"))
+	if appSecret == "" {
+		fmt.Fprintln(os.Stderr, "error: ต้องตั้งค่า OLA_MESSENGER_APP_SECRET (env เท่านั้น - ใช้ตรวจสอบ signature ของ webhook request)")
+		return 1
+	}
+	verifyToken := strings.TrimSpace(os.Getenv("OLA_MESSENGER_VERIFY_TOKEN"))
+	if verifyToken == "" {
+		fmt.Fprintln(os.Stderr, "error: ต้องตั้งค่า OLA_MESSENGER_VERIFY_TOKEN (env เท่านั้น - ใช้ตอนยืนยัน webhook URL ครั้งแรกในคอนโซล)")
+		return 1
+	}
+
+	pcfg, err := resolveProviderConfig(providerFlag, apiBaseFlag, model, flagKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
+	if ctxStr == "" {
+		ctxStr = os.Getenv("OLA_OLLAMA_CONTEXT_SIZE")
+	}
+	if ctxStr == "" {
+		ctxStr = "16384"
+	}
+	if !regexp.MustCompile(`^[0-9]+$`).MatchString(ctxStr) {
+		fmt.Fprintf(os.Stderr, "error: ctx ต้องเป็นตัวเลข (got: %s)\n", ctxStr)
+		return 1
+	}
+	ctxSize, _ := strconv.Atoi(ctxStr)
+
+	if messengerAPIBase == "" {
+		messengerAPIBase = os.Getenv("OLA_MESSENGER_API_BASE")
+	}
+	if messengerAPIBase == "" {
+		messengerAPIBase = defaultMessengerAPIBase
+	}
+	if listenAddr == "" {
+		listenAddr = os.Getenv("OLA_MESSENGER_LISTEN_ADDR")
+	}
+	if listenAddr == "" {
+		listenAddr = defaultMessengerListenAddr
+	}
+	if webhookPath == "" {
+		webhookPath = os.Getenv("OLA_MESSENGER_WEBHOOK_PATH")
+	}
+	if webhookPath == "" {
+		webhookPath = defaultMessengerWebhookPath
+	}
+
+	if contextDir == "" {
+		contextDir = os.Getenv("OLA_CONTEXT_DIR")
+	}
+	if contextDir == "" {
+		contextDir = defaultMessengerContextDir
+	}
+	if keepRecent <= 0 {
+		keepRecent = defaultChatBotKeepRecentTurns
+	}
+	if compactAfter <= 0 {
+		compactAfter = defaultChatBotCompactAfterTurns
+	}
+	if compactAfter <= keepRecent {
+		fmt.Fprintf(os.Stderr, "error: --context-compact-after (%d) ต้องมากกว่า --context-keep-recent (%d)\n", compactAfter, keepRecent)
+		return 1
+	}
+	if maxConcurrent <= 0 {
+		maxConcurrent = defaultTelegramMaxConcurrent
+	}
+
+	access := resolveMessengerAccessConfig(allowedUsers)
+	if access.empty() {
+		fmt.Fprintln(os.Stderr, "error: ไม่มีใครอยู่ใน allowlist เลย (--messenger-allowed-users หรือ OLA_MESSENGER_ALLOWED_USERS ว่างเปล่า) - บอทจะปฏิเสธทุกคน ตั้งอย่างน้อยหนึ่งอย่าง")
+		return 1
+	}
+
+	persona, err = resolveChatBotPersona(persona, personaFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
+	knowledgeCfg, knowledgeWarnings := resolveKnowledgeConfig(knowledgeDir)
+	for _, w := range knowledgeWarnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
+
+	embedCfg := resolveEmbedConfig(embedModel, embedTopK, embedMinScore, embedRefreshSec)
+	if embedCfg.enabled() {
+		if !knowledgeCfg.enabled() {
+			fmt.Fprintln(os.Stderr, "error: --embed-model ตั้งไว้แต่ไม่มี --knowledge-dir - embedding search ใช้กับฐานความรู้เท่านั้น ไม่มีอะไรให้ index")
+			return 1
+		}
+		if pcfg.Provider != providerOllama {
+			fmt.Fprintln(os.Stderr, "error: --embed-model รองรับเฉพาะ --provider ollama ในตอนนี้ (เรียก Ollama's /api/embed โดยตรง)")
+			return 1
+		}
+	}
+
+	searchCfg := resolveSearchConfig(searxngURL, searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec, flagNoWebSearch)
+	if !flagNoWebSearch {
+		searchCfg.OllamaAPIKey, searchCfg.OllamaBase = resolveOllamaSearchConfig(ollamaSearchKey)
+	}
+
+	maxImageSize, err := resolveMaxImageSize(maxImageSizeRaw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	maxPDFSize, err := resolveMaxPDFSize(maxPDFSizeRaw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	if pdfMaxPages <= 0 {
+		pdfMaxPages = envInt("OLA_PDF_MAX_PAGES", defaultPDFMaxPages)
+	}
+	if pdfDPI <= 0 {
+		pdfDPI = envInt("OLA_PDF_DPI", defaultPDFDPI)
+	}
+	saveImages = saveImages || envBool("OLA_SAVE_IMAGES")
+
+	tools := filterTools(builtinTools, "get_current_time", "delay")
+	if knowledgeCfg.enabled() {
+		tools = append(tools, searchKnowledgeTool, readKnowledgeTool)
+	}
+	if searchCfg.searchEnabled() {
+		tools = append(tools, webSearchTool)
+	}
+	if searchCfg.fetchEnabled() {
+		tools = append(tools, webFetchTool)
+	}
+	if saveImages {
+		tools = append(tools, readPicTool, readSavedPDFTool)
+	}
+
+	systemPrompt := buildChatBotSystemPrompt("Messenger", persona)
+
+	if outputFile == "" {
+		outputFile = os.Getenv("OLA_OUTPUT_FILE")
+	}
+	if outputFile == "" {
+		outputFile = "messengerbot.log"
+	}
+	outFile, err := os.OpenFile(outputFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: เปิดไฟล์ log %s ไม่ได้: %v\n", outputFile, err)
+		return 1
+	}
+	defer outFile.Close()
+
+	ntfyTopic := topic
+	if ntfyTopic == "" {
+		ntfyTopic = os.Getenv("OLA_TOPIC")
+	}
+
+	restClient, modelClient := buildMessengerHTTPClients()
+
+	page, err := messengerGetPageInfo(restClient, messengerAPIBase, pageToken)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: เชื่อมต่อ Messenger Platform API ไม่ได้ (เช็ค OLA_MESSENGER_PAGE_TOKEN และการเชื่อมต่อเน็ต): %v\n", err)
+		return 1
+	}
+
+	session := &messengerSession{
+		chatBotCore: chatBotCore{
+			client:           modelClient,
+			systemPrompt:     systemPrompt,
+			tools:            tools,
+			knowledgeCfg:     knowledgeCfg,
+			embedCfg:         embedCfg,
+			knowledgeIdx:     &knowledgeIndexStore{},
+			knowledgeIdxPath: knowledgeIndexPath(contextDir),
+			searchCfg:        searchCfg,
+			pcfg:             pcfg,
+			ctxSize:          ctxSize,
+			contextDir:       contextDir,
+			keepRecent:       keepRecent,
+			compactAfter:     compactAfter,
+			ntfyTopic:        ntfyTopic,
+			maxImageSize:     maxImageSize,
+			maxPDFSize:       maxPDFSize,
+			pdfMaxPages:      pdfMaxPages,
+			pdfDPI:           pdfDPI,
+			saveImages:       saveImages,
+			outFile:          outFile,
+			locks:            map[string]*sync.Mutex{},
+		},
+		restClient:  restClient,
+		apiBase:     messengerAPIBase,
+		pageToken:   pageToken,
+		appSecret:   appSecret,
+		verifyToken: verifyToken,
+		pageID:      page.ID,
+		access:      access,
+		sem:         make(chan struct{}, maxConcurrent),
+	}
+
+	if embedCfg.enabled() {
+		if prevIdx, err := loadKnowledgeIndex(session.knowledgeIdxPath); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: โหลด knowledge index เดิม (%s) ไม่ได้ (%v) - จะสร้างใหม่ทั้งหมด\n", session.knowledgeIdxPath, err)
+		} else {
+			session.knowledgeIdx.set(prevIdx)
+		}
+		fmt.Println("กำลัง embed ฐานความรู้ (embed-model: " + embedCfg.Model + ")...")
+		session.refreshKnowledgeIndex()
+		fmt.Printf("  embed เสร็จแล้ว: %d chunk(s) ใน index (%s)\n", len(session.knowledgeIdx.get().Chunks), session.knowledgeIdxPath)
+		session.startKnowledgeIndexRefresher(embedCfg.RefreshInterval)
+	}
+
+	pageName := page.Name
+	if pageName == "" {
+		pageName = page.ID
+	}
+	fmt.Printf("ola messengerbot: เชื่อมต่อสำเร็จเป็น %s (model: %s, provider: %s)\n", pageName, pcfg.Model, pcfg.Provider)
+	fmt.Printf("  allowlist: %d user(s)\n", len(access.Users))
+	fmt.Println("  " + strings.ReplaceAll(session.toolsStatusText(), "\n", "\n  "))
+	fmt.Printf("  context: %s (compact เมื่อเกิน %d turn, เหลือ %d turn ล่าสุด)\n", contextDir, compactAfter, keepRecent)
+	fmt.Printf("  log: %s (append)\n", outputFile)
+	fmt.Printf("  webhook: listen %s%s (ต้องมี HTTPS reverse proxy ชี้ URL จริงมาที่นี่ - ดู 'ola messengerbot -h')\n", listenAddr, webhookPath)
+	fmt.Println("กด Ctrl-C เพื่อหยุด")
+	fmt.Fprintf(outFile, "\n=== ola messengerbot เริ่มทำงาน %s (page: %s) ===\n%s\n",
+		time.Now().Format(time.RFC3339), pageName, session.toolsStatusText())
+
+	mux := http.NewServeMux()
+	mux.HandleFunc(webhookPath, session.webhookHandler)
+	srv := &http.Server{Addr: listenAddr, Handler: mux}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	serverErrCh := make(chan error, 1)
+	go func() {
+		serverErrCh <- srv.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serverErrCh:
+		if err != nil && err != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "error: HTTP server ล้มเหลว: %v\n", err)
+			return 1
+		}
+	case <-sigCh:
+		fmt.Println("\nกำลังหยุด ola messengerbot...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: ปิด HTTP server ไม่ราบรื่น: %v\n", err)
+		}
+	}
+	fmt.Fprintf(outFile, "=== ola messengerbot หยุดทำงาน %s ===\n", time.Now().Format(time.RFC3339))
+	return 0
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Section: whatsappbot (WhatsApp Cloud API)
+//
+// "ola whatsappbot" is WhatsApp's counterpart of telegrambot/discordbot/
+// linebot/messengerbot - same principles via chatBotCore (see that
+// struct's own doc comment). Like messengerbot, WhatsApp has no group
+// concept a bot can be added to via the Cloud API in the way
+// Telegram/Discord/LINE do - every conversation is a private 1-on-1
+// thread between a phone number and the business's own WhatsApp phone
+// number, identified by a bare phone number string (wa_id) - so, like
+// messengerbot, there is no addressed/speaker-attribution branch and the
+// allowlist is a single tier (wa_ids).
+//
+// TRANSPORT: webhook, sharing the exact same GET-verification handshake
+// and X-Hub-Signature-256 POST signing as messengerbot (see the shared
+// "Meta webhook verification" section above) - WhatsApp Cloud API and
+// Messenger Platform are both Meta Graph API products configured through
+// the same "App" in Meta for Developers, just different Products
+// attached to it.
+//
+// THE ONE GENUINE STRUCTURAL DIFFERENCE FROM MESSENGER: authentication.
+// Messenger's Send API traditionally takes the page token as an
+// access_token QUERY PARAMETER; WhatsApp Cloud API instead takes the
+// access token as an "Authorization: Bearer <token>" HEADER on every
+// call - the same header shape LINE already uses (see lineRESTRequest),
+// so whatsappRESTRequest below is structurally a near-copy of that
+// function, just pointed at a different base URL shape
+// (graph.facebook.com/<phone_number_id>/... instead of api.line.me/...).
+//
+// THE OTHER DIFFERENCE: media download is a genuine two-step process
+// (resolve a media ID to a temporary ~5-minute download URL via the
+// Graph API, itself Bearer-authenticated, THEN download that URL - also
+// Bearer-authenticated) - the same two-step shape Telegram's
+// tgGetFile/tgDownloadFile need, unlike Messenger's own attachment
+// payload which already carries a directly-downloadable URL (see
+// messengerAttachment and handleMessengerEvent's own comment on reusing
+// discordDownloadFile for that reason). See whatsappDownloadMediaByID.
+//
+// KNOWN LIMITATION, DOCUMENTED RATHER THAN WORKED AROUND: WhatsApp
+// enforces a 24-hour "customer service window" - a business can only
+// send a free-form reply within 24 hours of the user's own last message;
+// outside that window, only a pre-approved message TEMPLATE can be sent.
+// This bot only ever replies reactively (it never messages a user
+// first), so every real reply happens well inside that window by
+// construction - but there is no template-message support at all here,
+// so if the model's own tool-calling loop somehow took longer than 24
+// hours to produce an answer (never realistic for how this bot is
+// actually used), that final send would fail. See README for the fuller
+// explanation of this tradeoff.
+// ─────────────────────────────────────────────────────────────────
+
+const defaultWhatsAppAPIBase = "https://graph.facebook.com/v21.0"
+const defaultWhatsAppListenAddr = ":8082"
+const defaultWhatsAppWebhookPath = "/whatsapp/webhook"
+const defaultWhatsAppContextDir = "whatsapp-context"
+
+// whatsappMaxMessageRunes stays a little under WhatsApp's documented
+// 4096-character text message body limit - see messengerMaxMessageRunes'
+// own comment on why each platform keeps its own constant/split function
+// rather than sharing one.
+const whatsappMaxMessageRunes = 4000
+
+// ─────────────────────────────────────────────────────────────────
+// Webhook payload types (only the fields this bot actually uses - the
+// Cloud API's real "value" object also carries a "statuses" array for
+// delivery/read receipts, which this bot has no use for and simply
+// leaves unparsed by omitting the field entirely; encoding/json ignores
+// JSON object keys with no matching Go struct field).
+// ─────────────────────────────────────────────────────────────────
+
+type whatsappMediaRef struct {
+	ID       string `json:"id"`
+	MimeType string `json:"mime_type,omitempty"`
+	Filename string `json:"filename,omitempty"` // present on "document" messages only
+	Caption  string `json:"caption,omitempty"`
+}
+
+// isPDF mirrors lineMessage.isPDF/discordAttachment.isPDF's own
+// reasoning: trust the MIME type when given, fall back to the filename
+// extension otherwise. Safe to call on a nil receiver (returns false) so
+// callers don't need their own nil check first - see handleWhatsAppMessage.
+func (m *whatsappMediaRef) isPDF() bool {
+	if m == nil {
+		return false
+	}
+	if m.MimeType == "application/pdf" {
+		return true
+	}
+	return strings.EqualFold(filepath.Ext(m.Filename), ".pdf")
+}
+
+type whatsappMessage struct {
+	From      string `json:"from"` // sender's wa_id (bare phone number, no leading "+")
+	ID        string `json:"id"`
+	Timestamp string `json:"timestamp"`
+	Type      string `json:"type"` // "text", "image", "document", ... - other types are ignored
+	Text      *struct {
+		Body string `json:"body"`
+	} `json:"text,omitempty"`
+	Image    *whatsappMediaRef `json:"image,omitempty"`
+	Document *whatsappMediaRef `json:"document,omitempty"`
+}
+
+type whatsappContact struct {
+	WaID    string `json:"wa_id"`
+	Profile struct {
+		Name string `json:"name"`
+	} `json:"profile"`
+}
+
+type whatsappChangeValue struct {
+	MessagingProduct string `json:"messaging_product"`
+	Metadata         struct {
+		PhoneNumberID string `json:"phone_number_id"`
+	} `json:"metadata"`
+	Contacts []whatsappContact `json:"contacts,omitempty"`
+	Messages []whatsappMessage `json:"messages,omitempty"`
+}
+
+type whatsappChange struct {
+	Value whatsappChangeValue `json:"value"`
+	Field string              `json:"field"`
+}
+
+type whatsappEntry struct {
+	ID      string           `json:"id"`
+	Changes []whatsappChange `json:"changes"`
+}
+
+type whatsappWebhookBody struct {
+	Object string          `json:"object"`
+	Entry  []whatsappEntry `json:"entry"`
+}
+
+// ─────────────────────────────────────────────────────────────────
+// REST client. Every call carries "Authorization: Bearer <access
+// token>" - see this section's own header comment on why this differs
+// from messengerbot's query-parameter scheme despite both being Graph
+// API calls.
+// ─────────────────────────────────────────────────────────────────
+
+func whatsappRESTRequest(client *http.Client, apiBase, token, method, path string, body interface{}) ([]byte, int, error) {
+	var reqBody io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return nil, 0, fmt.Errorf("marshal request ไม่ได้: %v", err)
+		}
+		reqBody = bytes.NewReader(data)
+	}
+	httpReq, err := http.NewRequest(method, strings.TrimRight(apiBase, "/")+path, reqBody)
+	if err != nil {
+		return nil, 0, err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("อ่าน response body ไม่ได้: %v", err)
+	}
+	return respBody, resp.StatusCode, nil
+}
+
+type whatsappPhoneInfo struct {
+	DisplayPhoneNumber string `json:"display_phone_number"`
+	VerifiedName       string `json:"verified_name"`
+}
+
+// whatsappGetPhoneInfo validates the access token + phone_number_id pair
+// works and gets the number's own verified name for the startup banner -
+// mirrors lineGetBotInfo/messengerGetPageInfo's own "fail fast" reasoning.
+func whatsappGetPhoneInfo(client *http.Client, apiBase, token, phoneNumberID string) (whatsappPhoneInfo, error) {
+	body, status, err := whatsappRESTRequest(client, apiBase, token, http.MethodGet, "/"+phoneNumberID+"?fields=display_phone_number,verified_name", nil)
+	if err != nil {
+		return whatsappPhoneInfo{}, err
+	}
+	if status >= 400 {
+		return whatsappPhoneInfo{}, fmt.Errorf("GET /%s สถานะ %d: %s", phoneNumberID, status, string(body))
+	}
+	var out whatsappPhoneInfo
+	if err := json.Unmarshal(body, &out); err != nil {
+		return whatsappPhoneInfo{}, fmt.Errorf("decode phone info response ไม่ได้: %v", err)
+	}
+	return out, nil
+}
+
+// splitWhatsAppMessage mirrors splitLineMessage/splitMessengerMessage's
+// own logic exactly with WhatsApp's own length constant.
+func splitWhatsAppMessage(text string) []string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		text = "(ไม่มีคำตอบ)"
+	}
+	runes := []rune(text)
+	if len(runes) <= whatsappMaxMessageRunes {
+		return []string{text}
+	}
+	var chunks []string
+	for len(runes) > 0 {
+		n := whatsappMaxMessageRunes
+		if n > len(runes) {
+			n = len(runes)
+		}
+		cut := n
+		if n == whatsappMaxMessageRunes {
+			for i := n - 1; i > n/2; i-- {
+				if runes[i] == '\n' {
+					cut = i + 1
+					break
+				}
+			}
+		}
+		chunk := strings.TrimSpace(string(runes[:cut]))
+		if chunk != "" {
+			chunks = append(chunks, chunk)
+		}
+		runes = runes[cut:]
+	}
+	if len(chunks) == 0 {
+		chunks = []string{"(ไม่มีคำตอบ)"}
+	}
+	return chunks
+}
+
+func whatsappSendMessage(client *http.Client, apiBase, token, phoneNumberID, to, text string) error {
+	for _, chunk := range splitWhatsAppMessage(text) {
+		body := map[string]interface{}{
+			"messaging_product": "whatsapp",
+			"to":                to,
+			"type":              "text",
+			"text":              map[string]interface{}{"body": chunk, "preview_url": false},
+		}
+		respBody, status, err := whatsappRESTRequest(client, apiBase, token, http.MethodPost, "/"+phoneNumberID+"/messages", body)
+		if err != nil {
+			return err
+		}
+		if status >= 400 {
+			return fmt.Errorf("POST /%s/messages สถานะ %d: %s", phoneNumberID, status, string(respBody))
+		}
+	}
+	return nil
+}
+
+type whatsappMediaURLResponse struct {
+	URL      string `json:"url"`
+	MimeType string `json:"mime_type"`
+	FileSize int64  `json:"file_size"`
+	ID       string `json:"id"`
+}
+
+// whatsappGetMediaURL resolves a media ID to a temporary (Meta documents
+// this as valid for around 5 minutes) download URL - see this section's
+// own header comment for why this two-step shape is needed here but not
+// for messengerbot.
+func whatsappGetMediaURL(client *http.Client, apiBase, token, mediaID string) (whatsappMediaURLResponse, error) {
+	body, status, err := whatsappRESTRequest(client, apiBase, token, http.MethodGet, "/"+mediaID, nil)
+	if err != nil {
+		return whatsappMediaURLResponse{}, err
+	}
+	if status >= 400 {
+		return whatsappMediaURLResponse{}, fmt.Errorf("GET /%s สถานะ %d: %s", mediaID, status, string(body))
+	}
+	var out whatsappMediaURLResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return whatsappMediaURLResponse{}, fmt.Errorf("decode media response ไม่ได้: %v", err)
+	}
+	return out, nil
+}
+
+// whatsappDownloadMedia performs the second step: downloading the actual
+// bytes from the temporary URL whatsappGetMediaURL resolved, which
+// (unlike Messenger's own already-public-ish CDN URL) still requires the
+// SAME Bearer token on this second request too. Enforces maxSize via
+// io.LimitReader the same way every other platform's own download helper
+// does (tgDownloadFile/lineDownloadFile/discordDownloadFile).
+func whatsappDownloadMedia(client *http.Client, mediaURL, token string, maxSize int64) ([]byte, error) {
+	req, err := http.NewRequest(http.MethodGet, mediaURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("ดาวน์โหลดไฟล์สถานะ %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("ดาวน์โหลดไฟล์ไม่สำเร็จ: %v", err)
+	}
+	if int64(len(data)) > maxSize {
+		return nil, fmt.Errorf("ไฟล์มีขนาดเกิน %s", formatByteSize(maxSize))
+	}
+	return data, nil
+}
+
+// whatsappDownloadMediaByID chains the two steps above - resolve then
+// download - since every caller needs both together.
+func whatsappDownloadMediaByID(client *http.Client, apiBase, token, mediaID string, maxSize int64) ([]byte, error) {
+	meta, err := whatsappGetMediaURL(client, apiBase, token, mediaID)
+	if err != nil {
+		return nil, fmt.Errorf("หา URL ไฟล์ไม่ได้: %v", err)
+	}
+	return whatsappDownloadMedia(client, meta.URL, token, maxSize)
+}
+
+// buildWhatsAppHTTPClients mirrors buildMessengerHTTPClients'/
+// buildLineHTTPClients' own reasoning exactly.
+func buildWhatsAppHTTPClients() (rest, model *http.Client) {
+	rest = &http.Client{Timeout: 30 * time.Second}
+	model = newHTTPClient()
+	return rest, model
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Access control: a single allowlist tier (wa_ids) - see this section's
+// own header comment on why WhatsApp has no group/channel tier at all
+// here, the same reasoning as messengerAccessConfig.
+// ─────────────────────────────────────────────────────────────────
+
+type whatsappAccessConfig struct {
+	Users map[string]bool
+}
+
+func (c whatsappAccessConfig) allowed(waID string) bool {
+	return c.Users[waID]
+}
+
+func (c whatsappAccessConfig) empty() bool {
+	return len(c.Users) == 0
+}
+
+func parseWhatsAppIDList(raw string) map[string]bool {
+	ids := map[string]bool{}
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		ids[part] = true
+	}
+	return ids
+}
+
+func resolveWhatsAppAccessConfig(usersFlag string) whatsappAccessConfig {
+	usersRaw := usersFlag
+	if usersRaw == "" {
+		usersRaw = os.Getenv("OLA_WHATSAPP_ALLOWED_USERS")
+	}
+	return whatsappAccessConfig{Users: parseWhatsAppIDList(usersRaw)}
+}
+
+// whatsappContextKey mirrors telegramContextKey/discordContextKey/
+// lineContextKey/messengerContextKey - the "whatsapp_" prefix lets this
+// bot safely share one --context-dir with any of the other four with no
+// key collisions.
+func whatsappContextKey(waID string) string {
+	return "whatsapp_user_" + waID
+}
+
+// ─────────────────────────────────────────────────────────────────
+// whatsappSession embeds chatBotCore (see that struct's own doc
+// comment) - everything platform-agnostic is inherited from there
+// unchanged. Only the WhatsApp-specific transport/access pieces live
+// here.
+// ─────────────────────────────────────────────────────────────────
+
+type whatsappSession struct {
+	chatBotCore
+	restClient    *http.Client
+	apiBase       string
+	accessToken   string
+	appSecret     string
+	verifyToken   string
+	phoneNumberID string
+	access        whatsappAccessConfig
+	sem           chan struct{}
+}
+
+// handleWhatsAppMessage processes exactly one incoming message object end
+// to end. Like handleMessengerEvent, there is no "addressed" branch at
+// all - every message that reaches this function is always answered (see
+// this section's own header comment on why WhatsApp has no group concept
+// here).
+func (s *whatsappSession) handleWhatsAppMessage(msg whatsappMessage) {
+	s.sem <- struct{}{}
+	defer func() { <-s.sem }()
+
+	waID := msg.From
+	if waID == "" {
+		return
+	}
+	hasImage := msg.Type == "image" && msg.Image != nil
+	hasPDF := msg.Type == "document" && msg.Document.isPDF()
+	if msg.Type != "text" && !hasImage && !hasPDF {
+		return // sticker/location/audio/video/reaction/non-PDF document/etc - nothing this bot can act on
+	}
+	text := ""
+	if msg.Text != nil {
+		text = strings.TrimSpace(msg.Text.Body)
+	}
+	if text == "" && hasImage && msg.Image.Caption != "" {
+		text = strings.TrimSpace(msg.Image.Caption)
+	}
+	if text == "" && hasPDF && msg.Document.Caption != "" {
+		text = strings.TrimSpace(msg.Document.Caption)
+	}
+	if text == "" && !hasImage && !hasPDF {
+		return
+	}
+
+	if text == "/whoami" || text == "/start" {
+		_ = whatsappSendMessage(s.restClient, s.apiBase, s.accessToken, s.phoneNumberID, waID, fmt.Sprintf("หมายเลขของคุณ (wa_id): %s", waID))
+		return
+	}
+
+	if !s.access.allowed(waID) {
+		_ = whatsappSendMessage(s.restClient, s.apiBase, s.accessToken, s.phoneNumberID, waID,
+			fmt.Sprintf("คุณยังไม่ได้รับอนุญาตให้ใช้บอทนี้ ส่ง /whoami เพื่อดูหมายเลข แล้วแจ้งผู้ดูแลให้เพิ่มสิทธิ์\nwa_id: %s", waID))
+		s.logf("[whatsapp_denied] wa_id=%s\n", waID)
+		return
+	}
+
+	if text == "/tools" {
+		_ = whatsappSendMessage(s.restClient, s.apiBase, s.accessToken, s.phoneNumberID, waID, s.toolsStatusText())
+		return
+	}
+
+	key := whatsappContextKey(waID)
+	lock := s.contextMutex(key)
+	lock.Lock()
+	defer lock.Unlock()
+
+	var images []string
+	var imageRefs []string
+	var pdfRefs []string
+
+	if hasImage {
+		data, err := whatsappDownloadMediaByID(s.restClient, s.apiBase, s.accessToken, msg.Image.ID, s.maxImageSize)
+		if err != nil {
+			s.logf("[whatsapp_error] ดาวน์โหลดรูปภาพไม่ได้: %v\n", err)
+			_ = whatsappSendMessage(s.restClient, s.apiBase, s.accessToken, s.phoneNumberID, waID, fmt.Sprintf("ขออภัย ดาวน์โหลดรูปภาพไม่สำเร็จ: %v", err))
+			return
+		}
+		images = append(images, base64.StdEncoding.EncodeToString(data))
+		if s.saveImages {
+			if ref, err := savePicture(s.contextDir, key, data); err != nil {
+				s.logf("[whatsapp_error] บันทึกรูปภาพไม่ได้: %v\n", err)
+			} else {
+				imageRefs = []string{ref}
+			}
+		}
+	}
+
+	if hasPDF {
+		data, err := whatsappDownloadMediaByID(s.restClient, s.apiBase, s.accessToken, msg.Document.ID, s.maxPDFSize)
+		if err != nil {
+			s.logf("[whatsapp_error] ดาวน์โหลดไฟล์ PDF ไม่ได้: %v\n", err)
+			_ = whatsappSendMessage(s.restClient, s.apiBase, s.accessToken, s.phoneNumberID, waID, fmt.Sprintf("ขออภัย ดาวน์โหลดไฟล์ PDF ไม่สำเร็จ: %v", err))
+			return
+		}
+		var savedPath string
+		if s.saveImages {
+			if ref, err := savePDFFile(s.contextDir, key, data); err != nil {
+				s.logf("[whatsapp_error] บันทึกไฟล์ PDF ไม่ได้: %v\n", err)
+			} else {
+				pdfRefs = []string{ref}
+				savedPath = filepath.Join(s.contextDir, filepath.FromSlash(ref))
+			}
+		}
+		var pages []string
+		var convErr error
+		if savedPath != "" {
+			pages, _, convErr = convertPDFToImages(savedPath, s.pdfMaxPages, s.pdfDPI)
+		} else {
+			pages, _, convErr = convertDownloadedPDFBytes(data, s.pdfMaxPages, s.pdfDPI)
+		}
+		if convErr != nil {
+			s.logf("[whatsapp_error] แปลง PDF ไม่สำเร็จ: %v\n", convErr)
+			_ = whatsappSendMessage(s.restClient, s.apiBase, s.accessToken, s.phoneNumberID, waID, fmt.Sprintf("ขออภัย แปลงไฟล์ PDF ไม่สำเร็จ: %v", convErr))
+			return
+		}
+		images = append(images, pages...)
+	}
+
+	s.logf("\n=== whatsapp key=%s wa_id=%s ===\n[user] %s\n", key, waID, text)
+
+	answer, err := s.recordAndRespond(key, "", text, true, images, imageRefs, pdfRefs)
+	if err != nil {
+		s.logf("[whatsapp_error] key=%s: %v\n", key, err)
+		if s.ntfyTopic != "" {
+			sendNotification(s.ntfyTopic, truncateWords(fmt.Sprintf("[whatsappbot error] key=%s: %v", key, err), maxNotificationWords))
+		}
+		_ = whatsappSendMessage(s.restClient, s.apiBase, s.accessToken, s.phoneNumberID, waID, "ขออภัย เกิดข้อผิดพลาดระหว่างประมวลผล ลองใหม่อีกครั้ง")
+		return
+	}
+	s.logf("[assistant] %s\n", answer)
+	if err := whatsappSendMessage(s.restClient, s.apiBase, s.accessToken, s.phoneNumberID, waID, answer); err != nil {
+		s.logf("[whatsapp_error] ส่งข้อความกลับไม่ได้: %v\n", err)
+	}
+}
+
+// webhookHandler is the actual net/http.HandlerFunc WhatsApp both GETs
+// (verification handshake) and POSTs (message events) to - structurally
+// identical to messengerSession.webhookHandler (see that method's own
+// doc comment), only the POST payload shape differs (nested
+// entry[].changes[].value.messages[] here vs a flat
+// entry[].messaging[] there).
+func (s *whatsappSession) webhookHandler(w http.ResponseWriter, r *http.Request) {
+	if handleMetaWebhookVerify(w, r, s.verifyToken) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if !verifyMetaSignature(body, r.Header.Get("X-Hub-Signature-256"), s.appSecret) {
+		s.logf("[whatsapp_error] signature ไม่ถูกต้อง - ปฏิเสธ request จาก %s\n", r.RemoteAddr)
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+
+	var payload whatsappWebhookBody
+	if err := json.Unmarshal(body, &payload); err != nil {
+		s.logf("[whatsapp_error] parse webhook body ไม่ได้: %v\n", err)
+		return
+	}
+	for _, entry := range payload.Entry {
+		for _, change := range entry.Changes {
+			for i := range change.Value.Messages {
+				msg := change.Value.Messages[i]
+				go s.handleWhatsAppMessage(msg)
+			}
+		}
+	}
+}
+
+func whatsappUsage(fs *flag.FlagSet) func() {
+	return func() {
+		fmt.Println("Usage: ola whatsappbot [options]")
+		fmt.Println()
+		fmt.Println("รัน ola เป็น WhatsApp bot ผ่าน WhatsApp Cloud API - รับข้อความผ่าน webhook เหมือน")
+		fmt.Println("'ola messengerbot'/'ola linebot' ทุกประการ (WhatsApp ยิง HTTP POST เข้ามาหาเซิร์ฟเวอร์นี้)")
+		fmt.Println("หลักการ tool/persona/knowledge-base/context/web search เหมือน 'ola telegrambot' ทุกประการ")
+		fmt.Println("ต่างที่: WhatsApp ไม่มีแนวคิด 'กลุ่ม' ผ่าน Cloud API เลย - ทุกบทสนทนาเป็น 1-on-1 ระหว่าง")
+		fmt.Println("เบอร์โทรกับเบอร์ธุรกิจเท่านั้น ทุกข้อความจึงถูกตอบเสมอ เหมือน 'ola messengerbot'")
+		fmt.Println("(ดู README หัวข้อ whatsappbot สำหรับรายละเอียด)")
+		fmt.Println()
+		fmt.Println("⚠️  ข้อจำกัดสำคัญ (WhatsApp เท่านั้น ไม่มีในบอทอื่น): ตอบข้อความได้แบบอิสระ (free-form)")
+		fmt.Println("    เฉพาะภายใน 24 ชั่วโมงหลังผู้ใช้ทักมาล่าสุดเท่านั้น (\"customer service window\")")
+		fmt.Println("    เกินจากนั้น Meta จะปฏิเสธข้อความ ต้องใช้ pre-approved message template แทน (ยังไม่")
+		fmt.Println("    รองรับใน ola whatsappbot รุ่นนี้) - เพราะบอทนี้ตอบแบบ reactive เท่านั้น (ไม่เคยทัก")
+		fmt.Println("    หาผู้ใช้ก่อนเอง) กรณีนี้แทบไม่เกิดในทางปฏิบัติ แต่ควรรู้ไว้")
+		fmt.Println()
+		fmt.Println("⚠️  ต้องมี public HTTPS endpoint ชี้เข้ามาที่ webhook นี้ (ปกติวางไว้หลัง reverse proxy")
+		fmt.Println("    เช่น Caddy/nginx ที่จัดการ TLS ให้ - whatsappbot เองฟังแค่ plain HTTP) แล้วเอา URL")
+		fmt.Println("    นั้นไปตั้งใน Meta for Developers > [App ของคุณ] > WhatsApp > Configuration > Webhook")
+		fmt.Println()
+		fmt.Println("Required (env เท่านั้น - ไม่มี flag รับค่าลับโดยตรง เพื่อไม่ให้หลุดไปอยู่ใน shell history/ps):")
+		fmt.Println("  OLA_WHATSAPP_ACCESS_TOKEN      Access token จาก Meta for Developers (System User token แนะนำสำหรับ production)")
+		fmt.Println("  OLA_WHATSAPP_APP_SECRET        App Secret ของแอป - ใช้ตรวจสอบ signature ของ webhook")
+		fmt.Println("  OLA_WHATSAPP_VERIFY_TOKEN      ค่าที่คุณกำหนดเอง - ใช้ตอนยืนยัน webhook URL ครั้งแรกในคอนโซล")
+		fmt.Println("  OLA_WHATSAPP_PHONE_NUMBER_ID   Phone Number ID ของเบอร์ธุรกิจที่จะใช้ส่ง (ไม่ใช่ตัวเบอร์โทรเอง)")
+		fmt.Println("  -m/--model หรือ OLA_OLLAMA_MODEL")
+		fmt.Println()
+		fmt.Println("Access control (allowlist ชั้นเดียว - ไม่มีชั้นกลุ่มเหมือนสามบอทแรก):")
+		fmt.Println("  --whatsapp-allowed-users <ids>  OLA_WHATSAPP_ALLOWED_USERS  comma-separated wa_id (เบอร์โทรไม่มี +)")
+		fmt.Println("                                   ส่ง /whoami คุยกับบอทเพื่อดูเบอร์ของตัวเอง (ใช้ได้แม้ยังไม่อยู่ใน allowlist)")
+		fmt.Println()
+		fmt.Println("Persona/Knowledge base/Context/Web search: เหมือน 'ola telegrambot' ทุก flag ทุกพฤติกรรม - ดู 'ola telegrambot -h'")
+		fmt.Println("  --persona, --persona-file, --knowledge-dir, --embed-model, --embed-top-k, --embed-min-score,")
+		fmt.Println("  --embed-refresh-interval, --context-dir (default: whatsapp-context), --context-keep-recent,")
+		fmt.Println("  --context-compact-after, --searxng-url, --ollama-search-key, --no-web-search, --search-*")
+		fmt.Println()
+		fmt.Println("Runtime:")
+		fmt.Println("  -c/--ctx, -P/--provider, --api-base, -k/--key   เหมือน 'ola ask'")
+		fmt.Println("  --whatsapp-listen-addr <addr>   OLA_WHATSAPP_LISTEN_ADDR   ที่อยู่ที่ HTTP server ฟัง (default :8082)")
+		fmt.Println("  --whatsapp-webhook-path <path>  OLA_WHATSAPP_WEBHOOK_PATH  path ของ webhook (default /whatsapp/webhook)")
+		fmt.Println("  --whatsapp-api-base <url>       OLA_WHATSAPP_API_BASE      (default: https://graph.facebook.com/v21.0)")
+		fmt.Println("  --whatsapp-max-concurrent <n>   จำนวนข้อความสูงสุดที่ประมวลผลพร้อมกันทั้งโปรเซส (default 4)")
+		fmt.Println("  --max-image-size <size>      OLA_MAX_IMAGE_SIZE   ขนาดรูปภาพสูงสุด (default 10M) - ดู 'ola telegrambot -h'")
+		fmt.Println("  --save-images                OLA_SAVE_IMAGES      บันทึกรูปไว้ดูซ้ำได้ (default ปิด) - ดู 'ola telegrambot -h'")
+		fmt.Println("  --max-pdf-size, --pdf-max-pages, --pdf-dpi        รองรับไฟล์ PDF เหมือนกัน - ดู 'ola telegrambot -h'")
+		fmt.Println("  -x/--topic     ntfy.sh topic (แจ้งเตือนเมื่อเกิด error ระหว่างประมวลผลข้อความ)")
+		fmt.Println("  -o/--output    log ไฟล์แบบเต็ม (default: whatsappbot.log, เปิดแบบ append เสมอ)")
+		fmt.Println()
+		fmt.Println("คำสั่งในตัว: /whoami หรือ /start (ดูเบอร์/wa_id ของตัวเอง), /tools (เช็คสถานะ tool ปัจจุบัน - เฉพาะผู้ที่อยู่ใน allowlist)")
+		fs.PrintDefaults()
+	}
+}
+
+func cmdWhatsAppBot(args []string) int {
+	fs := flag.NewFlagSet("whatsappbot", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+
+	var model, ctxStr, outputFile, topic string
+	var flagKey, flagHelp bool
+	var providerFlag, apiBaseFlag string
+	var whatsappAPIBase, listenAddr, webhookPath string
+	var allowedUsers string
+	var persona, personaFile string
+	var knowledgeDir string
+	var embedModel string
+	var embedTopK int
+	var embedMinScore float64
+	var embedRefreshSec int
+	var contextDir string
+	var keepRecent, compactAfter int
+	var maxConcurrent int
+	var searxngURL, ollamaSearchKey string
+	var flagNoWebSearch bool
+	var maxImageSizeRaw string
+	var maxPDFSizeRaw string
+	var pdfMaxPages, pdfDPI int
+	var saveImages bool
+	var searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec int
+
+	fs.StringVar(&model, "m", "", "")
+	fs.StringVar(&model, "model", "", "")
+	fs.StringVar(&ctxStr, "c", "", "")
+	fs.StringVar(&ctxStr, "ctx", "", "")
+	fs.BoolVar(&flagKey, "k", false, "")
+	fs.BoolVar(&flagKey, "key", false, "")
+	fs.StringVar(&providerFlag, "P", "", "")
+	fs.StringVar(&providerFlag, "provider", "", "")
+	fs.StringVar(&apiBaseFlag, "api-base", "", "")
+	fs.StringVar(&whatsappAPIBase, "whatsapp-api-base", "", "")
+	fs.StringVar(&listenAddr, "whatsapp-listen-addr", "", "")
+	fs.StringVar(&webhookPath, "whatsapp-webhook-path", "", "")
+	fs.StringVar(&allowedUsers, "whatsapp-allowed-users", "", "")
+	fs.StringVar(&persona, "persona", "", "")
+	fs.StringVar(&personaFile, "persona-file", "", "")
+	fs.StringVar(&knowledgeDir, "knowledge-dir", "", "")
+	fs.StringVar(&embedModel, "embed-model", "", "")
+	fs.IntVar(&embedTopK, "embed-top-k", 0, "")
+	fs.Float64Var(&embedMinScore, "embed-min-score", 0, "")
+	fs.IntVar(&embedRefreshSec, "embed-refresh-interval", 0, "")
+	fs.StringVar(&contextDir, "context-dir", "", "")
+	fs.IntVar(&keepRecent, "context-keep-recent", 0, "")
+	fs.IntVar(&compactAfter, "context-compact-after", 0, "")
+	fs.IntVar(&maxConcurrent, "whatsapp-max-concurrent", 0, "")
+	fs.StringVar(&searxngURL, "searxng-url", "", "")
+	fs.StringVar(&ollamaSearchKey, "ollama-search-key", "", "")
+	fs.BoolVar(&flagNoWebSearch, "no-web-search", false, "")
+	fs.IntVar(&searchMaxResults, "search-max-results", 0, "")
+	fs.IntVar(&searchConcurrency, "search-concurrency", 0, "")
+	fs.IntVar(&fetchConcurrency, "fetch-concurrency", 0, "")
+	fs.IntVar(&searchTimeoutSec, "search-timeout", 0, "")
+	fs.IntVar(&fetchTimeoutSec, "fetch-timeout", 0, "")
+	fs.StringVar(&maxImageSizeRaw, "max-image-size", "", "")
+	fs.StringVar(&maxPDFSizeRaw, "max-pdf-size", "", "")
+	fs.IntVar(&pdfMaxPages, "pdf-max-pages", 0, "")
+	fs.IntVar(&pdfDPI, "pdf-dpi", 0, "")
+	fs.BoolVar(&saveImages, "save-images", false, "")
+	fs.StringVar(&topic, "x", "", "")
+	fs.StringVar(&topic, "topic", "", "")
+	fs.StringVar(&outputFile, "o", "", "")
+	fs.StringVar(&outputFile, "output", "", "")
+	fs.BoolVar(&flagHelp, "h", false, "")
+	fs.BoolVar(&flagHelp, "help", false, "")
+
+	usage := whatsappUsage(fs)
+	fs.Usage = usage
+
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	if flagHelp {
+		usage()
+		return 0
+	}
+
+	quietMode = true // headless daemon - see cmdTelegramBot's own comment on this exact line for the full reasoning
+
+	accessToken := strings.TrimSpace(os.Getenv("OLA_WHATSAPP_ACCESS_TOKEN"))
+	if accessToken == "" {
+		fmt.Fprintln(os.Stderr, "error: ต้องตั้งค่า OLA_WHATSAPP_ACCESS_TOKEN (env เท่านั้น - ไม่มี flag รับ token โดยตรง เพื่อไม่ให้หลุดไปอยู่ใน shell history/ps)")
+		return 1
+	}
+	appSecret := strings.TrimSpace(os.Getenv("OLA_WHATSAPP_APP_SECRET"))
+	if appSecret == "" {
+		fmt.Fprintln(os.Stderr, "error: ต้องตั้งค่า OLA_WHATSAPP_APP_SECRET (env เท่านั้น - ใช้ตรวจสอบ signature ของ webhook request)")
+		return 1
+	}
+	verifyToken := strings.TrimSpace(os.Getenv("OLA_WHATSAPP_VERIFY_TOKEN"))
+	if verifyToken == "" {
+		fmt.Fprintln(os.Stderr, "error: ต้องตั้งค่า OLA_WHATSAPP_VERIFY_TOKEN (env เท่านั้น - ใช้ตอนยืนยัน webhook URL ครั้งแรกในคอนโซล)")
+		return 1
+	}
+	phoneNumberID := strings.TrimSpace(os.Getenv("OLA_WHATSAPP_PHONE_NUMBER_ID"))
+	if phoneNumberID == "" {
+		fmt.Fprintln(os.Stderr, "error: ต้องตั้งค่า OLA_WHATSAPP_PHONE_NUMBER_ID (env เท่านั้น - Phone Number ID ของเบอร์ธุรกิจที่จะใช้ส่ง)")
+		return 1
+	}
+
+	pcfg, err := resolveProviderConfig(providerFlag, apiBaseFlag, model, flagKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
+	if ctxStr == "" {
+		ctxStr = os.Getenv("OLA_OLLAMA_CONTEXT_SIZE")
+	}
+	if ctxStr == "" {
+		ctxStr = "16384"
+	}
+	if !regexp.MustCompile(`^[0-9]+$`).MatchString(ctxStr) {
+		fmt.Fprintf(os.Stderr, "error: ctx ต้องเป็นตัวเลข (got: %s)\n", ctxStr)
+		return 1
+	}
+	ctxSize, _ := strconv.Atoi(ctxStr)
+
+	if whatsappAPIBase == "" {
+		whatsappAPIBase = os.Getenv("OLA_WHATSAPP_API_BASE")
+	}
+	if whatsappAPIBase == "" {
+		whatsappAPIBase = defaultWhatsAppAPIBase
+	}
+	if listenAddr == "" {
+		listenAddr = os.Getenv("OLA_WHATSAPP_LISTEN_ADDR")
+	}
+	if listenAddr == "" {
+		listenAddr = defaultWhatsAppListenAddr
+	}
+	if webhookPath == "" {
+		webhookPath = os.Getenv("OLA_WHATSAPP_WEBHOOK_PATH")
+	}
+	if webhookPath == "" {
+		webhookPath = defaultWhatsAppWebhookPath
+	}
+
+	if contextDir == "" {
+		contextDir = os.Getenv("OLA_CONTEXT_DIR")
+	}
+	if contextDir == "" {
+		contextDir = defaultWhatsAppContextDir
+	}
+	if keepRecent <= 0 {
+		keepRecent = defaultChatBotKeepRecentTurns
+	}
+	if compactAfter <= 0 {
+		compactAfter = defaultChatBotCompactAfterTurns
+	}
+	if compactAfter <= keepRecent {
+		fmt.Fprintf(os.Stderr, "error: --context-compact-after (%d) ต้องมากกว่า --context-keep-recent (%d)\n", compactAfter, keepRecent)
+		return 1
+	}
+	if maxConcurrent <= 0 {
+		maxConcurrent = defaultTelegramMaxConcurrent
+	}
+
+	access := resolveWhatsAppAccessConfig(allowedUsers)
+	if access.empty() {
+		fmt.Fprintln(os.Stderr, "error: ไม่มีใครอยู่ใน allowlist เลย (--whatsapp-allowed-users หรือ OLA_WHATSAPP_ALLOWED_USERS ว่างเปล่า) - บอทจะปฏิเสธทุกคน ตั้งอย่างน้อยหนึ่งอย่าง")
+		return 1
+	}
+
+	persona, err = resolveChatBotPersona(persona, personaFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
+	knowledgeCfg, knowledgeWarnings := resolveKnowledgeConfig(knowledgeDir)
+	for _, w := range knowledgeWarnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
+
+	embedCfg := resolveEmbedConfig(embedModel, embedTopK, embedMinScore, embedRefreshSec)
+	if embedCfg.enabled() {
+		if !knowledgeCfg.enabled() {
+			fmt.Fprintln(os.Stderr, "error: --embed-model ตั้งไว้แต่ไม่มี --knowledge-dir - embedding search ใช้กับฐานความรู้เท่านั้น ไม่มีอะไรให้ index")
+			return 1
+		}
+		if pcfg.Provider != providerOllama {
+			fmt.Fprintln(os.Stderr, "error: --embed-model รองรับเฉพาะ --provider ollama ในตอนนี้ (เรียก Ollama's /api/embed โดยตรง)")
+			return 1
+		}
+	}
+
+	searchCfg := resolveSearchConfig(searxngURL, searchMaxResults, searchConcurrency, fetchConcurrency, searchTimeoutSec, fetchTimeoutSec, flagNoWebSearch)
+	if !flagNoWebSearch {
+		searchCfg.OllamaAPIKey, searchCfg.OllamaBase = resolveOllamaSearchConfig(ollamaSearchKey)
+	}
+
+	maxImageSize, err := resolveMaxImageSize(maxImageSizeRaw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	maxPDFSize, err := resolveMaxPDFSize(maxPDFSizeRaw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	if pdfMaxPages <= 0 {
+		pdfMaxPages = envInt("OLA_PDF_MAX_PAGES", defaultPDFMaxPages)
+	}
+	if pdfDPI <= 0 {
+		pdfDPI = envInt("OLA_PDF_DPI", defaultPDFDPI)
+	}
+	saveImages = saveImages || envBool("OLA_SAVE_IMAGES")
+
+	tools := filterTools(builtinTools, "get_current_time", "delay")
+	if knowledgeCfg.enabled() {
+		tools = append(tools, searchKnowledgeTool, readKnowledgeTool)
+	}
+	if searchCfg.searchEnabled() {
+		tools = append(tools, webSearchTool)
+	}
+	if searchCfg.fetchEnabled() {
+		tools = append(tools, webFetchTool)
+	}
+	if saveImages {
+		tools = append(tools, readPicTool, readSavedPDFTool)
+	}
+
+	systemPrompt := buildChatBotSystemPrompt("WhatsApp", persona)
+
+	if outputFile == "" {
+		outputFile = os.Getenv("OLA_OUTPUT_FILE")
+	}
+	if outputFile == "" {
+		outputFile = "whatsappbot.log"
+	}
+	outFile, err := os.OpenFile(outputFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: เปิดไฟล์ log %s ไม่ได้: %v\n", outputFile, err)
+		return 1
+	}
+	defer outFile.Close()
+
+	ntfyTopic := topic
+	if ntfyTopic == "" {
+		ntfyTopic = os.Getenv("OLA_TOPIC")
+	}
+
+	restClient, modelClient := buildWhatsAppHTTPClients()
+
+	phone, err := whatsappGetPhoneInfo(restClient, whatsappAPIBase, accessToken, phoneNumberID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: เชื่อมต่อ WhatsApp Cloud API ไม่ได้ (เช็ค OLA_WHATSAPP_ACCESS_TOKEN, OLA_WHATSAPP_PHONE_NUMBER_ID และการเชื่อมต่อเน็ต): %v\n", err)
+		return 1
+	}
+
+	session := &whatsappSession{
+		chatBotCore: chatBotCore{
+			client:           modelClient,
+			systemPrompt:     systemPrompt,
+			tools:            tools,
+			knowledgeCfg:     knowledgeCfg,
+			embedCfg:         embedCfg,
+			knowledgeIdx:     &knowledgeIndexStore{},
+			knowledgeIdxPath: knowledgeIndexPath(contextDir),
+			searchCfg:        searchCfg,
+			pcfg:             pcfg,
+			ctxSize:          ctxSize,
+			contextDir:       contextDir,
+			keepRecent:       keepRecent,
+			compactAfter:     compactAfter,
+			ntfyTopic:        ntfyTopic,
+			maxImageSize:     maxImageSize,
+			maxPDFSize:       maxPDFSize,
+			pdfMaxPages:      pdfMaxPages,
+			pdfDPI:           pdfDPI,
+			saveImages:       saveImages,
+			outFile:          outFile,
+			locks:            map[string]*sync.Mutex{},
+		},
+		restClient:    restClient,
+		apiBase:       whatsappAPIBase,
+		accessToken:   accessToken,
+		appSecret:     appSecret,
+		verifyToken:   verifyToken,
+		phoneNumberID: phoneNumberID,
+		access:        access,
+		sem:           make(chan struct{}, maxConcurrent),
+	}
+
+	if embedCfg.enabled() {
+		if prevIdx, err := loadKnowledgeIndex(session.knowledgeIdxPath); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: โหลด knowledge index เดิม (%s) ไม่ได้ (%v) - จะสร้างใหม่ทั้งหมด\n", session.knowledgeIdxPath, err)
+		} else {
+			session.knowledgeIdx.set(prevIdx)
+		}
+		fmt.Println("กำลัง embed ฐานความรู้ (embed-model: " + embedCfg.Model + ")...")
+		session.refreshKnowledgeIndex()
+		fmt.Printf("  embed เสร็จแล้ว: %d chunk(s) ใน index (%s)\n", len(session.knowledgeIdx.get().Chunks), session.knowledgeIdxPath)
+		session.startKnowledgeIndexRefresher(embedCfg.RefreshInterval)
+	}
+
+	displayName := phone.VerifiedName
+	if displayName == "" {
+		displayName = phone.DisplayPhoneNumber
+	}
+	if displayName == "" {
+		displayName = phoneNumberID
+	}
+	fmt.Printf("ola whatsappbot: เชื่อมต่อสำเร็จเป็น %s (model: %s, provider: %s)\n", displayName, pcfg.Model, pcfg.Provider)
+	fmt.Printf("  allowlist: %d user(s)\n", len(access.Users))
+	fmt.Println("  " + strings.ReplaceAll(session.toolsStatusText(), "\n", "\n  "))
+	fmt.Printf("  context: %s (compact เมื่อเกิน %d turn, เหลือ %d turn ล่าสุด)\n", contextDir, compactAfter, keepRecent)
+	fmt.Printf("  log: %s (append)\n", outputFile)
+	fmt.Printf("  webhook: listen %s%s (ต้องมี HTTPS reverse proxy ชี้ URL จริงมาที่นี่ - ดู 'ola whatsappbot -h')\n", listenAddr, webhookPath)
+	fmt.Println("กด Ctrl-C เพื่อหยุด")
+	fmt.Fprintf(outFile, "\n=== ola whatsappbot เริ่มทำงาน %s (phone: %s) ===\n%s\n",
+		time.Now().Format(time.RFC3339), displayName, session.toolsStatusText())
+
+	mux := http.NewServeMux()
+	mux.HandleFunc(webhookPath, session.webhookHandler)
+	srv := &http.Server{Addr: listenAddr, Handler: mux}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	serverErrCh := make(chan error, 1)
+	go func() {
+		serverErrCh <- srv.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serverErrCh:
+		if err != nil && err != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "error: HTTP server ล้มเหลว: %v\n", err)
+			return 1
+		}
+	case <-sigCh:
+		fmt.Println("\nกำลังหยุด ola whatsappbot...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: ปิด HTTP server ไม่ราบรื่น: %v\n", err)
+		}
+	}
+	fmt.Fprintf(outFile, "=== ola whatsappbot หยุดทำงาน %s ===\n", time.Now().Format(time.RFC3339))
 	return 0
 }
 
